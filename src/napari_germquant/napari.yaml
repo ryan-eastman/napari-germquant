@@ -1,6 +1,6 @@
-# npe2 manifest. `name` is THE PLUGIN NAME (it must equal `name` in pyproject.toml and prefixes every
-# command id below; npe2 rejects a command id that does not start with the plugin name). NAMING.md
-# lists every place the name appears.
+# npe2 manifest: the reader and four dock widgets (Run, Results, Training, Time-lapse). `name` is THE
+# PLUGIN NAME (it must equal `name` in pyproject.toml and prefixes every command id below; npe2 rejects a
+# command id that does not start with the plugin name). NAMING.md lists every place the name appears.
 name: napari-germquant
 display_name: germquant
 contributions:
@@ -14,6 +14,12 @@ contributions:
     - id: napari-germquant.results_widget
       python_name: napari_germquant._results_widget:ResultsWidget
       title: germquant Results
+    - id: napari-germquant.training_widget
+      python_name: napari_germquant._training_widget:TrainingWidget
+      title: germquant Training
+    - id: napari-germquant.timelapse_widget
+      python_name: napari_germquant._timelapse_widget:TimelapseWidget
+      title: germquant Time-lapse
   readers:
     - command: napari-germquant.get_reader
       # the suffixes germquant.api.SUPPORTED_SUFFIXES lists; tests/test_manifest.py keeps them in step
@@ -33,3 +39,7 @@ contributions:
       display_name: Run
     - command: napari-germquant.results_widget
       display_name: Results
+    - command: napari-germquant.training_widget
+      display_name: Training
+    - command: napari-germquant.timelapse_widget
+      display_name: Time-lapse

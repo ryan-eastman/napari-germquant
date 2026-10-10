@@ -59,6 +59,7 @@ def test_refuses_a_timelapse_file_from_its_header(tmp_path, monkeypatch):
     with pytest.raises(api.UnsupportedImageError, match="time-lapse") as ei:
         open_image(p)
     assert "2 time points" in str(ei.value) and "DESIGN_timelapse.md" in str(ei.value)
+    assert "--t all" in str(ei.value) and "Time-lapse dock" in str(ei.value)
     # the header of the lab's live series as nd2 reports it: refused with the count, no pixel read
     live = {"sizes": {"T": 25, "Z": 76, "C": 2, "Y": 2720, "X": 2720}, "spacing": (0.2, 0.108, 0.108),
             "spacing_ok": True, "channel_names": ["Brightfield", "EGFP"], "dtype": "uint16", "is_2d": False}

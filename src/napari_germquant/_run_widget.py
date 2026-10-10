@@ -297,7 +297,9 @@ class RunWidget(QWidget):
         n_t = int(sizes.get("T", 1) or 1)
         n_p = max(int(sizes.get("P", 1) or 1), int(meta.get("n_scenes", 1) or 1))
         if n_t > 1 or n_p > 1:
-            extra = f"\nREFUSED: {n_t} time points, {n_p} positions or scenes; the plugin takes fixed single-scene images"
+            extra = (f"\nREFUSED: {n_t} time points, {n_p} positions or scenes; the plugin takes fixed single-scene "
+                     f"images (a series runs with germquant run --t all in a terminal; its folder opens in the "
+                     f"Time-lapse dock)")
         self.image_info.setText(f"{size_text}\n{spacing_text}\nchannels: {self._channel_names}{extra}")
         if not self.out_edit.text().strip():
             self.out_edit.setText(str(api.default_out_dir(p)))

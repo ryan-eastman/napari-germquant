@@ -12,8 +12,8 @@ plugin name with a hyphen (`napari-germquant`) and the Python import name with a
 | `pyproject.toml` | the key of the `[project.entry-points."napari.manifest"]` entry |
 | `src/napari_germquant/napari.yaml` | `name:` and the prefix of every command `id:` (npe2 requires the prefix to equal `name`) |
 | `src/napari_germquant/__init__.py` | `metadata.version("napari-germquant")` |
-| `tests/test_manifest.py`, `tests/test_reader.py` | the plugin name passed to `viewer.open(..., plugin=...)` and `get_manifest(...)` |
-| `src/napari_germquant/_engine.py`, `_reader.py` | text in the exported YAML and commands headers and in user-facing messages |
+| `tests/test_manifest.py`, `tests/test_reader.py`, `tests/test_training.py`, `tests/test_timelapse.py` | the plugin name passed to `viewer.open(..., plugin=...)`, `get_manifest(...)` and `viewer.window.add_plugin_dock_widget(...)` |
+| `src/napari_germquant/_engine.py`, `_reader.py`, `_training.py` | text in the exported YAML and commands headers, in user-facing messages and in the note of the `corrections.json` a training folder gets |
 | `README.md`, `NAMING.md`, `LICENSE` | prose |
 | the folder `C:/Users/ryane/napari-germquant` and its `.venv` | the checkout itself |
 
@@ -28,6 +28,8 @@ The manifest's `display_name: germquant` is what the napari menus show; it can s
 | `src/napari_germquant/napari.yaml` | every `python_name: napari_germquant.<module>:<object>` |
 | `src/napari_germquant/_reader.py` | `META_KEY = "napari_germquant"`: the metadata key on every layer the reader adds |
 | `src/napari_germquant/_results.py` | the `napari_germquant_results` metadata key on every layer the results loader adds |
+| `src/napari_germquant/_training_widget.py` | `META_KEY = "napari_germquant_training"`: the metadata key on the two layers the Training dock shows |
+| `src/napari_germquant/_timelapse.py` | `META_KEY = "napari_germquant_timelapse"`: the metadata key on every layer the Time-lapse dock adds |
 | `tests/*.py` | `from napari_germquant import ...` |
 | `tests/conftest.py`, `tests/test_reader.py` | the opt-in environment variable `NAPARI_GERMQUANT_NAS_TEST` |
 

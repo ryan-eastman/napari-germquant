@@ -52,9 +52,10 @@ def check_single_timepoint(path: str | Path, meta: dict) -> None:
     if n_t > 1:
         raise api.UnsupportedImageError(
             f"{name} is a time-lapse ({n_t} time points). napari-germquant opens fixed images only; the engine "
-            f"would measure time point 0 and nothing else. Time-lapse quantification is planned as a loop over "
-            f"time points (docs/DESIGN_timelapse.md in the germquant checkout). For now export one time point "
-            f"as its own file and open that.")
+            f"would measure time point 0 and nothing else. Run the series in a terminal with "
+            f"`germquant run {name} --profile <profile> --t all --out <folder>` (docs/TIMELAPSE.md and "
+            f"docs/DESIGN_timelapse.md in the germquant checkout), then open <folder> in the Time-lapse dock "
+            f"(Plugins > germquant > Time-lapse).")
     n_p = max(int(sizes.get("P", 1) or 1), int(meta.get("n_scenes", 1) or 1))
     if n_p > 1:
         raise api.UnsupportedImageError(

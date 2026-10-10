@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # prefixes) in src/napari_germquant/napari.yaml. NAMING.md lists every place to touch when renaming.
 name = "napari-germquant"
 version = "0.1.0.dev0"
-description = "napari plugin that drives the germquant engine: open a 3D stack, map channel roles, choose a profile and stages, run, review nuclei and spots"
+description = "napari plugin that drives the germquant engine: open a 3D stack, map channel roles, choose a profile and stages, run, review nuclei and spots, correct labels and train a nucleus model, review a time-lapse series"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -29,6 +29,8 @@ dependencies = [
   "pandas>=2.0",
   "pyyaml>=6",
   "tifffile>=2023.7",
+  # the Time-lapse dock's lazy (T, Z, Y, X) stacks; napari depends on it too
+  "dask>=2023.1",
 ]
 
 [project.optional-dependencies]

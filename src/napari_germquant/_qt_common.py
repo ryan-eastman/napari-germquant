@@ -1,9 +1,12 @@
-"""Small Qt helpers shared by the two dock widgets."""
+"""Small Qt helpers shared by the dock widgets."""
 from __future__ import annotations
 
 import logging
+import threading
+import time
+import traceback
 
-from qtpy.QtCore import QObject, Signal
+from qtpy.QtCore import QObject, QTimer, Signal
 
 from . import _engine  # noqa: F401  (import order: germquant.api before anything else)
 
@@ -22,19 +25,49 @@ def add_layer_tuples(viewer, layer_tuples) -> list:
     return added
 
 
+# the loggers whose INFO lines are worth a status-bar glance while the engine works
+_LOGGERS = ("germquant", "cellpose", "spotmax")
+# Several docks can run an engine call at the same time (a Run and a training, say). The logger levels are
+# raised to INFO when the first bridge attaches and put back when the last one detaches, so one dock
+# finishing never silences another that is still running.
+_LEVEL_LOCK = threading.Lock()
+_LEVEL_USERS = 0
+_SAVED_LEVELS: dict[str, int] = {}
+
+
+def _raise_levels() -> None:
+    global _LEVEL_USERS
+    with _LEVEL_LOCK:
+        if _LEVEL_USERS == 0:
+            for name in _LOGGERS:
+                log = logging.getLogger(name)
+                _SAVED_LEVELS[name] = log.level
+                if log.getEffectiveLevel() > logging.INFO:
+                    log.setLevel(logging.INFO)
+        _LEVEL_USERS += 1
+
+
+def _restore_levels() -> None:
+    global _LEVEL_USERS
+    with _LEVEL_LOCK:
+        _LEVEL_USERS = max(0, _LEVEL_USERS - 1)
+        if _LEVEL_USERS == 0:
+            for name in _LOGGERS:
+                logging.getLogger(name).setLevel(_SAVED_LEVELS.get(name, logging.NOTSET))
+            _SAVED_LEVELS.clear()
+
+
 class LogBridge(QObject):
     """Forwards log records from the worker thread to the GUI thread as a Qt signal (a signal emitted from
     another thread is queued to the receiver's thread, which is the one this object was created in)."""
 
     message = Signal(str)
 
-    # the loggers whose INFO lines are worth a status-bar glance during a run
-    LOGGERS = ("germquant", "cellpose", "spotmax")
+    LOGGERS = _LOGGERS
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._handler: logging.Handler | None = None
-        self._saved_levels: dict[str, int] = {}
 
     def attach(self) -> None:
         if self._handler is not None:
@@ -49,22 +82,17 @@ class LogBridge(QObject):
                     pass
 
         self._handler = _Handler(level=logging.INFO)
+        _raise_levels()
         for name in self.LOGGERS:
-            log = logging.getLogger(name)
-            self._saved_levels[name] = log.level
-            if log.getEffectiveLevel() > logging.INFO:
-                log.setLevel(logging.INFO)
-            log.addHandler(self._handler)
+            logging.getLogger(name).addHandler(self._handler)
 
     def detach(self) -> None:
         if self._handler is None:
             return
         for name in self.LOGGERS:
-            log = logging.getLogger(name)
-            log.removeHandler(self._handler)
-            log.setLevel(self._saved_levels.get(name, logging.NOTSET))
+            logging.getLogger(name).removeHandler(self._handler)
         self._handler = None
-        self._saved_levels.clear()
+        _restore_levels()
 
 
 def set_viewer_status(viewer, text: str) -> None:
@@ -74,3 +102,89 @@ def set_viewer_status(viewer, text: str) -> None:
         viewer.status = text
     except Exception:  # noqa: BLE001 - the status bar is a convenience, never a reason to fail
         pass
+
+
+def format_exception(exc: BaseException, limit: int = 1500) -> str:
+    """``Type: message`` and the tail of the traceback, for a status label."""
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-limit:]
+    return f"{type(exc).__name__}: {exc}\n{tb}"
+
+
+class WorkerRunner(QObject):
+    """One engine call at a time in a napari thread worker, so the viewer never freezes: the elapsed time
+    and the engine's log lines go to the status bar while it runs. ``start`` refuses a second call while
+    one is in flight. The callbacks run in the GUI thread (napari queues the worker's signals to it).
+
+    ``line_format`` turns one log line into the progress text shown after the elapsed time (None: the line
+    itself, shortened); returning None keeps the previous progress text."""
+
+    def __init__(self, viewer=None, parent=None):
+        super().__init__(parent)
+        self.viewer = viewer
+        self.worker = None
+        self.label = ""
+        self.progress = ""
+        self._t0 = 0.0
+        self._line_format = None
+        self._finished_cb = None
+        self._bridge = LogBridge(self)
+        self._bridge.message.connect(self._on_line)
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+
+    @property
+    def busy(self) -> bool:
+        return self.worker is not None
+
+    def elapsed_text(self) -> str:
+        s = int(time.monotonic() - self._t0)
+        return f"{s // 60} min {s % 60:02d} s"
+
+    def start(self, func, *, label: str, returned, errored, finished=None, line_format=None) -> bool:
+        if self.worker is not None:
+            return False
+        from napari.qt.threading import create_worker
+
+        self.label = label
+        self.progress = ""
+        self._line_format = line_format
+        self._finished_cb = finished
+        self._t0 = time.monotonic()
+        self._bridge.attach()
+        self._timer.start()
+        set_viewer_status(self.viewer, f"{label} ...")
+        try:
+            # an explicit errored connection: without one napari re-raises the exception in the Qt event loop
+            self.worker = create_worker(func, _connect={"returned": returned, "errored": errored,
+                                                        "finished": self._on_finished})
+        except BaseException:
+            self._timer.stop()
+            self._bridge.detach()
+            self.worker = None
+            self._finished_cb = None
+            raise
+        return True
+
+    def _status_text(self) -> str:
+        text = f"{self.label} ... {self.elapsed_text()}"
+        return text + (f": {self.progress}" if self.progress else "")
+
+    def _tick(self) -> None:
+        set_viewer_status(self.viewer, self._status_text())
+
+    def _on_line(self, text: str) -> None:
+        if self.worker is None:
+            return
+        shown = self._line_format(text) if self._line_format is not None else text[:160]
+        if shown is not None:
+            self.progress = shown
+        set_viewer_status(self.viewer, self._status_text())
+
+    def _on_finished(self) -> None:
+        self._timer.stop()
+        self._bridge.detach()
+        self.worker = None
+        cb, self._finished_cb = self._finished_cb, None
+        if cb is not None:
+            cb()
