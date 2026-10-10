@@ -263,8 +263,12 @@ root.
    has not been timed through this dock yet). The summary under the buttons gives the hold-out F1 and miss
    rate; compare them with the design gate printed below them before using the model for numbers.
 7. **Register model** (the fields are already filled in). The status line shows the profile line to use,
-   `segmentation.nuclei.cellpose_model: <name>`, in a profile that `extends:` the one you started from. Rerun
-   the series with that profile; export again into a new training folder if a second round is wanted.
+   `segmentation.nuclei.cellpose_model: <absolute path of the model file>`, in a profile that `extends:` the
+   one you started from. Use the absolute path: the bare model name resolves only in a germquant whose model
+   registry holds it, and this plugin's environment and the engine's `.venv` keep separate registries unless
+   both set the same `GERMQUANT_MODELS` (the engine refuses an unknown bare name rather than segmenting with
+   Cellpose's stock weights). Rerun the series with that profile; export again into a new training folder if
+   a second round is wanted.
 
 ## First run of the Time-lapse dock: a series as layers
 

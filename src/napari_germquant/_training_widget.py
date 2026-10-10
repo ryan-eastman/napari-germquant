@@ -508,7 +508,16 @@ class TrainingWidget(QWidget):
                 pass
         self.image_layer.name = f"{stem} image"
         self.labels_layer.name = f"{stem} labels"
+        # napari keeps a Labels layer's undo history when its data is replaced, so one Ctrl+Z after Next would
+        # paste the previous pair's stroke into this one (and Save would accept it as a correction). Switching
+        # editable off resets the history (napari's _on_editable_changed); the paint mode is restored after.
+        mode = self.labels_layer.mode
+        self.labels_layer.editable = False
         self.labels_layer.editable = True
+        try:
+            self.labels_layer.mode = mode
+        except Exception:  # noqa: BLE001 - a mode the restored layer refuses falls back to napari's default
+            pass
         try:
             self.viewer.layers.selection.active = self.labels_layer
         except Exception:  # noqa: BLE001

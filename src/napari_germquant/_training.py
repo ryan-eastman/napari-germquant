@@ -432,7 +432,11 @@ def register_summary(entry: dict) -> str:
              f"{int(entry['size']) // 1_000_000} MB) in {models_registry.local_registry_path()}"]
     if entry.get("card"):
         lines.append(f"card: {entry['card']}")
-    lines.append(f"use it with  segmentation.nuclei.cellpose_model: {entry['name']}  in a profile")
+    lines.append(f"use it with  segmentation.nuclei.cellpose_model: {entry['path']}  in a profile (the absolute "
+                 "path works in every environment on this computer)")
+    lines.append(f"the bare name {entry['name']!r} resolves only in a germquant whose registry is "
+                 f"{models_registry.local_registry_path()}; the engine refuses an unregistered name rather than "
+                 "segmenting with Cellpose's stock weights")
     return "\n".join(lines)
 
 

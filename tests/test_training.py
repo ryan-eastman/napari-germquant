@@ -344,7 +344,9 @@ def test_dock_trains_without_blocking_and_registers(make_napari_viewer, qtbot, p
     _wait(qtbot, w, "last_register")
     assert R.resolve_registered("live_test") == model.resolve()
     assert R.local_registry_path() == models_root / "models" / "local_models.json"
-    assert "registered live_test" in w.status_label.text() and "cellpose_model: live_test" in w.status_label.text()
+    status = w.status_label.text()
+    assert "registered live_test" in status and "cellpose_model: " in status and "live_test" in status
+    assert "absolute" in status and "resolves only in a germquant whose registry is" in status
 
 
 def test_dock_reports_a_failed_training(make_napari_viewer, qtbot, pairs, tmp_path, fake_cellpose):
@@ -377,3 +379,23 @@ def test_dock_through_the_plugin_menu_keeps_two_layers(make_napari_viewer, pairs
     assert w.next_pair() and w.next_pair() and w.previous_pair()
     assert len(viewer.layers) == 2 and w.index == 1
     assert np.array_equal(viewer.layers[1].data, T.read_pair(w.pairs[1])[1])
+
+
+def test_undo_after_paging_does_not_carry_a_stroke_into_the_next_pair(make_napari_viewer, pairs):
+    """napari keeps a Labels layer's undo history when its data is replaced; the dock resets it on every page,
+    so Ctrl+Z after Next cannot paste the previous pair's stroke into this one (and Save cannot record it)."""
+    viewer = make_napari_viewer()
+    w = TrainingWidget(viewer)
+    assert w.open_pairs(pairs) == 8
+    lab = w.labels_layer
+    lab.brush_size = 3
+    lab.paint((2, 2), 55)                                 # recorded in the layer's undo history
+    assert w.is_dirty()
+    assert w.save_current() is not None
+    assert w.next_pair()
+    expected = T.read_pair(w.pairs[1])[1]
+    lab.undo()
+    assert np.array_equal(lab.data, expected) and not w.is_dirty()
+    lab.redo()
+    assert np.array_equal(lab.data, expected) and not w.is_dirty()
+    assert lab.editable
