@@ -1,0 +1,28 @@
+# ---- microscopy data and results never go in the repository ----
+*.nd2
+*.tif
+*.tiff
+*.ome.tif
+*.ome.tiff
+*.czi
+*.lif
+*.ims
+*.zarr/
+results/
+results_*/
+*_results/
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/
+
+# ---- os / editor ----
+.DS_Store
+.vscode/
+.idea/

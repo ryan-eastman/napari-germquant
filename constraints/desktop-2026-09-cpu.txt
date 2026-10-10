@@ -1,0 +1,21 @@
+# constraints/desktop-2026-09.txt of the germquant checkout with the torch, torchvision and cupy lines
+# removed, for a plugin environment that installs the CPU torch wheel (no CUDA). Every other pin is the
+# workstation's validated version. Used only for the cellpose and bioio install steps in README.md;
+# the plugin's own install step uses the engine's file unchanged.
+cellacdc==1.7.1
+cellpose==4.2.1.1
+dask==2026.6.0
+matplotlib==3.11.0
+nd2==0.11.3
+numba==0.65.1
+numpy==2.4.6
+opencv-python-headless==4.13.0.92
+pandas==3.0.3
+pyarrow==24.0.0
+PyYAML==6.0.3
+scikit-image==0.26.0
+scikit-learn==1.9.0
+scipy==1.17.1
+skan==0.13.1
+spotmax==1.3.1
+tifffile==2026.3.3

@@ -1,0 +1,35 @@
+# npe2 manifest. `name` is THE PLUGIN NAME (it must equal `name` in pyproject.toml and prefixes every
+# command id below; npe2 rejects a command id that does not start with the plugin name). NAMING.md
+# lists every place the name appears.
+name: napari-germquant
+display_name: germquant
+contributions:
+  commands:
+    - id: napari-germquant.get_reader
+      python_name: napari_germquant._reader:napari_get_reader
+      title: Open a 3D stack with germquant (one layer per channel)
+    - id: napari-germquant.run_widget
+      python_name: napari_germquant._run_widget:RunWidget
+      title: germquant Run
+    - id: napari-germquant.results_widget
+      python_name: napari_germquant._results_widget:ResultsWidget
+      title: germquant Results
+  readers:
+    - command: napari-germquant.get_reader
+      # the suffixes germquant.api.SUPPORTED_SUFFIXES lists; tests/test_manifest.py keeps them in step
+      filename_patterns:
+        - "*.nd2"
+        - "*.tif"
+        - "*.tiff"
+        - "*.ome.tif"
+        - "*.ome.tiff"
+        - "*.czi"
+        - "*.lif"
+        - "*.zarr"
+        - "*.ome.zarr"
+      accepts_directories: true
+  widgets:
+    - command: napari-germquant.run_widget
+      display_name: Run
+    - command: napari-germquant.results_widget
+      display_name: Results

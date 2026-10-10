@@ -1,0 +1,3 @@
+# Normalise line endings to LF in the repository (the workstation has core.autocrlf=true).
+* text=auto eol=lf
+*.png binary

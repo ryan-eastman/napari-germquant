@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# THE PLUGIN NAME. It appears here, as the entry-point key below, and as `name:` (plus the command id
+# prefixes) in src/napari_germquant/napari.yaml. NAMING.md lists every place to touch when renaming.
+name = "napari-germquant"
+version = "0.1.0.dev0"
+description = "napari plugin that drives the germquant engine: open a 3D stack, map channel roles, choose a profile and stages, run, review nuclei and spots"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Ryan Eastman" }]
+classifiers = [
+  "Framework :: napari",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+  # napari 0.9 is the host; the 0.9 minor is pinned because the widget code touches napari's API
+  # (thread_worker, layer features, the npe2 manifest schema). PyQt6 is the one Qt binding.
+  "napari[pyqt6]>=0.9,<0.10",
+  # the engine. Not on PyPI: install it first, editable, from a checkout (README.md), then this package.
+  "germquant>=0.1.0",
+  "qtpy>=2.4",
+  "numpy>=1.25",
+  "pandas>=2.0",
+  "pyyaml>=6",
+  "tifffile>=2023.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-qt>=4.4", "ruff>=0.4"]
+
+[project.entry-points."napari.manifest"]
+napari-germquant = "napari_germquant:napari.yaml"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+napari_germquant = ["napari.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -p no:zarr: zarr (pulled in by bioio-ome-tiff) registers a pytest plugin that only serves zarr's own
+# tests and, on the Windows workstation, breaks pyarrow imports during collection (the germquant
+# pyproject has the same note). --strict-markers: a typo in a marker name fails instead of passing.
+addopts = "-p no:zarr --strict-markers"
+markers = [
+  "realdata: needs the local .nd2 copies under C:/Users/ryane/n2_rad51_local (the test skips itself otherwise)",
+  "nas: reads a file header from the lab NAS; opt in with NAPARI_GERMQUANT_NAS_TEST=1",
+]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+# the engine's rule set (classic defaults written out), see the germquant pyproject
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E702"]
