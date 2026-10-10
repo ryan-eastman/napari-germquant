@@ -73,7 +73,7 @@ uses:
 
 ```
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-uv pip install -c <germquant>\constraints\desktop-2026-09.txt --extra-index-url https://download.pytorch.org/whl/cu128 -e "<germquant>[gpu,sc]"
+uv pip install -c <germquant>\constraints\desktop-2026-09.txt --extra-index-url https://download.pytorch.org/whl/cu128 -e "<germquant>[gpu,sc,readers]"
 uv pip install -c <germquant>\constraints\desktop-2026-09.txt --extra-index-url https://download.pytorch.org/whl/cu128 spotmax cellacdc
 ```
 
@@ -83,7 +83,7 @@ the torch, torchvision and cupy lines removed so the CPU wheel is kept):
 
 ```
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
-uv pip install -c <germquant>\constraints\desktop-2026-09.txt -e <germquant>
+uv pip install -c <germquant>\constraints\desktop-2026-09.txt -e "<germquant>[readers]"
 uv pip install -c constraints\desktop-2026-09-cpu.txt cellpose==4.2.1.1 bioio bioio-ome-tiff bioio-tifffile
 ```
 
@@ -108,7 +108,7 @@ you see. In Terminal, in this project's folder:
 
 ```
 uv venv --python 3.11 .venv
-uv pip install -c <germquant>/constraints/mac-arm64-2026-09.txt -e "<germquant>[gpu,sc]"
+uv pip install -c <germquant>/constraints/mac-arm64-2026-09.txt -e "<germquant>[gpu,sc,readers]"
 uv pip install -c <germquant>/constraints/mac-arm64-2026-09.txt spotmax cellacdc
 uv pip install -c <germquant>/constraints/mac-arm64-2026-09.txt -e ".[dev]"
 .venv/bin/germquant get-model

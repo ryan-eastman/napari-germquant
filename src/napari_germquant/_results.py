@@ -50,9 +50,14 @@ class ResultsSet:
         if not p.is_file():
             return None
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            data = json.loads(p.read_text(encoding="utf-8"))
         except ValueError:
             return None
+        # the engine nests the per-stage records under "stages" next to image_id, config_hash and
+        # complete; an older flat document is returned as is
+        if isinstance(data, dict) and isinstance(data.get("stages"), dict):
+            return data["stages"]
+        return data
 
     def spacing(self) -> tuple[float, float, float]:
         """(dz, dy, dx) from the shared metadata block of image_summary (one row, always written), else
