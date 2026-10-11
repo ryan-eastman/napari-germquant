@@ -6,7 +6,9 @@ Image layer when the series kept them, and the track points as a Tracks layer (p
 track as Points) once the series is linked. The coordinates toggle switches every layer between the raw
 microscope frame and the registered frame (raw minus the cumulative drift of each timepoint). Register and
 Link run ``germquant register`` and ``germquant track-link`` (their Python functions, in thread workers)
-and reload what they wrote. Everything the dock decides is in ``_timelapse`` (no Qt).
+and reload what they wrote; Register's mode is rigid (one shift per timepoint) or piecewise (one shift per
+axial segment of the germline, for a germline that slides inside the worm), and Link's registration says
+which of the two tables it subtracts. Everything the dock decides is in ``_timelapse`` (no Qt).
 """
 from __future__ import annotations
 
@@ -118,6 +120,26 @@ class TimelapseWidget(QWidget):
         reg_box = QGroupBox("Register the drift (germquant register)")
         reg = QFormLayout(reg_box)
         defaults = TL.RegisterSettings()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(list(TL.REGISTER_MODES))
+        self.mode_combo.setCurrentText(defaults.mode)
+        self.mode_combo.setToolTip("rigid: one translation per timepoint; piecewise: one translation per segment "
+                                   "along the gonad axis, for a germline that slides inside the worm (always "
+                                   "against the previous timepoint)")
+        self.mode_combo.currentTextChanged.connect(lambda _text: self._mode_changed())
+        reg.addRow("Mode", self.mode_combo)
+        self.segments_spin = QSpinBox()
+        self.segments_spin.setRange(1, 64)
+        self.segments_spin.setValue(defaults.segments)
+        self.segments_spin.setToolTip("piecewise: segments of equal nucleus count along the axis (at least 5 "
+                                      "germline nuclei each)")
+        reg.addRow("Segments", self.segments_spin)
+        self.margin_spin = QDoubleSpinBox()
+        self.margin_spin.setRange(0.0, 100.0)
+        self.margin_spin.setDecimals(1)
+        self.margin_spin.setValue(defaults.margin_um)
+        self.margin_spin.setToolTip("piecewise: how far a segment's crop reaches beyond its nuclei in y and x")
+        reg.addRow("Margin (um)", self.margin_spin)
         self.reference_combo = QComboBox()
         self.reference_combo.addItems(["previous", "t0"])
         self.reference_combo.setCurrentText(defaults.reference)
@@ -144,6 +166,7 @@ class TimelapseWidget(QWidget):
         self.register_btn = QPushButton("Register")
         self.register_btn.clicked.connect(lambda: self.register())
         reg.addRow("", self.register_btn)
+        self._mode_changed()
         self.shifts_label = QLabel("")
         self.shifts_label.setWordWrap(True)
         self.shifts_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -166,6 +189,12 @@ class TimelapseWidget(QWidget):
                 if item is not None:
                     item.setEnabled(False)
         link.addRow("Backend", self.backend_combo)
+        self.registration_combo = QComboBox()
+        self.registration_combo.addItems(list(TL.REGISTRATIONS))
+        self.registration_combo.setToolTip("rigid: subtract each timepoint's shift (register_shifts); piecewise: "
+                                           "subtract each nucleus's displacement along the gonad axis "
+                                           "(register_piecewise, from Register in piecewise mode)")
+        link.addRow("Registration", self.registration_combo)
         self.all_nuclei_check = QCheckBox("link every nucleus, not only the germline ones (--all-nuclei)")
         link.addRow("", self.all_nuclei_check)
         self.link_btn = QPushButton("Link")
@@ -209,6 +238,25 @@ class TimelapseWidget(QWidget):
         """Raw or registered coordinates for every layer of the dock (the radio buttons)."""
         (self.reg_radio if registered else self.raw_radio).setChecked(True)
 
+    def _mode_changed(self) -> None:
+        """Piecewise: the segment options apply and the reference is the previous timepoint."""
+        piecewise = self.mode_combo.currentText() == "piecewise"
+        self.segments_spin.setEnabled(piecewise)
+        self.margin_spin.setEnabled(piecewise)
+        if piecewise:
+            self.reference_combo.setCurrentText("previous")
+        self.reference_combo.setEnabled(not piecewise)
+
+    def _set_piecewise_available(self, available: bool) -> None:
+        """The piecewise link registration needs the register_piecewise table."""
+        i = self.registration_combo.findText("piecewise")
+        item = self.registration_combo.model().item(i) if i >= 0 else None
+        if item is not None:
+            item.setEnabled(bool(available))
+            item.setToolTip("" if available else "no register_piecewise table yet: press Register in piecewise mode")
+        if not available and self.registration_combo.currentText() == "piecewise":
+            self.registration_combo.setCurrentText("rigid")
+
     def select_backend(self, backend: str) -> None:
         for i in range(self.backend_combo.count()):
             if self.backend_combo.itemData(i) == backend:
@@ -234,6 +282,14 @@ class TimelapseWidget(QWidget):
             self._update_buttons()
             return None
         self._set_view(view)
+        # the starting values the commands would use without options: the series' own config, else code defaults
+        start = TL.series_defaults(view.folder)
+        self.segments_spin.setValue(start["segments"])
+        self.margin_spin.setValue(start["margin_um"])
+        reg = start["registration"] if (start["registration"] != "piecewise" or view.has_piecewise) else "rigid"
+        if view.linked_piecewise and view.has_piecewise:
+            reg = "piecewise"
+        self.registration_combo.setCurrentText(reg)
         self.load_layers()
         self._status(f"opened {view.stem}", GREEN)
         return view
@@ -241,7 +297,9 @@ class TimelapseWidget(QWidget):
     def _set_view(self, view: TL.SeriesView) -> None:
         self.view = view
         self.info_label.setText(TL.info_text(view))
-        self.shifts_label.setText(TL.shifts_summary(view))
+        pw = TL.piecewise_summary(view)
+        self.shifts_label.setText(TL.shifts_summary(view) + (f"\n{pw}" if pw else ""))
+        self._set_piecewise_available(view.has_piecewise)
         rows = TL.shift_rows(view)
         self.shifts_table.setRowCount(len(rows))
         for i, cells in enumerate(rows):
@@ -351,11 +409,15 @@ class TimelapseWidget(QWidget):
         return TL.RegisterSettings(reference=self.reference_combo.currentText(),
                                    upsample=int(self.upsample_spin.value()),
                                    max_step_um=float(self.max_step_spin.value()),
-                                   normalization=self.norm_combo.currentText())
+                                   normalization=self.norm_combo.currentText(),
+                                   mode=self.mode_combo.currentText(),
+                                   segments=int(self.segments_spin.value()),
+                                   margin_um=float(self.margin_spin.value()))
 
     def link_settings(self) -> TL.LinkSettings:
         return TL.LinkSettings(backend=str(self.backend_combo.currentData()),
-                               all_nuclei=self.all_nuclei_check.isChecked())
+                               all_nuclei=self.all_nuclei_check.isChecked(),
+                               registration=self.registration_combo.currentText())
 
     def register(self) -> bool:
         """``germquant register`` on the open series, in a thread worker."""
@@ -364,21 +426,27 @@ class TimelapseWidget(QWidget):
                          AMBER)
             return False
         folder = self.view.folder
-        settings = self.register_settings()
+        try:
+            settings = self.register_settings()
+        except ValueError as e:
+            self._status(str(e), RED)
+            return False
         self.last_register = None
         self.last_error = None
         cmd = settings.command(folder)
-        self._status(f"registering {self.view.stem} ...\n{cmd}")
+        self._status(f"registering {self.view.stem} ({settings.mode}) ...\n{cmd}")
         self.runner.start(lambda: TL.register(folder, settings), label=f"registering {self.view.stem}",
-                          returned=lambda res: self._on_registered(res, cmd),
+                          returned=lambda res: self._on_registered(res, cmd, settings.mode),
                           errored=lambda e: self._on_errored(e, "register"), finished=self._update_buttons)
         self._update_buttons()
         return True
 
-    def _on_registered(self, res: dict, cmd: str) -> None:
+    def _on_registered(self, res: dict, cmd: str, mode: str = "rigid") -> None:
         self.last_register = res
         if not self._reload():
             return
+        if mode in TL.REGISTRATIONS:
+            self.registration_combo.setCurrentText(mode)      # Link next subtracts what was just registered
         self._status(f"registered {res['series_id']}: {res['table_path']}\nsame as: {cmd}", GREEN)
         set_viewer_status(self.viewer, f"{res['series_id']} registered")
 

@@ -24,6 +24,7 @@ from napari_germquant import _timelapse as TL
 from napari_germquant._timelapse_widget import TimelapseWidget
 from germquant import cli
 from germquant.timelapse import layout as gq_layout
+from germquant.timelapse import piecewise as gq_piecewise
 from germquant.timelapse import register as gq_register
 from germquant.timelapse import track as gq_track
 
@@ -235,6 +236,100 @@ def test_settings_reproduce_the_command_line_arguments(series, monkeypatch):
         TL.LinkSettings("trackmate")
 
 
+def test_piecewise_settings_reproduce_the_command_line_arguments(series, monkeypatch):
+    """Register in piecewise mode and Link with the piecewise registration call the engine with exactly the
+    arguments `germquant register --mode piecewise` and `germquant track-link --registration piecewise` pass,
+    and the dock starts from the values those commands use without options."""
+    class Stop(BaseException):
+        pass
+
+    def recorder(fn, sink):
+        sig = inspect.signature(fn)
+
+        def rec(*a, **k):
+            bound = sig.bind(*a, **k)
+            bound.apply_defaults()
+            sink.append({key: (str(v) if isinstance(v, Path) else v) for key, v in bound.arguments.items()})
+            raise Stop
+        return rec
+
+    seen: list = []
+    monkeypatch.setattr(gq_piecewise, "register_series_piecewise", recorder(gq_piecewise.register_series_piecewise, seen))
+    settings = TL.RegisterSettings(mode="piecewise", segments=3, margin_um=4.5, upsample=4, max_step_um=2.5,
+                                   normalization="phase")
+    with pytest.raises(Stop):
+        TL.register(series, settings)
+    with pytest.raises(Stop):
+        cli.main(settings.argv(series))
+    assert seen[0] == seen[1]
+    assert seen[0]["segments"] == 3 and seen[0]["margin_um"] == 4.5 and seen[0]["taper"] is None
+    assert seen[0]["cfg"] == {"timelapse": {"track": {"max_dist_um": 2.5}}}
+    assert TL.RegisterSettings(mode="piecewise").argv(series)[2:] == [
+        "--mode", "piecewise", "--segments", "4", "--margin-um", "6", "--upsample", "10", "--max-step-um", "5",
+        "--normalization", "none"]
+    with pytest.raises(ValueError, match="previous"):
+        TL.RegisterSettings(mode="piecewise", reference="t0")
+    with pytest.raises(ValueError, match="mode"):
+        TL.RegisterSettings(mode="affine")
+
+    seen.clear()
+    monkeypatch.setattr(gq_track, "link_series", recorder(gq_track.link_series, seen))
+    ls = TL.LinkSettings("overlap_inhouse", registration="piecewise")
+    with pytest.raises(Stop):
+        TL.link(series, ls)
+    with pytest.raises(Stop):
+        cli.main(ls.argv(series))
+    assert seen[0] == seen[1] and seen[0]["registration"] == "piecewise"
+    with pytest.raises(ValueError, match="registration"):
+        TL.LinkSettings("overlap_inhouse", registration="elastic")
+
+    assert TL.series_defaults(series) == {"segments": 4, "margin_um": 6.0, "registration": "rigid"}
+    (series / "run_manifest.json").write_text(json.dumps({"config": {"timelapse": {
+        "register": {"piecewise_segments": 2, "piecewise_margin_um": 3.0}, "track": {"registration": "piecewise"}}}}))
+    assert TL.series_defaults(series) == {"segments": 2, "margin_um": 3.0, "registration": "piecewise"}
+
+
+def test_piecewise_register_link_and_the_registered_view(series):
+    """A piecewise Register and Link through the glue on the synthetic series: the tables are written, the view
+    says how the tracks were linked, the registered labels move label by label (each lands within half a voxel
+    of its registered centroid; the off-gonad nucleus, which has no track point, is left out), and the
+    reference volumes stay raw."""
+    res = TL.register(series, TL.RegisterSettings(mode="piecewise", segments=1))
+    assert (series / f"{STEM}__register_piecewise.csv").is_file() and len(res["table"]) == T
+    view = TL.open_series(series)
+    assert view.has_piecewise and not view.linked_piecewise and view.shift_source == "none"
+    text = TL.info_text(view)
+    assert "piecewise registration:" in text and "registration: none yet" not in text
+    assert "segment 0 (axis" in TL.piecewise_summary(view)
+
+    TL.link(series, TL.LinkSettings("overlap_inhouse", registration="piecewise"))
+    view = TL.open_series(series)
+    assert view.linked_piecewise and view.link_record["shift_source"] == "register_piecewise"
+    assert "piecewise registration)" in TL.info_text(view) and any("registered view" in n for n in view.notes)
+    pts = view.points
+    reg = TL.labels_stack(view, registered=True)
+    assert reg.shape == (T, *SHAPE)
+    moved = 0
+    for k in range(T):
+        frame = np.asarray(reg[k])
+        nuclei = pd.read_csv(series / f"t{k:03d}" / f"{STEM}_t{k:03d}__nuclei.csv")
+        junk = int(nuclei.loc[~nuclei["in_germline"].astype(bool), "nucleus_id"].iloc[0])
+        assert not (frame == junk).any()
+        for r in pts[pts["t_index"] == k].itertuples():
+            vox = np.argwhere(frame == int(r.nucleus_id))
+            assert len(vox), (k, r.nucleus_id)
+            centre = vox.mean(axis=0) * np.array(SPACING)
+            target = np.array([r.reg_z_um, r.reg_y_um, r.reg_x_um])
+            assert np.all(np.abs(centre - target) <= 0.5 * np.array(SPACING) + 1e-6), (k, r.nucleus_id, centre, target)
+            moved += int(not np.allclose([r.z_um, r.y_um, r.x_um], target))
+    assert moved > 0
+    ref_raw, _ = TL.reference_stack(view)
+    ref_reg, _ = TL.reference_stack(view, registered=True)
+    assert np.array_equal(np.asarray(ref_reg), np.asarray(ref_raw))
+    assert TL.frame_shifts(view, SPACING, True) == {}
+    assert np.array_equal(np.asarray(TL.labels_stack(view)[2]), _labels(series, 2))
+
+
 def test_backend_choices_say_what_is_installed():
     choices = {b: (usable, what) for b, usable, what in TL.backend_choices()}
     assert list(choices) == list(gq_track.BACKENDS)
@@ -324,6 +419,43 @@ def test_dock_opens_registers_links_and_toggles(make_napari_viewer, qtbot, serie
     assert "tracks" not in w.layers and f"{STEM} tracks" not in [layer.name for layer in viewer.layers]
     free = w.layers["unlinked"]
     assert type(free).__name__ == "Points" and len(free.data) == len(GERMLINE) * T and free.ndim == 4
+
+
+def test_dock_registers_and_links_piecewise(make_napari_viewer, qtbot, series):
+    """Mode piecewise in the dock: the segment options switch on, the reference is fixed to the previous
+    timepoint, Register writes the piecewise table and selects it for Link, and the registered view of the
+    piecewise-linked series moves the labels label by label while the reference layer stays raw."""
+    viewer = make_napari_viewer()
+    w = TimelapseWidget(viewer)
+    w.open_folder(str(series))
+    item = w.registration_combo.model().item(w.registration_combo.findText("piecewise"))
+    assert not item.isEnabled() and w.registration_combo.currentText() == "rigid"
+    assert not w.segments_spin.isEnabled() and w.reference_combo.isEnabled()
+    w.reference_combo.setCurrentText("t0")
+    w.mode_combo.setCurrentText("piecewise")
+    assert w.segments_spin.isEnabled() and w.margin_spin.isEnabled() and not w.reference_combo.isEnabled()
+    assert w.reference_combo.currentText() == "previous"
+    w.segments_spin.setValue(1)
+    assert w.register()
+    _wait(qtbot, w, "last_register")
+    assert "--mode piecewise" in w.status_label.text() and "segment 0 (axis" in w.shifts_label.text()
+    assert item.isEnabled() and w.registration_combo.currentText() == "piecewise"
+    w.select_backend("overlap_inhouse")
+    assert w.link()
+    _wait(qtbot, w, "last_link")
+    rec = w.last_link["record"]
+    assert rec["registration"] == "piecewise" and rec["n_tracks"] == len(GERMLINE)
+    assert "piecewise registration" in w.link_label.text() and "piecewise registration" in w.info_label.text()
+    w.set_coordinates(True)
+    expected = np.asarray(TL.labels_stack(w.view, registered=True)[2])
+    assert np.array_equal(np.asarray(w.layers["labels"].data[2]), expected)
+    assert np.array_equal(np.asarray(w.layers["reference"].data[2]), _ref(series, 2))
+    pts = pd.read_csv(series / f"{STEM}__track_points.csv")
+    linked = pts[pts["time_track_id"].notna()].sort_values(["time_track_id", "t_index"])
+    assert np.allclose(w.layers["tracks"].data[:, 2:], linked[["reg_z_um", "reg_y_um", "reg_x_um"]].to_numpy(float))
+    # reopening the folder keeps the piecewise choice the tracks were linked with
+    w.open_folder(str(series))
+    assert w.registration_combo.currentText() == "piecewise"
 
 
 def test_dock_reports_a_folder_that_is_not_a_series(make_napari_viewer, tmp_path):
