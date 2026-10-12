@@ -1,0 +1,21 @@
+# GUI and test pins for the plugin's continuous integration (.github/workflows/ci.yml; ubuntu-latest,
+# windows-latest and macos-14, Python 3.11). The versions the lab workstation's plugin environment resolved to on
+# 2026-10-09 (constraints/plugin-venv-2026-10-09.txt), for the packages the engine's own constraints files do not
+# pin. The workflow combines this file with the engine checkout's constraints/ci-cpu-2026-10.txt (macOS:
+# ci-mac-arm64-2026-10.txt) and constraints/readers-2026-10.txt, which pin numpy, pandas, torch, cellpose, pytest,
+# ruff and the bioio readers; no package appears in two files, so the three cannot conflict. Install with
+#   uv pip install -c <engine>/constraints/ci-cpu-2026-10.txt -c <engine>/constraints/readers-2026-10.txt \
+#     -c constraints/ci-plugin-2026-10.txt -e ".[dev]"
+napari==0.9.2
+npe2==0.9.0
+magicgui==0.10.2
+app-model==0.5.1
+in-n-out==0.2.1
+psygnal==0.16.1
+superqt==0.8.2
+vispy==0.17.0
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.2
+PyQt6-sip==13.13.0
+qtpy==2.4.3
+pytest-qt==4.5.0

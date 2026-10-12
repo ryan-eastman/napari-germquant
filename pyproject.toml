@@ -6,8 +6,8 @@ build-backend = "setuptools.build_meta"
 # THE PLUGIN NAME. It appears here, as the entry-point key below, and as `name:` (plus the command id
 # prefixes) in src/napari_germquant/napari.yaml. NAMING.md lists every place to touch when renaming.
 name = "napari-germquant"
-version = "0.1.0.dev0"
-description = "napari plugin that drives the germquant engine: open a 3D stack, map channel roles, choose a profile and stages, run, review nuclei and spots, correct labels and train a nucleus model, review a time-lapse series"
+version = "0.2.0.dev0"
+description = "napari plugin that drives the germquant engine: pick a system pack or a profile, map channel roles, choose stages, run in the engine's own environment, review nuclei or cells and spots, correct labels and train a nucleus model, review a time-lapse series"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -23,7 +23,10 @@ dependencies = [
   # (thread_worker, layer features, the npe2 manifest schema). PyQt6 is the one Qt binding.
   "napari[pyqt6]>=0.9,<0.10",
   # the engine. Not on PyPI: install it first, editable, from a checkout (README.md), then this package.
-  "germquant>=0.1.0",
+  # System packs need 0.2.0.dev0 (docs/DESIGN_system_packs.md 8.9). PEP 440 sorts 0.2.0.dev0 before 0.2, so a
+  # plain >=0.2 would refuse the development engine; after the engine's v0.2.0 tag this becomes >=0.2,<0.3.
+  # The pack features are also gated in code on hasattr(api, "list_packs"), so an older engine gets one message.
+  "germquant>=0.2.0.dev0,<0.3",
   "qtpy>=2.4",
   "numpy>=1.25",
   "pandas>=2.0",

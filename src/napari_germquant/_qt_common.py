@@ -25,8 +25,9 @@ def add_layer_tuples(viewer, layer_tuples) -> list:
     return added
 
 
-# the loggers whose INFO lines are worth a status-bar glance while the engine works
-_LOGGERS = ("germquant", "cellpose", "spotmax")
+# the loggers whose INFO lines are worth a status-bar glance while the engine works ("napari_germquant.engine"
+# carries the lines an engine subprocess prints, _runner.py)
+_LOGGERS = ("germquant", "cellpose", "spotmax", "napari_germquant")
 # Several docks can run an engine call at the same time (a Run and a training, say). The logger levels are
 # raised to INFO when the first bridge attaches and put back when the last one detaches, so one dock
 # finishing never silences another that is still running.

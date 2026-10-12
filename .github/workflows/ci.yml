@@ -1,0 +1,138 @@
+# Continuous integration of napari-germquant: lint and the whole plugin test suite on Linux, Windows and macOS
+# (Apple Silicon), against the germquant engine at a pinned commit (the engine's docs/DESIGN_system_packs.md,
+# section 8.10, and gate G1).
+#
+# The engine: checked out from its public repository at ENGINE_COMMIT and installed editable with the readers
+# extra, so the built-in packs are found in that checkout. While a tranche's train is open the pin is the head
+# of the engine's integration branch (feat/tranche5, 0521abf for train A); it moves to the engine's main commit
+# after the engine pull request merges, and only then does the plugin pull request merge. If the engine
+# repository ever becomes private, the engine checkout needs a read token (open question O22).
+#
+# The test pack: tests/fixtures/packs/test_pack is a copy of the engine's tests/fixtures/packs/test_pack, so the
+# tests need no sibling checkout. A step compares the copy's SHA256SUMS with the engine checkout's and verifies
+# every file of the copy against it, so the two copies cannot drift.
+#
+# The engine interpreter: the subprocess runner tests use sys.executable as the engine interpreter, with the
+# job's environment inherited, as the workstation tests do (section 9 of the design).
+#
+# Environment: Python 3.11 and uv. torch and torchvision are CPU wheels (PyPI's arm64 build on macOS); the engine
+# and the plugin resolve against the engine checkout's constraints (ci-cpu-2026-10.txt, ci-mac-arm64-2026-10.txt on
+# macOS, and readers-2026-10.txt) plus constraints/ci-plugin-2026-10.txt here (napari, PyQt6, pytest-qt). Cellpose
+# is installed as in the README's laptop install (some pack checks look for it). SpotMAX is not installed, as in
+# the workstation's plugin environment; tests that need it skip or expect it missing.
+#
+# Qt: QT_QPA_PLATFORM=offscreen for the whole job. tests/conftest.py answers napari's two OpenGL queries with
+# constants under offscreen, so nothing is rendered and no GPU is touched (none of these runners has one).
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QT_QPA_PLATFORM: offscreen
+  # -1, not an empty string (Windows drops empty variables): torch sees no CUDA device
+  CUDA_VISIBLE_DEVICES: "-1"
+  ENGINE_REPOSITORY: ryan-eastman/C_elegans_germline_masking_and_spot_counting
+  # train A of tranche 5: the head of feat/tranche5 (0521abf, "Merge tranche-5 package P3")
+  ENGINE_COMMIT: 0521abf14da11c84ad6ab76a5c11c445253e7a84
+
+jobs:
+  test:
+    name: ${{ matrix.os }}, Python 3.11
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            engine_constraints: constraints/ci-cpu-2026-10.txt
+          - os: windows-latest
+            engine_constraints: constraints/ci-cpu-2026-10.txt
+          - os: macos-14
+            engine_constraints: constraints/ci-mac-arm64-2026-10.txt
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the plugin
+        uses: actions/checkout@v7
+        with:
+          path: plugin
+
+      - name: Check out the engine at the pinned commit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.ENGINE_REPOSITORY }}
+          ref: ${{ env.ENGINE_COMMIT }}
+          path: engine
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install uv (the uv cache directory is saved between runs)
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            plugin/pyproject.toml
+            plugin/constraints/ci-plugin-2026-10.txt
+            engine/constraints/ci-cpu-2026-10.txt
+            engine/constraints/ci-mac-arm64-2026-10.txt
+            engine/constraints/readers-2026-10.txt
+
+      - name: Install the Qt system libraries (Linux)
+        if: runner.os == 'Linux'
+        uses: tlambert03/setup-qt-libs@v1
+
+      - name: Install torch and torchvision (CPU wheels from the PyTorch index)
+        if: runner.os != 'macOS'
+        run: uv pip install --system --index-url https://download.pytorch.org/whl/cpu "torch==2.11.0" "torchvision==0.26.0"
+
+      - name: Install torch and torchvision (macOS arm64 wheels from PyPI)
+        if: runner.os == 'macOS'
+        run: uv pip install --system "torch==2.11.0" "torchvision==0.26.0"
+
+      - name: Install the engine, editable, with the readers extra (and Cellpose)
+        run: >-
+          uv pip install --system
+          -c "engine/${{ matrix.engine_constraints }}" -c engine/constraints/readers-2026-10.txt
+          -c plugin/constraints/ci-plugin-2026-10.txt
+          -e "./engine[readers]" "cellpose==4.2.1.1"
+
+      - name: Install the plugin with its test tools
+        run: >-
+          uv pip install --system
+          -c "engine/${{ matrix.engine_constraints }}" -c engine/constraints/readers-2026-10.txt
+          -c plugin/constraints/ci-plugin-2026-10.txt
+          -e "./plugin[dev]"
+
+      - name: Record the resolved environment
+        run: |
+          uv pip freeze --system
+          python -c "import germquant, napari, napari_germquant; print('germquant', germquant.__version__, germquant.__file__); print('napari', napari.__version__, 'plugin', napari_germquant.__file__)"
+          python -m germquant.packs --version
+
+      - name: The test pack copy matches the engine's
+        run: |
+          python -c "import pathlib, sys; norm = lambda p: pathlib.Path(p).read_bytes().replace(b'\r\n', b'\n'); same = norm('plugin/tests/fixtures/packs/test_pack/SHA256SUMS') == norm('engine/tests/fixtures/packs/test_pack/SHA256SUMS'); print('SHA256SUMS equal' if same else 'SHA256SUMS differ'); sys.exit(0 if same else 'tests/fixtures/packs/test_pack differs from the engine checkout: copy it from the engine again')"
+          python -m germquant.packs verify plugin/tests/fixtures/packs/test_pack
+
+      - name: Lint
+        working-directory: plugin
+        run: ruff check src tests
+
+      - name: Test
+        working-directory: plugin
+        run: pytest -q -rs tests

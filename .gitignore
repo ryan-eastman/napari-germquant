@@ -26,3 +26,12 @@ dist/
 .DS_Store
 .vscode/
 .idea/
+
+# The test pack is a copy of the engine's tests/fixtures/packs/test_pack and is tracked in full: its example
+# is an .ome.tif, ignored everywhere above. Only a folder-wide negation works (git never re-includes a file
+# whose parent folder is excluded), and these lines must stay LAST. The re-ignores keep caches and .DS_Store
+# out of it, as in the engine (docs/DESIGN_system_packs.md 3.7).
+!/tests/fixtures/packs/**
+/tests/fixtures/packs/**/__pycache__/
+/tests/fixtures/packs/**/*.py[cod]
+/tests/fixtures/packs/**/.DS_Store
