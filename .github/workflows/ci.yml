@@ -26,8 +26,11 @@
 # warm) took the time the README's Continuous integration section records; timeout-minutes sits a little above
 # the budget, so a job that blows it shows as failed instead of running on.
 #
-# Qt: QT_QPA_PLATFORM=offscreen for the whole job. tests/conftest.py answers napari's two OpenGL queries with
+# Qt: QT_QPA_PLATFORM=offscreen on Linux and Windows. tests/conftest.py answers napari's two OpenGL queries with
 # constants under offscreen, so nothing is rendered and no GPU is touched (none of these runners has one).
+# macOS uses Qt's native cocoa platform instead: under offscreen there is no OpenGL context on macOS, and
+# vispy's GL call in napari's viewer teardown segfaulted there (the first CI run, 2026-10-12). GitHub's macOS
+# runners have a window session, so a hidden viewer gets a real context; the conftest shim stays off.
 name: CI
 
 on:
@@ -44,7 +47,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  QT_QPA_PLATFORM: offscreen
   # -1, not an empty string (Windows drops empty variables): torch sees no CUDA device
   CUDA_VISIBLE_DEVICES: "-1"
   ENGINE_REPOSITORY: ryan-eastman/C_elegans_germline_masking_and_spot_counting
@@ -63,10 +65,15 @@ jobs:
         include:
           - os: ubuntu-latest
             engine_constraints: constraints/ci-cpu-2026-10.txt
+            qt_platform: offscreen
           - os: windows-latest
             engine_constraints: constraints/ci-cpu-2026-10.txt
+            qt_platform: offscreen
           - os: macos-14
             engine_constraints: constraints/ci-mac-arm64-2026-10.txt
+            qt_platform: cocoa
+    env:
+      QT_QPA_PLATFORM: ${{ matrix.qt_platform }}
     defaults:
       run:
         shell: bash
