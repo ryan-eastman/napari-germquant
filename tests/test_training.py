@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import tifffile
-from conftest import write_ome
+from conftest import engine_device, write_ome
 
 from napari_germquant import _training as T
 from napari_germquant._training_widget import TrainingWidget
@@ -218,10 +218,12 @@ def test_device_choice_reaches_the_engine_and_the_variable_is_restored(tmp_path,
     _index(pairs, fake_cellpose["lookup"])
     res = T.train(pairs, T.TrainSettings(out=tmp_path / "m" / "a", base="none", epochs=2, split_by="image",
                                          val_frac=0.5, device="cuda"))
-    # CUDA is hidden in the test session and there is no Apple GPU: the engine falls back to the CPU and says so
-    assert fake_cellpose["env"] == ["cuda"] and res["device"] == "cpu" and fake_cellpose["build"][-1][1] == "cpu"
+    # CUDA is hidden in the test session: the engine falls back (to mps on an Apple GPU, else the CPU) and says so
+    fallback = engine_device("cuda")
+    assert fallback != "cuda"
+    assert fake_cellpose["env"] == ["cuda"] and res["device"] == fallback and fake_cellpose["build"][-1][1] == fallback
     assert "GERMQUANT_DEVICE" not in os.environ
-    assert "asked for cuda" in T.train_summary(res, "cuda") and "asked for" not in T.train_summary(res, "cpu")
+    assert "asked for cuda" in T.train_summary(res, "cuda") and "asked for" not in T.train_summary(res, fallback)
     monkeypatch.setenv("GERMQUANT_DEVICE", "auto")
     T.train(pairs, T.TrainSettings(out=tmp_path / "m" / "b", base="none", epochs=1, split_by="image", device="mps"))
     assert fake_cellpose["env"][-1] == "mps" and os.environ["GERMQUANT_DEVICE"] == "auto"
@@ -368,7 +370,7 @@ def test_dock_without_a_viewer_and_without_input():
     assert not w.export() and "results or series folder" in w.status_label.text()
     assert w.open_pairs() == 0 and not w.train() and not w.register_model()
     assert w.device_combo.count() == 3 and [w.device_combo.itemData(i) for i in range(3)] == ["cuda", "mps", "cpu"]
-    assert w.device_combo.currentData() == T.default_device() == "cpu"     # CUDA hidden, no Apple GPU here
+    assert w.device_combo.currentData() == T.default_device() == engine_device()   # CUDA hidden; mps on a Mac
 
 
 def test_dock_through_the_plugin_menu_keeps_two_layers(make_napari_viewer, pairs):

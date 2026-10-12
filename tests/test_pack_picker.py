@@ -25,6 +25,7 @@ from conftest import (
     TINYNET_BYTES,
     TINYNET_SHA,
     copy_pack,
+    engine_device,
     settle,
 )
 from qtpy.QtCore import Qt
@@ -234,7 +235,7 @@ def test_cell_pack_names_cells_and_warns_about_the_segmenter(make_napari_viewer,
     assert not rw.banner.isHidden() and "expects cellpose" in rw.banner.text()
     prov = rw.provenance.text()
     for piece in ("pack: cell_pack@0.1.0   recipe: basic", "config_hash: 02bb83cf74f9", "model sha256: unused",
-                  f"git sha: {provenance.git_sha()}", "device used: cpu (asked for auto)"):
+                  f"git sha: {provenance.git_sha()}", f"device used: {engine_device()} (asked for auto)"):
         assert piece in prov, piece
     assert "cells: 5   mean spots per cell: 2.00" in rw.summary.text()
     assert "germline cells" not in rw.summary.text()                 # the germline stage is off in this pack

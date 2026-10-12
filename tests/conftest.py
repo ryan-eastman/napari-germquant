@@ -229,6 +229,16 @@ def second_python(tmp_path_factory) -> Path:
     return py
 
 
+def engine_device(prefer: str | None = "auto") -> str:
+    """The device the engine picks for ``prefer`` in this test session: germquant.device.select_device, the
+    function the engine itself calls. CUDA is hidden here (CUDA_VISIBLE_DEVICES=-1), but an Apple GPU is not:
+    on the macos-14 runner torch offers MPS, so "auto" (and a "cuda" request) give mps there and cpu on the
+    Linux and Windows runners. Tests compare with this instead of assuming the CPU."""
+    from germquant.device import select_device
+
+    return select_device(prefer, quiet=True)
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _offscreen_without_opengl():
     """Qt's ``offscreen`` platform plugin cannot create an OpenGL context on Windows (and macOS), and napari

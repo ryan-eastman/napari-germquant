@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import CHANNELS, IMAGE_ID, TEST_IMAGE, TEST_PACK, copy_pack, settle, write_ome
+from conftest import CHANNELS, IMAGE_ID, TEST_IMAGE, TEST_PACK, copy_pack, engine_device, settle, write_ome
 
 from napari_germquant._engine import Recipe
 from napari_germquant._run_widget import RED, RunWidget
@@ -214,7 +214,7 @@ def test_gui_run_writes_the_same_files_as_the_cli(make_napari_viewer, qtbot, syn
     assert start["config_hash"] == mb["config_hash"] == done["config_hash"]
     assert start["config_hash_source"].startswith("napari's germquant, the same version and git sha")
     assert start["xy_stride"] == stride
-    assert start["device_requested"] == "auto" and start["device_selected"] == "cpu"
+    assert start["device_requested"] == "auto" and start["device_selected"] == engine_device()
     assert start["engine"]["germquant"] == api.__version__ and start["engine"]["git_sha"]
     assert start["images"] == [{"path": str(image), "image_id": image_id, "out_dir": str(out_gui)}]
     assert done["done_sha256"] and done["stage_hashes"] == mb["stage_hashes"] and end["counts"]["done"] == 1
