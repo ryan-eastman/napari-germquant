@@ -122,6 +122,7 @@ class RunWidget(QWidget):
         self._engine_runner: EngineRunner | None = None
         self._engine_info: dict | None = None
         self._engine_error: str | None = None
+        self._last_engine_error: str = ""
         self._recipe_runners: dict[str, EngineRunner] = {}
         self._config_files: list[Path] = []
         self.runner_env: dict = {}           # extra environment for every engine subprocess this dock starts
@@ -298,12 +299,17 @@ class RunWidget(QWidget):
         try:
             info = runner.version()
         except RunnerError as e:                 # EngineTooOld too: one clear message
-            self._engine_runner, self._engine_info, self._engine_error = None, None, str(e)
-            self._show_engine()
-            if _engine.packs_supported():
-                self.pack_picker.show_message(str(e), RED)
-                self._entries = []
-                self.pack_picker.set_entries([])
+            self._last_engine_error = str(e)
+            if initial or self._engine_runner is None:
+                self._engine_runner, self._engine_info, self._engine_error = None, None, str(e)
+                self._show_engine()
+                if _engine.packs_supported():
+                    self.pack_picker.show_message(str(e), RED)
+                    self._entries = []
+                    self.pack_picker.set_entries([])
+            else:                                # a working engine stays; the new choice is not stored
+                self._status(f"that engine cannot be used, so the dock keeps {self._engine_runner.describe()}: {e}",
+                             RED)
             return False
         self._engine_runner, self._engine_info, self._engine_error = runner, info, None
         self._recipe_runners = {}
@@ -400,8 +406,13 @@ class RunWidget(QWidget):
                 self._status("no engine chosen: nothing ran", AMBER)
             return
         choice = dlg.choice()
-        if not choice or not self.set_engine(choice):
-            self._status(f"that engine cannot be used: {self._engine_error or 'nothing chosen'}", RED)
+        if not choice:
+            self._status("no engine chosen: nothing ran", AMBER)
+            return
+        had_engine = self._engine_runner is not None
+        if not self.set_engine(choice):
+            if not had_engine:                   # with a working engine kept, _activate_engine has said so
+                self._status(f"that engine cannot be used: {self._last_engine_error}", RED)
             return
         self._status(f"engine set for this computer: {self._engine_runner.describe()}", GREEN)
         if pending:
@@ -1103,8 +1114,12 @@ class RunWidget(QWidget):
 
     def _on_errored(self, exc: BaseException) -> None:
         self.last_error = exc
+        log_path = getattr(exc, "run_log", None)
+        if log_path:
+            self.last_run_log = Path(log_path)
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1500:]
-        self._status(f"run FAILED: {type(exc).__name__}: {exc}\n{tb}", RED)
+        where = f"\nrun log {log_path}" if log_path else ""
+        self._status(f"run FAILED: {type(exc).__name__}: {exc}{where}\n{tb}", RED)
         set_viewer_status(self.viewer, f"germquant failed: {type(exc).__name__}: {exc}")
         try:
             from napari.utils.notifications import show_error

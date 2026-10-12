@@ -655,6 +655,10 @@ def execute_run(runner: EngineRunner, plan, *, config_hash: str | None = None, p
         rlog.event("image_failed", image_id=image_id, out_dir=str(plan.out), status="failed",
                    elapsed_s=round(time.monotonic() - t0, 3), error=f"{type(e).__name__}: {e}"[:4000])
         rlog.event("run_end", counts={"done": 0, "failed": 1, "skipped": 0})
+        try:
+            e.run_log = str(rlog.path)        # the dock names the log of a failed run too
+        except Exception:  # noqa: BLE001 - an exception type that takes no attributes
+            pass
         raise
     out = Path(res.get("out_dir") or plan.out)
     marker_path = out / f"{res.get('image_id', image_id)}__done.json"

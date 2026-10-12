@@ -182,6 +182,12 @@ def test_an_engine_without_packs_through_the_subprocess_runner_gets_one_message(
     assert w.engine_box.runs_label.text() == f"The engine chosen for this computer cannot be used: {msg}"
     if HAS_PACKS:
         assert w.pack_picker.message.text() == msg
+    # with a working engine chosen, trying an old one keeps the working one (and stores nothing new)
+    w2 = RunWidget(make_napari_viewer())
+    assert w2.set_engine(INPROCESS) and _settings.engine_choice() == INPROCESS
+    assert not w2.set_engine(sys.executable, env={"PYTHONPATH": str(old)})
+    assert w2.engine is not None and w2.engine.via == VIA_INPROCESS and _settings.engine_choice() == INPROCESS
+    assert "that engine cannot be used, so the dock keeps this napari environment" in w2.status_label.text()
 
 
 def test_an_engine_without_packs_in_this_environment_gets_one_message(make_napari_viewer, monkeypatch,
@@ -350,6 +356,29 @@ def test_card_refresh_loads_no_torch_and_does_not_rehash_a_verified_blob(make_na
 # ---------------------------------------------------------------------------------------------------
 # run logs (section 7.6)
 # ---------------------------------------------------------------------------------------------------
+
+
+def test_a_failed_run_is_logged_and_its_log_named(make_napari_viewer, qtbot, synthetic_image, classical_overlay,
+                                                  tmp_path):
+    """A run that fails in the engine (here: its output folder is a file) writes run_start, image_failed and
+    run_end, and the dock names the log with the error."""
+    w = RunWidget(make_napari_viewer())
+    assert w.set_engine(INPROCESS)
+    w.set_image(str(synthetic_image))
+    w.select_config_file(classical_overlay)
+    w.stage_checks["spots"].setChecked(False)
+    blocker = tmp_path / "results_is_a_file"
+    blocker.write_text("not a folder", encoding="ascii")
+    w.out_edit.setText(str(blocker))
+    w.run_btn.click()
+    qtbot.waitUntil(lambda: w.last_error is not None or w.last_result is not None, timeout=300_000)
+    qtbot.waitUntil(lambda: w.run_btn.isEnabled(), timeout=30_000)
+    assert w.last_result is None and w.last_error is not None
+    start, failed, end = read_run_log(w.last_run_log)
+    assert w.last_run_log.parent == tmp_path / "runs"
+    assert [start["event"], failed["event"], end["event"]] == ["run_start", "image_failed", "run_end"]
+    assert failed["status"] == "failed" and failed["error"] and end["counts"] == {"done": 0, "failed": 1, "skipped": 0}
+    assert "run FAILED" in w.status_label.text() and f"run log {w.last_run_log}" in w.status_label.text()
 
 
 def test_run_log_location_and_format(tmp_path, monkeypatch):
