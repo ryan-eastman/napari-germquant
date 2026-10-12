@@ -521,7 +521,17 @@ at a pinned commit (the head of the engine's integration branch while a train is
 commit once the engine pull request has merged, and only then does the plugin pull request merge), installs it
 editable with the readers extra, compares the test pack copy's SHA256SUMS with the engine checkout's and
 verifies every file of the copy against it. Pins: the engine checkout's constraints files plus
-`constraints/ci-plugin-2026-10.txt` (napari, PyQt6, pytest-qt at the workstation's versions).
+`constraints/ci-plugin-2026-10.txt` (napari, PyQt6, pytest-qt at the workstation's versions, and the bioio
+plugins of the readers extra; their native libraries are left to the resolver, and each job prints what it
+installed).
+
+Time. Gate G1 gives a job 15 minutes, and each change records what it adds; `timeout-minutes` is 20, so a job
+over budget fails instead of running on. A Linux replica of the ubuntu job (WSL Ubuntu 24.04, plugin bfab387,
+engine 0521abf, run on 2026-10-12) took 131 s from checkout to the end of the tests with an empty uv cache
+(installs 11 s for about 2.2 GB of wheels, pytest 111 s) and 114 s with uv's cache warm. The P4 review fixes
+added about 25 s of tests (pytest on Linux 76 s before, about 100 to 111 s after; the whole suite on the Windows
+workstation 83 s before, 116 to 142 s after, the slower figure with another job running). GitHub's runners are
+slower than these machines, and the Windows and macOS jobs have not run on GitHub yet.
 
 On 2026-10-10 both new docks were also driven headless on a scratch copy of the first four timepoints of the
 live GFP::SYP-2 series (xy stride 2, 76 x 1360 x 1360 labels per timepoint; two runs): opening took 1.5 to
