@@ -1,16 +1,22 @@
 """The Run dock: the roles table and stage checkboxes it builds, the plan and export, and the run itself,
-which must write exactly the files `germquant run` writes with the same settings."""
+which must write exactly the files `germquant run` writes with the same settings, through both engine runners
+(docs/DESIGN_system_packs.md, section 9)."""
 from __future__ import annotations
 
+import importlib.util
+import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import CHANNELS, IMAGE_ID, write_ome
+from conftest import CHANNELS, IMAGE_ID, TEST_IMAGE, TEST_PACK, copy_pack, engine_device, settle, write_ome
 
 from napari_germquant._engine import Recipe
 from napari_germquant._run_widget import RED, RunWidget
+from napari_germquant._runner import VIA_INPROCESS, VIA_SUBPROCESS, read_run_log
+from napari_germquant._settings import INPROCESS
 from germquant import api, cli, provenance
 
 
@@ -85,26 +91,74 @@ def test_timelapse_header_blocks_the_run(make_napari_viewer, tmp_path):
         w.plan()
 
 
-def _tables(out: Path) -> dict[str, pd.DataFrame]:
-    return {f.name: pd.read_csv(f, low_memory=False, float_precision="round_trip").drop(columns=["run_timestamp"])
-            for f in sorted(out.glob(f"{IMAGE_ID}__*.csv"))}
+def _tables(out: Path, image_id: str = IMAGE_ID) -> dict[str, pd.DataFrame]:
+    """Every table of the image, CSV and parquet, without the run_timestamp column (section 9)."""
+    tables = {f.name: pd.read_csv(f, low_memory=False, float_precision="round_trip")
+              for f in sorted(out.glob(f"{image_id}__*.csv"))}
+    tables.update({f.name: pd.read_parquet(f) for f in sorted(out.glob(f"{image_id}__*.parquet"))})
+    return {name: df.drop(columns=["run_timestamp"], errors="ignore") for name, df in tables.items()}
 
 
+@pytest.mark.parametrize("runner", ["inprocess", "subprocess"])
+@pytest.mark.parametrize("route", ["config", "pack"])
 def test_gui_run_writes_the_same_files_as_the_cli(make_napari_viewer, qtbot, synthetic_image, classical_overlay,
-                                                  tmp_path):
-    """The Run button on the synthetic gonad with the classical segmenter and spots off, against
-    `germquant run` with the exported settings: same file list, cell-identical tables, same completion marker."""
+                                                  tmp_path, request, monkeypatch, route, runner):
+    """The Run button against `germquant run` with the exported argv, through the in-process runner and the
+    subprocess runner (sys.executable as the engine interpreter, as in the plugin CI): the same file list,
+    cell-identical tables (run_timestamp aside) and equal completion markers (every key except finished).
+    The config route runs the synthetic gonad with the classical segmenter and spots off. The pack route runs a
+    copy of the test pack whose DEFAULT recipe is with_model (its model is absent, so it cannot run) on its
+    synthetic example, picking basic, at xy stride 2: a run that dropped the picked recipe for the pack's
+    default, or dropped the stride, would fail or differ from the command line. Only the config route in
+    process runs with an engine older than 0.2.0.dev0 (no packs, no `python -m germquant`)."""
+    if (route == "pack" or runner == "subprocess") and importlib.util.find_spec("germquant.packs") is None:
+        pytest.skip("the pack route and the subprocess runner need germquant 0.2.0.dev0 or later")
+    if route == "pack":
+        request.getfixturevalue("pack_env")
+        from germquant import packs
+
+        def not_the_default(d):
+            d["id"] = "test_pack_nd"
+            for r in d["recipes"]:
+                r["default"] = r["id"] == "with_model"
+        copy_pack(TEST_PACK, tmp_path / "nd" / "test_pack_nd", edit=not_the_default)
+        monkeypatch.setenv("GERMQUANT_PACKS", str(tmp_path / "nd"))
+        packs.refresh()
     viewer = make_napari_viewer()
     w = RunWidget(viewer)
-    w.set_image(str(synthetic_image))
-    w.select_config_file(classical_overlay)                   # the --config route
-    assert w.config is not None and w.config.get("segmentation.nuclei.method") == "classical"
-    w.stage_checks["spots"].setChecked(False)                 # the --no-spots route
+    assert w.engine is None                                   # nothing chosen yet: the dock would ask
+    w.set_engine(sys.executable if runner == "subprocess" else INPROCESS)
+    settle(w, qtbot)
+    assert w.engine is not None and w.engine_ok, w.engine_box.runs_label.text()
+    assert w.engine.via == (VIA_SUBPROCESS if runner == "subprocess" else VIA_INPROCESS)
     out_gui, out_cli = tmp_path / "gui", tmp_path / "cli"
+    stride = 1
+    if route == "config":
+        image, image_id = synthetic_image, IMAGE_ID
+        w.set_image(str(image))
+        w.select_config_file(classical_overlay)               # the --config route
+        assert w.config is not None and w.config.get("segmentation.nuclei.method") == "classical"
+        w.stage_checks["spots"].setChecked(False)             # the --no-spots route
+        recipe_args, tail = ["--config", str(classical_overlay)], ["--no-spots"]
+    else:
+        image = tmp_path / "image" / TEST_IMAGE.name
+        image.parent.mkdir()
+        shutil.copyfile(TEST_IMAGE, image)
+        image_id = api.image_stem(image)
+        entry = next(e for e in w.pack_entries if e.id == "test_pack_nd")
+        assert entry.default_recipe_id() == "with_model"
+        w.select_pack("test_pack_nd", "basic")                # the --pack route, not the pack's default recipe
+        w.set_image(str(image))
+        settle(w, qtbot)
+        assert w.route == "pack" and w.recipe == Recipe.from_pack("test_pack_nd@0.1.0", "basic")
+        assert w.pack_status["usable"], w.pack_status
+        assert w.config.get("segmentation.nuclei.method") == "classical"
+        stride = 2
+        w.stride_spin.setValue(stride)                        # the --xy-stride route
+        recipe_args, tail = ["--pack", "test_pack_nd@0.1.0", "--recipe", "basic"], ["--xy-stride", "2"]
     w.out_edit.setText(str(out_gui))
     plan = w.plan()
-    assert plan.run_argv() == ["run", str(synthetic_image), "--config", str(classical_overlay), "--out", str(out_gui),
-                               "--no-spots"]
+    assert plan.run_argv() == ["run", str(image), *recipe_args, "--out", str(out_gui), *tail]
 
     w.run_btn.click()
     assert not w.run_btn.isEnabled()                          # a run is in progress
@@ -112,19 +166,25 @@ def test_gui_run_writes_the_same_files_as_the_cli(make_napari_viewer, qtbot, syn
     qtbot.waitUntil(lambda: w.run_btn.isEnabled(), timeout=30_000)
     assert w.last_error is None, w.last_error
     res = w.last_result
-    assert res["image_id"] == IMAGE_ID and res["n_nuclei"] >= 1 and Path(res["out_dir"]) == out_gui
-    assert "spots" not in provenance.read_done_marker(out_gui, IMAGE_ID)["enabled_stages"]
+    assert res["image_id"] == image_id and res["n_nuclei"] >= 1 and Path(res["out_dir"]) == out_gui
     assert "done:" in w.status_label.text() and str(res["n_nuclei"]) in w.status_label.text()
     # the results came back as layers: nuclei labels with the nuclei table as features (row i = label i)
     labels = [layer for layer in viewer.layers if layer.__class__.__name__ == "Labels"]
-    assert len(labels) == 1 and labels[0].name == f"{IMAGE_ID} nuclei"
+    assert len(labels) == 1 and labels[0].name == f"{image_id} nuclei"
     feats = labels[0].features
     assert feats.shape[0] == int(labels[0].data.max()) + 1 and "volume_um3" in feats.columns
-    nuclei = pd.read_csv(out_gui / f"{IMAGE_ID}__nuclei.csv")
+    nuclei = pd.read_csv(out_gui / f"{image_id}__nuclei.csv")
     nid = int(nuclei["nucleus_id"].iloc[0])
     assert feats["volume_um3"].iloc[nid] == pytest.approx(float(nuclei["volume_um3"].iloc[0]))
-    assert tuple(np.round(labels[0].scale, 6)) == (0.4, 0.2, 0.2)
-    assert not [layer for layer in viewer.layers if layer.__class__.__name__ == "Points"]   # spots were off
+    points = [layer for layer in viewer.layers if layer.__class__.__name__ == "Points"]
+    if route == "config":
+        assert "spots" not in provenance.read_done_marker(out_gui, image_id)["enabled_stages"]
+        assert tuple(np.round(labels[0].scale, 6)) == (0.4, 0.2, 0.2)
+        assert not points                                     # spots were off
+    else:
+        assert [p.name for p in points] == [f"{image_id} spots"] and len(points[0].data) >= 1
+        assert "pack: test_pack_nd@0.1.0   recipe: basic" in w.status_label.text()
+        assert "WARNING" not in w.status_label.text()         # basic expects the classical segmenter
 
     # the same settings through the command line
     argv = plan.run_argv()
@@ -132,13 +192,29 @@ def test_gui_run_writes_the_same_files_as_the_cli(make_napari_viewer, qtbot, syn
     assert cli.main(argv) == 0
 
     assert sorted(f.name for f in out_gui.iterdir()) == sorted(f.name for f in out_cli.iterdir())
-    a, b = _tables(out_gui), _tables(out_cli)
-    assert a.keys() == b.keys() and len(a) >= 5
+    a, b = _tables(out_gui, image_id), _tables(out_cli, image_id)
+    assert a.keys() == b.keys() and len(a) >= 10
     for name in a:
         pd.testing.assert_frame_equal(a[name], b[name], check_exact=True, obj=name)
-    ma = provenance.read_done_marker(out_gui, IMAGE_ID)
-    mb = provenance.read_done_marker(out_cli, IMAGE_ID)
-    for k in ("config_hash", "enabled_stages", "stage_hashes", "xy_stride", "z_range", "failed_stages"):
-        assert ma[k] == mb[k], k
-    assert a[f"{IMAGE_ID}__nuclei.csv"]["config_hash"].iloc[0] == mb["config_hash"]
-    assert not ma["failed_stages"]
+    ma = provenance.read_done_marker(out_gui, image_id)
+    mb = provenance.read_done_marker(out_cli, image_id)
+    assert set(ma) == set(mb) and "finished" in ma
+    for k in ma:
+        if k != "finished":                                   # stamped with the time of writing
+            assert ma[k] == mb[k], k
+    assert a[f"{image_id}__nuclei.csv"]["config_hash"].iloc[0] == mb["config_hash"]
+    assert not ma["failed_stages"] and ma["xy_stride"] == stride
+
+    # the run log sits next to the output folder, never inside it (the file lists above are equal)
+    log = w.last_run_log
+    assert log is not None and log.parent == tmp_path / "runs" and log.suffix == ".jsonl"
+    start, done, end = read_run_log(log)
+    assert [start["event"], done["event"], end["event"]] == ["run_start", "image_done", "run_end"]
+    assert start["via"] == w.engine.via and start["interpreter"] == w.engine.python
+    assert start["config_hash"] == mb["config_hash"] == done["config_hash"]
+    assert start["config_hash_source"].startswith("napari's germquant, the same version and git sha")
+    assert start["xy_stride"] == stride
+    assert start["device_requested"] == "auto" and start["device_selected"] == engine_device()
+    assert start["engine"]["germquant"] == api.__version__ and start["engine"]["git_sha"]
+    assert start["images"] == [{"path": str(image), "image_id": image_id, "out_dir": str(out_gui)}]
+    assert done["done_sha256"] and done["stage_hashes"] == mb["stage_hashes"] and end["counts"]["done"] == 1

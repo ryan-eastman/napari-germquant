@@ -1,0 +1,151 @@
+# Continuous integration of napari-germquant: lint and the whole plugin test suite on Linux, Windows and macOS
+# (Apple Silicon), against the germquant engine at a pinned commit (the engine's docs/DESIGN_system_packs.md,
+# section 8.10, and gate G1).
+#
+# The engine: checked out from its public repository at ENGINE_COMMIT and installed editable with the readers
+# extra, so the built-in packs are found in that checkout. While a tranche's train is open the pin is the head
+# of the engine's integration branch (feat/tranche5, 0521abf for train A); it moves to the engine's main commit
+# after the engine pull request merges, and only then does the plugin pull request merge. If the engine
+# repository ever becomes private, the engine checkout needs a read token (open question O22).
+#
+# The test pack: tests/fixtures/packs/test_pack is a copy of the engine's tests/fixtures/packs/test_pack, so the
+# tests need no sibling checkout. A step compares the copy's SHA256SUMS with the engine checkout's and verifies
+# every file of the copy against it, so the two copies cannot drift.
+#
+# The engine interpreter: the subprocess runner tests use sys.executable as the engine interpreter, with the
+# job's environment inherited, as the workstation tests do (section 9 of the design).
+#
+# Environment: Python 3.11 and uv. torch and torchvision are CPU wheels (PyPI's arm64 build on macOS); the engine
+# and the plugin resolve against the engine checkout's constraints (ci-cpu-2026-10.txt, ci-mac-arm64-2026-10.txt on
+# macOS, and readers-2026-10.txt) plus constraints/ci-plugin-2026-10.txt here (napari, PyQt6, pytest-qt, and the
+# bioio plugins of the readers extra that the engine's file leaves open). Cellpose is installed as in the README's
+# laptop install (some pack checks look for it). SpotMAX is not installed, as in the workstation's plugin
+# environment; tests that need it skip or expect it missing.
+#
+# Time: gate G1 gives a job 15 minutes. The Linux replica of this job (WSL, a fresh environment with uv's cache
+# warm) took the time the README's Continuous integration section records; timeout-minutes sits a little above
+# the budget, so a job that blows it shows as failed instead of running on.
+#
+# Qt: QT_QPA_PLATFORM=offscreen on Linux and Windows. tests/conftest.py answers napari's two OpenGL queries with
+# constants under offscreen, so nothing is rendered and no GPU is touched (none of these runners has one).
+# macOS uses Qt's native cocoa platform instead: under offscreen there is no OpenGL context on macOS, and
+# vispy's GL call in napari's viewer teardown segfaulted there (the first CI run, 2026-10-12). GitHub's macOS
+# runners have a window session, so a hidden viewer gets a real context; the conftest shim stays off.
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # -1, not an empty string (Windows drops empty variables): torch sees no CUDA device
+  CUDA_VISIBLE_DEVICES: "-1"
+  ENGINE_REPOSITORY: ryan-eastman/C_elegans_germline_masking_and_spot_counting
+  # train A of tranche 5, merged: the engine's main at b90ebdf ("Merge pull request #12", tranche-5 train A)
+  ENGINE_COMMIT: b90ebdf6859f6b0e3211a3c2970854adfdca41b8
+
+jobs:
+  test:
+    name: ${{ matrix.os }}, Python 3.11
+    runs-on: ${{ matrix.os }}
+    # gate G1: 15 minutes a job; a little above, so a job over budget fails instead of running on
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            engine_constraints: constraints/ci-cpu-2026-10.txt
+            qt_platform: offscreen
+          - os: windows-latest
+            engine_constraints: constraints/ci-cpu-2026-10.txt
+            qt_platform: offscreen
+          - os: macos-14
+            engine_constraints: constraints/ci-mac-arm64-2026-10.txt
+            qt_platform: cocoa
+    env:
+      QT_QPA_PLATFORM: ${{ matrix.qt_platform }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the plugin
+        uses: actions/checkout@v7
+        with:
+          path: plugin
+
+      - name: Check out the engine at the pinned commit
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.ENGINE_REPOSITORY }}
+          ref: ${{ env.ENGINE_COMMIT }}
+          path: engine
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install uv (the uv cache directory is saved between runs)
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            plugin/pyproject.toml
+            plugin/constraints/ci-plugin-2026-10.txt
+            engine/constraints/ci-cpu-2026-10.txt
+            engine/constraints/ci-mac-arm64-2026-10.txt
+            engine/constraints/readers-2026-10.txt
+
+      - name: Install the Qt system libraries (Linux)
+        if: runner.os == 'Linux'
+        uses: tlambert03/setup-qt-libs@v1
+
+      - name: Install torch and torchvision (CPU wheels from the PyTorch index)
+        if: runner.os != 'macOS'
+        run: uv pip install --system --index-url https://download.pytorch.org/whl/cpu "torch==2.11.0" "torchvision==0.26.0"
+
+      - name: Install torch and torchvision (macOS arm64 wheels from PyPI)
+        if: runner.os == 'macOS'
+        run: uv pip install --system "torch==2.11.0" "torchvision==0.26.0"
+
+      - name: Install the engine, editable, with the readers extra (and Cellpose)
+        run: >-
+          uv pip install --system
+          -c "engine/${{ matrix.engine_constraints }}" -c engine/constraints/readers-2026-10.txt
+          -c plugin/constraints/ci-plugin-2026-10.txt
+          -e "./engine[readers]" "cellpose==4.2.1.1"
+
+      - name: Install the plugin with its test tools
+        run: >-
+          uv pip install --system
+          -c "engine/${{ matrix.engine_constraints }}" -c engine/constraints/readers-2026-10.txt
+          -c plugin/constraints/ci-plugin-2026-10.txt
+          -e "./plugin[dev]"
+
+      - name: Record the resolved environment
+        run: |
+          uv pip freeze --system
+          python -c "import germquant, napari, napari_germquant; print('germquant', germquant.__version__, germquant.__file__); print('napari', napari.__version__, 'plugin', napari_germquant.__file__)"
+          python -m germquant.packs --version
+
+      - name: The test pack copy matches the engine's
+        run: |
+          python -c "import pathlib, sys; norm = lambda p: pathlib.Path(p).read_bytes().replace(b'\r\n', b'\n'); same = norm('plugin/tests/fixtures/packs/test_pack/SHA256SUMS') == norm('engine/tests/fixtures/packs/test_pack/SHA256SUMS'); print('SHA256SUMS equal' if same else 'SHA256SUMS differ'); sys.exit(0 if same else 'tests/fixtures/packs/test_pack differs from the engine checkout: copy it from the engine again')"
+          python -m germquant.packs verify plugin/tests/fixtures/packs/test_pack
+
+      - name: Lint
+        working-directory: plugin
+        run: ruff check src tests
+
+      - name: Test
+        working-directory: plugin
+        run: pytest -q -rs tests

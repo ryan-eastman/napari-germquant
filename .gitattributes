@@ -1,3 +1,11 @@
 # Normalise line endings to LF in the repository (the workstation has core.autocrlf=true).
 * text=auto eol=lf
 *.png binary
+# The test pack copy must stay byte-identical to the engine's (its SHA256SUMS is compared in CI): text=auto
+# keeps git's binary detection, and these binary rules come last so they win, as in the engine.
+tests/fixtures/packs/**/*.tif binary
+tests/fixtures/packs/**/*.tiff binary
+tests/fixtures/packs/**/*.png binary
+tests/fixtures/packs/**/*.npz binary
+tests/fixtures/packs/**/*.zip binary
+tests/fixtures/packs/**/*.h5 binary

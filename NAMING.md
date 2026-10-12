@@ -14,6 +14,8 @@ plugin name with a hyphen (`napari-germquant`) and the Python import name with a
 | `src/napari_germquant/__init__.py` | `metadata.version("napari-germquant")` |
 | `tests/test_manifest.py`, `tests/test_reader.py`, `tests/test_training.py`, `tests/test_timelapse.py` | the plugin name passed to `viewer.open(..., plugin=...)`, `get_manifest(...)` and `viewer.window.add_plugin_dock_widget(...)` |
 | `src/napari_germquant/_engine.py`, `_reader.py`, `_training.py` | text in the exported YAML and commands headers, in user-facing messages and in the note of the `corrections.json` a training folder gets |
+| `src/napari_germquant/_settings.py` | `ORG` and `APP`: the QSettings names the engine interpreter is stored under (renaming forgets the stored choice; the dock then asks again) |
+| `src/napari_germquant/_runner.py` | `user_runs_dir()`: the per-user folder for run logs that cannot sit next to their output folder |
 | `README.md`, `NAMING.md`, `LICENSE` | prose |
 | the folder `C:/Users/ryane/napari-germquant` and its `.venv` | the checkout itself |
 
@@ -30,6 +32,8 @@ The manifest's `display_name: germquant` is what the napari menus show; it can s
 | `src/napari_germquant/_results.py` | the `napari_germquant_results` metadata key on every layer the results loader adds |
 | `src/napari_germquant/_training_widget.py` | `META_KEY = "napari_germquant_training"`: the metadata key on the two layers the Training dock shows |
 | `src/napari_germquant/_timelapse.py` | `META_KEY = "napari_germquant_timelapse"`: the metadata key on every layer the Time-lapse dock adds |
+| `src/napari_germquant/_runner.py`, `_qt_common.py` | the logger `napari_germquant.engine` that carries an engine subprocess's lines to the status bar |
+| `src/napari_germquant/_settings.py`, `tests/conftest.py` | the environment variable `NAPARI_GERMQUANT_SETTINGS` (a private settings file) |
 | `tests/*.py` | `from napari_germquant import ...` |
 | `tests/conftest.py`, `tests/test_reader.py` | the opt-in environment variable `NAPARI_GERMQUANT_NAS_TEST` |
 

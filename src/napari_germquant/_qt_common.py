@@ -25,8 +25,9 @@ def add_layer_tuples(viewer, layer_tuples) -> list:
     return added
 
 
-# the loggers whose INFO lines are worth a status-bar glance while the engine works
-_LOGGERS = ("germquant", "cellpose", "spotmax")
+# the loggers whose INFO lines are worth a status-bar glance while the engine works ("napari_germquant.engine"
+# carries the lines an engine subprocess prints, _runner.py)
+_LOGGERS = ("germquant", "cellpose", "spotmax", "napari_germquant")
 # Several docks can run an engine call at the same time (a Run and a training, say). The logger levels are
 # raised to INFO when the first bridge attaches and put back when the last one detaches, so one dock
 # finishing never silences another that is still running.
@@ -116,7 +117,11 @@ class WorkerRunner(QObject):
     one is in flight. The callbacks run in the GUI thread (napari queues the worker's signals to it).
 
     ``line_format`` turns one log line into the progress text shown after the elapsed time (None: the line
-    itself, shortened); returning None keeps the previous progress text."""
+    itself, shortened); returning None keeps the previous progress text.
+
+    ``should_stop`` is for the call itself (any thread): True after ``cancel()``, and when napari asks the
+    worker to quit (napari does that for every thread worker when it closes). A call that polls it can end its
+    engine process instead of keeping napari waiting."""
 
     def __init__(self, viewer=None, parent=None):
         super().__init__(parent)
@@ -127,6 +132,7 @@ class WorkerRunner(QObject):
         self._t0 = 0.0
         self._line_format = None
         self._finished_cb = None
+        self._cancel = threading.Event()
         self._bridge = LogBridge(self)
         self._bridge.message.connect(self._on_line)
         self._timer = QTimer(self)
@@ -136,6 +142,20 @@ class WorkerRunner(QObject):
     @property
     def busy(self) -> bool:
         return self.worker is not None
+
+    def should_stop(self) -> bool:
+        """Whether the call in flight should stop (Cancel, or napari quitting)."""
+        if self._cancel.is_set():
+            return True
+        worker = self.worker
+        return bool(worker is not None and getattr(worker, "abort_requested", False))
+
+    def cancel(self) -> bool:
+        """Ask the call in flight to stop (it does so when it polls should_stop); False when none runs."""
+        if self.worker is None:
+            return False
+        self._cancel.set()
+        return True
 
     def elapsed_text(self) -> str:
         s = int(time.monotonic() - self._t0)
@@ -150,6 +170,7 @@ class WorkerRunner(QObject):
         self.progress = ""
         self._line_format = line_format
         self._finished_cb = finished
+        self._cancel.clear()
         self._t0 = time.monotonic()
         self._bridge.attach()
         self._timer.start()
