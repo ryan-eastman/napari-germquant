@@ -31,7 +31,7 @@ the stages measure, which profile to use and what the output tables mean. Read t
 Left: the Run dock after a run of the budding yeast pack on its real example (S-BIAD3750, SUT509 smFISH,
 Position 1) through the engine's `.venv`: 11 cells, 8 spots. Right: the Results dock after the cultured cells
 pack on its DeepFoci example: 2 nuclei, 110 gamma-H2AX foci and 67 53BP1 foci (the `spots_foci2` instance).
-Both were captured headless on the lab workstation on 2026-10-11 (CPU); a headless capture cannot draw napari's
+Both were captured headless on the lab workstation on 2026-10-12 (CPU); a headless capture cannot draw napari's
 image canvas, so the docks are shown without it.
 
 - **Reader.** File > Open on an `.nd2` (or a TIFF / OME-TIFF, CZI, LIF or OME-Zarr file, through the engine's
@@ -446,9 +446,14 @@ PowerShell:
 ```
 $env:QT_QPA_PLATFORM="offscreen"; $env:CUDA_VISIBLE_DEVICES="-1"; .venv\Scripts\python.exe -m pytest tests -q
 ```
-Mac / Linux:
+Linux:
 ```
 QT_QPA_PLATFORM=offscreen CUDA_VISIBLE_DEVICES=-1 .venv/bin/python -m pytest tests -q
+```
+Mac (Qt's offscreen platform has no OpenGL context on macOS, and napari's viewer teardown makes an OpenGL call;
+the native platform works there, with hidden viewers):
+```
+QT_QPA_PLATFORM=cocoa .venv/bin/python -m pytest tests -q
 ```
 
 What runs: the npe2 manifest (valid, named like the distribution, reader patterns equal the engine's suffix
@@ -516,7 +521,8 @@ The subprocess runner tests use this Python as the engine interpreter and pass t
 ### Continuous integration
 
 `.github/workflows/ci.yml` runs ruff and the whole suite on ubuntu-latest, windows-latest and macos-14 (Apple
-Silicon) with Python 3.11 and `QT_QPA_PLATFORM=offscreen`. It checks the engine out from its public repository
+Silicon) with Python 3.11, with `QT_QPA_PLATFORM=offscreen` on Linux and Windows and Qt's native `cocoa` platform
+on macOS. It checks the engine out from its public repository
 at a pinned commit (the head of the engine's integration branch while a train is open, then the engine's main
 commit once the engine pull request has merged, and only then does the plugin pull request merge), installs it
 editable with the readers extra, compares the test pack copy's SHA256SUMS with the engine checkout's and
@@ -529,9 +535,13 @@ Time. Gate G1 gives a job 15 minutes, and each change records what it adds; `tim
 over budget fails instead of running on. A Linux replica of the ubuntu job (WSL Ubuntu 24.04, plugin bfab387,
 engine 0521abf, run on 2026-10-12) took 131 s from checkout to the end of the tests with an empty uv cache
 (installs 11 s for about 2.2 GB of wheels, pytest 111 s) and 114 s with uv's cache warm. The P4 review fixes
-added about 25 s of tests (pytest on Linux 76 s before, about 100 to 111 s after; the whole suite on the Windows
-workstation 83 s before, 116 to 142 s after, the slower figure with another job running). GitHub's runners are
-slower than these machines, and the Windows and macOS jobs have not run on GitHub yet.
+added about 25 to 35 s of tests (pytest on Linux 76 s before, about 100 to 111 s after; the whole suite on the Windows
+workstation 83 s before, 116 to 142 s after, the slower figure with another job running). On GitHub (run
+38284331133, 2026-10-12, engine b90ebdf) the jobs took 2.9 min on ubuntu-latest, 6.4 min on windows-latest
+and 3.2 min on macos-14, of which the Test step took 2.2, 4.0 and 2.7 min. The macOS job uses Qt's native cocoa
+platform instead of offscreen (offscreen has no OpenGL context on macOS, and napari's viewer teardown makes an
+OpenGL call), and torch there offers the Apple GPU, so the tests expect the device the engine picks (mps on that
+runner, cpu on the others).
 
 On 2026-10-10 both new docks were also driven headless on a scratch copy of the first four timepoints of the
 live GFP::SYP-2 series (xy stride 2, 76 x 1360 x 1360 labels per timepoint; two runs): opening took 1.5 to
