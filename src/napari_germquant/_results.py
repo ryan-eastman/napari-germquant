@@ -409,12 +409,18 @@ def summary_text(rs: ResultsSet, expected: list[str] | None = None) -> str:
     except Exception:  # noqa: BLE001 - a half-written folder: the other lines still help
         pass
     summary = rs.table("image_summary")
+    stages = rs.stages()
     if summary is not None and len(summary):
         row = summary.iloc[0]
-        n = row.get("n_nuclei", "?")
-        g = row.get("n_germline_nuclei", "?")
-        parts.append(f"{plural}: {n}   germline {plural}: {g}   mean spots per {singular}: "
-                     f"{row.get('mean_spots', 'NA')}")
+        line = f"{plural}: {row.get('n_nuclei', '?')}"
+        # the germline count means something only where the germline stage ran (a C. elegans run); a pack run
+        # whose germline stage did not run (the outside packs) has no germline
+        germ = stages.get("germline") if isinstance(stages, dict) else None
+        if (isinstance(germ, dict) and germ.get("status") == "ran") or not rs.pack_record():
+            line += f"   germline {plural}: {row.get('n_germline_nuclei', '?')}"
+        mean = _num(row.get("mean_spots"))
+        line += f"   mean spots per {singular}: {f'{mean:.2f}' if mean is not None else 'NA'}"
+        parts.append(line)
         flags = row.get("qc_flags", "")
         if flags is None or (isinstance(flags, float) and np.isnan(flags)) or not str(flags).strip():
             flags = "none"
@@ -422,7 +428,6 @@ def summary_text(rs: ResultsSet, expected: list[str] | None = None) -> str:
     spots = rs.table("spots")
     if spots is not None:
         parts.append(f"spots table rows: {len(spots)}")
-    stages = rs.stages()
     if stages:
         ran = [k for k, v in stages.items() if isinstance(v, dict) and v.get("status") == "ran"]
         failed = [k for k, v in stages.items() if isinstance(v, dict) and v.get("status") == "failed"]

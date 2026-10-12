@@ -10,14 +10,22 @@ this napari environment runs them in process only when the user picks it explici
 Run asks for one instead of falling back. A pack recipe may have its own interpreter. The dock always says
 which environment and device run, and warns when the engine's germquant differs from the plugin's own.
 
+The GUI thread never waits for the engine. The version check, the pack listing and every card check run one
+at a time in a thread worker (``check_worker``); the dock asks for them and a small scheduler (``_pump``) starts
+the newest request of each kind when the worker is free, so a pick made while a check is in flight is checked
+next and a stale answer is only cached, never shown. Until a recipe's check is back, its card says "checking"
+and Run is off. ``idle`` says when nothing is in flight or waiting; ``wait_idle`` lets a script wait for that.
+
 The Run button executes the plan in a napari thread worker (``_runner.execute_run``: run_start, the run,
 image_done or image_failed, run_end in ``runs/<run_id>.jsonl`` next to the output folder); log lines of the
 engine go to the status bar through LogBridge; when the worker returns, the results folder is loaded as layers
-through ``_results`` (the loader the Results dock uses).
+through ``_results`` (the loader the Results dock uses). Cancel ends a run in a separate process (the engine
+process and every process it started); napari quitting does the same for a run, a download and a check.
 """
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -52,6 +60,7 @@ from ._results import ResultsSet, load_results_layers, summary_text
 from ._runner import (
     EngineRunner,
     InProcessRunner,
+    RunCancelled,
     RunnerError,
     SubprocessRunner,
     detect_interpreters,
@@ -67,6 +76,7 @@ GREEN = QColor(70, 150, 90)
 
 IMAGE_FILTER = "Images (" + " ".join(f"*{s}" for s in api.SUPPORTED_SUFFIXES) + ");;All files (*)"
 PACK, PROFILE = "pack", "profile"
+FIRST_LOOK_PACK = "celegans_germline"
 
 engine_log = logging.getLogger("napari_germquant.engine")
 
@@ -91,6 +101,10 @@ def _find_data(combo: QComboBox, value) -> int:
     return -1
 
 
+def _error_text(exc: BaseException) -> str:
+    return str(exc) if isinstance(exc, RunnerError) else f"{type(exc).__name__}: {exc}"
+
+
 class RunWidget(QWidget):
     """napari dock widget. ``napari_viewer`` is injected by napari; None builds the widget without a viewer
     (the headless tests of the roles table and the plan do that)."""
@@ -107,6 +121,8 @@ class RunWidget(QWidget):
         self._stage_rows: list[_engine.StageRow] = []
         self.stage_checks: dict[str, QCheckBox] = {}
         self._worker = None
+        self._run_cancel: threading.Event | None = None
+        self._run_cancellable = False
         self._t0 = 0.0
         self._plan: RunPlan | None = None
         self.last_result: dict | None = None
@@ -119,18 +135,28 @@ class RunWidget(QWidget):
         self._entries: list[_packs.PackEntry] = []
         self._check_cache: dict[tuple, dict] = {}
         self._pack_status: dict | None = None
+        self._card_pending = False
         self._engine_runner: EngineRunner | None = None
         self._engine_info: dict | None = None
         self._engine_error: str | None = None
         self._last_engine_error: str = ""
+        self.engine_ok: bool | None = None   # the outcome of the last engine choice checked (None: none yet)
         self._recipe_runners: dict[str, EngineRunner] = {}
         self._config_files: list[Path] = []
         self.runner_env: dict = {}           # extra environment for every engine subprocess this dock starts
         self._pending_run = False
+        self._pending_recipe: Recipe | None = None
+        self._resume_run = False
         self.interpreter_dialog: InterpreterDialog | None = None
         self.last_pack_result: dict | None = None
         self.last_pack_error: BaseException | None = None
+        # the engine calls the dock waits for, newest request of each kind (started by _pump)
+        self._want_engine: dict | None = None
+        self._want_recipe_interp: dict | None = None
+        self._want_listing: dict | None = None
+        self._want_card = False
         self.pack_worker = WorkerRunner(napari_viewer, self)
+        self.check_worker = WorkerRunner(None, self)       # version checks, listings and card checks
         self._bridge = LogBridge(self)
         self._bridge.message.connect(self._on_log_line)
         self._timer = QTimer(self)
@@ -198,6 +224,7 @@ class RunWidget(QWidget):
         self.pack_picker.get_models_clicked.connect(self.get_models)
         self.pack_picker.get_example_clicked.connect(self.get_example)
         self.pack_picker.interpreter_clicked.connect(self.ask_for_recipe_interpreter)
+        self.pack_picker.cancel_clicked.connect(self.cancel_pack_operation)
         root.addWidget(self.pack_picker)
 
         self.advanced_box = QGroupBox("Advanced: profile or config file (instead of a pack)")
@@ -257,6 +284,13 @@ class RunWidget(QWidget):
         self.run_btn = QPushButton("Run")
         self.run_btn.clicked.connect(self.run)
         row5.addWidget(self.run_btn)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip("stop the run: the engine process and every process it started are ended, and "
+                                   "the run log says it was cancelled (a run in this napari environment cannot be "
+                                   "stopped)")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_run)
+        row5.addWidget(self.cancel_btn)
         self.export_btn = QPushButton("Export profile")
         self.export_btn.setToolTip("write an extends: overlay YAML (validated: false) and the exact germquant run and "
                                    "batch commands for this plan")
@@ -269,6 +303,52 @@ class RunWidget(QWidget):
         run_form.addRow("Status", self.status_label)
         root.addWidget(run_box)
         root.addStretch(1)
+
+    # ------------------------------------------------------------------ engine calls, one at a time
+    @property
+    def idle(self) -> bool:
+        """No engine check (version, listing, card) is in flight or waiting."""
+        return (not self.check_worker.busy and self._want_engine is None and self._want_recipe_interp is None
+                and self._want_listing is None and not self._want_card)
+
+    def wait_idle(self, timeout_s: float = 300.0) -> bool:
+        """For a script driving the dock: run the Qt event loop until ``idle`` (True) or ``timeout_s`` (False).
+        The dock itself never waits."""
+        from qtpy.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        t0 = time.monotonic()
+        while not self.idle:
+            if time.monotonic() - t0 > timeout_s:
+                return False
+            app.processEvents()
+            time.sleep(0.01)
+        app.processEvents()
+        return True
+
+    def _pump(self) -> None:
+        """Start the next engine call the dock waits for, when the check worker is free: an engine choice first,
+        then a recipe's own interpreter, the pack listing, and the card of the current selection."""
+        if self.check_worker.busy:
+            return
+        if self._want_engine is not None:
+            req, self._want_engine = self._want_engine, None
+            self._start_engine_job(req)
+        elif self._want_recipe_interp is not None:
+            req, self._want_recipe_interp = self._want_recipe_interp, None
+            self._start_recipe_interp_job(req)
+        elif self._want_listing is not None:
+            req, self._want_listing = self._want_listing, None
+            self._start_listing_job(req)
+        elif self._want_card:
+            self._want_card = False
+            self._start_card_job()
+
+    def _start_check(self, func, label: str, returned, errored) -> None:
+        """``func(should_stop)`` in the check worker; ``_pump`` starts the next call when it is done."""
+        worker = self.check_worker
+        worker.start(lambda: func(worker.should_stop), label=label, returned=returned, errored=errored,
+                     finished=self._pump, line_format=lambda _line: None)
 
     # ------------------------------------------------------------------ the engine
     def _init_engine(self) -> None:
@@ -286,7 +366,7 @@ class RunWidget(QWidget):
                                               "the list, the checks and the models come from the environment "
                                               "that will run them.", AMBER)
             return
-        self._activate_engine(choice, initial=True)
+        self._activate_engine(choice, initial=True, store=False, origin="startup")
 
     def _make_runner(self, choice: str) -> EngineRunner:
         runner: EngineRunner = InProcessRunner() if choice == _settings.INPROCESS else \
@@ -294,39 +374,81 @@ class RunWidget(QWidget):
         runner.device = self.engine_box.device()
         return runner
 
-    def _activate_engine(self, choice: str, initial: bool = False) -> bool:
+    def _activate_engine(self, choice: str, *, initial: bool = False, store: bool = True, origin: str = "") -> None:
+        """Ask for ``choice`` to be checked (its version, then its pack list) in the check worker; it becomes the
+        dock's engine (and, with ``store``, this computer's stored choice) only when the check passes."""
         runner = self._make_runner(choice)
-        try:
-            info = runner.version()
-        except RunnerError as e:                 # EngineTooOld too: one clear message
-            self._last_engine_error = str(e)
-            if initial or self._engine_runner is None:
-                self._engine_runner, self._engine_info, self._engine_error = None, None, str(e)
-                self._show_engine()
-                if _engine.packs_supported():
-                    self.pack_picker.show_message(str(e), RED)
-                    self._entries = []
-                    self.pack_picker.set_entries([])
-            else:                                # a working engine stays; the new choice is not stored
-                self._status(f"that engine cannot be used, so the dock keeps {self._engine_runner.describe()}: {e}",
-                             RED)
-            return False
+        self._want_engine = {"choice": choice, "runner": runner, "initial": initial, "store": store,
+                             "origin": origin}
+        self._want_listing = None                        # a listing of the old engine is not wanted any more
+        if self._engine_runner is None:
+            self.engine_box.show_engine(f"checking {runner.describe()} ...")
+        else:
+            self._status(f"checking the engine {runner.describe()} ...", None)
+        self._pump()
+
+    def _start_engine_job(self, req: dict) -> None:
+        runner = req["runner"]
+        listing_wanted = _engine.packs_supported()
+
+        def job(should_stop):
+            info = runner.version(should_stop=should_stop)
+            listing, list_error = None, None
+            if listing_wanted:
+                try:
+                    listing = runner.list_packs(should_stop=should_stop)
+                except RunCancelled:
+                    raise
+                except RunnerError as e:
+                    list_error = str(e)
+            return info, listing, list_error
+
+        self._start_check(job, f"checking {runner.describe()}", lambda res: self._engine_ready(req, *res),
+                          lambda exc: self._engine_failed(req, exc))
+
+    def _engine_ready(self, req: dict, info: dict, listing: dict | None, list_error: str | None) -> None:
+        if self._want_engine is not None:               # a newer choice waits: this one is superseded
+            return
+        runner = req["runner"]
         self._engine_runner, self._engine_info, self._engine_error = runner, info, None
         self._recipe_runners = {}
+        self._check_cache.clear()
+        self.engine_ok = True
+        if req["store"]:
+            _settings.set_engine_choice(req["choice"])
         self._show_engine()
-        self.refresh_packs(choose_route=initial)
-        return True
+        self._apply_listing(listing, list_error, choose_route=req["initial"])
+        if req["origin"] == "dialog":
+            self._status(f"engine set for this computer: {runner.describe()}", GREEN)
+            self._resume_pending_run()
 
-    def set_engine(self, choice: str | Path, env: dict | None = None) -> bool:
-        """Use ``choice`` (a Python path, or ``inprocess``) as this computer's engine and store it when its
-        version check passes; ``env`` replaces the extra environment of the dock's engine subprocesses."""
+    def _engine_failed(self, req: dict, exc: BaseException) -> None:
+        if self._want_engine is not None:
+            return
+        msg = _error_text(exc)
+        self._last_engine_error = msg
+        self.engine_ok = False
+        resume, self._resume_run = self._resume_run, False
+        if req["initial"] or self._engine_runner is None:
+            self._engine_runner, self._engine_info, self._engine_error = None, None, msg
+            self._show_engine()
+            if _engine.packs_supported():
+                self.pack_picker.show_message(msg, RED)
+                self._entries = []
+                self.pack_picker.set_entries([])
+            if req["origin"] == "dialog":
+                self._status(f"that engine cannot be used: {msg}" + ("; nothing ran" if resume else ""), RED)
+        else:                                    # a working engine stays; the new choice is not stored
+            self._status(f"that engine cannot be used, so the dock keeps {self._engine_runner.describe()}: {msg}",
+                         RED)
+
+    def set_engine(self, choice: str | Path, env: dict | None = None) -> None:
+        """Use ``choice`` (a Python path, or ``inprocess``) as this computer's engine, stored when its version
+        check passes; ``env`` replaces the extra environment of the dock's engine subprocesses. The check runs in
+        the check worker: ``engine`` and ``engine_ok`` say the outcome once ``idle``."""
         if env is not None:
             self.runner_env = dict(env)
-        choice = str(choice)
-        ok = self._activate_engine(choice)
-        if ok:
-            _settings.set_engine_choice(choice)
-        return ok
+        self._activate_engine(str(choice), store=True, origin="set_engine")
 
     @property
     def engine(self) -> EngineRunner | None:
@@ -375,11 +497,11 @@ class RunWidget(QWidget):
             if mapped:
                 rr = self.engine_runner(pid, rid)
                 lines.append(f"recipe {pid} {rid} runs in its own interpreter: {rr.describe() if rr else mapped}")
-                try:
-                    if rr is not None:
-                        warnings.append(mismatch_warning(plugin_engine_info(), rr.version()))
-                except RunnerError as e:
-                    warnings.append(f"the recipe's interpreter cannot be used: {e}")
+                version = rr.cached_version() if rr is not None else None
+                if version is not None:
+                    warnings.append(mismatch_warning(plugin_engine_info(), version))
+                elif rr is not None and rr.version_error:
+                    warnings.append(f"the recipe's interpreter cannot be used: {rr.version_error}")
         self.engine_box.show_engine("\n".join(lines))
         self.engine_box.show_warning("\n".join(w for w in warnings if w))
 
@@ -401,22 +523,25 @@ class RunWidget(QWidget):
 
     def _engine_dialog_done(self, dlg: InterpreterDialog, accepted: bool) -> None:
         pending, self._pending_run = self._pending_run, False
-        if not accepted:
+        choice = dlg.choice() if accepted else None
+        if not choice:
             if pending:
                 self._status("no engine chosen: nothing ran", AMBER)
             return
-        choice = dlg.choice()
-        if not choice:
-            self._status("no engine chosen: nothing ran", AMBER)
+        # Run resumes after the check only for the recipe it was pressed with (see _resume_pending_run)
+        self._resume_run = pending
+        self._activate_engine(choice, store=True, origin="dialog")
+
+    def _resume_pending_run(self) -> None:
+        """After an engine chosen from Run's prompt: run, but only the recipe Run was pressed with. A pack the
+        dock selected on its own once the engine listed its packs is never run unasked."""
+        resume, self._resume_run = self._resume_run, False
+        if not resume:
             return
-        had_engine = self._engine_runner is not None
-        if not self.set_engine(choice):
-            if not had_engine:                   # with a working engine kept, _activate_engine has said so
-                self._status(f"that engine cannot be used: {self._last_engine_error}", RED)
-            return
-        self._status(f"engine set for this computer: {self._engine_runner.describe()}", GREEN)
-        if pending:
+        if self._recipe is not None and self._recipe == self._pending_recipe:
             self.run()
+        else:
+            self._status("Engine set. Pick a pack and recipe, then press Run.", AMBER)
 
     def ask_for_recipe_interpreter(self) -> InterpreterDialog | None:
         """Open the dialog that sets (or clears) the current pack recipe's own interpreter."""
@@ -434,42 +559,93 @@ class RunWidget(QWidget):
         dlg.open()
         return dlg
 
-    def set_recipe_interpreter(self, pack_id: str, recipe_id: str, python: str | Path | None) -> bool:
-        """Store (or with None clear) the interpreter of one pack recipe, after its version check."""
+    def set_recipe_interpreter(self, pack_id: str, recipe_id: str, python: str | Path | None) -> None:
+        """Store (or with None clear) the interpreter of one pack recipe. A new interpreter is stored after its
+        version check, which runs in the check worker."""
         if python:
             runner = self._make_runner(str(python))
-            try:
-                runner.version()
-            except RunnerError as e:
-                self._status(f"that interpreter cannot run {pack_id} {recipe_id}: {e}", RED)
-                return False
-            self._recipe_runners[str(python)] = runner
-        _settings.set_recipe_interpreter(pack_id, recipe_id, str(python) if python else None)
+            self._want_recipe_interp = {"pack": pack_id, "recipe": recipe_id, "python": str(python),
+                                        "runner": runner}
+            self._status(f"checking {runner.describe()} for {pack_id} {recipe_id} ...", None)
+            self._pump()
+            return
+        _settings.set_recipe_interpreter(pack_id, recipe_id, None)
+        self._recipe_interp_changed(pack_id, recipe_id)
+
+    def _start_recipe_interp_job(self, req: dict) -> None:
+        runner = req["runner"]
+        self._start_check(lambda should_stop: runner.version(should_stop=should_stop),
+                          f"checking {runner.describe()}", lambda _info: self._recipe_interp_ready(req),
+                          lambda exc: self._status(f"that interpreter cannot run {req['pack']} {req['recipe']}: "
+                                                   f"{_error_text(exc)}", RED))
+
+    def _recipe_interp_ready(self, req: dict) -> None:
+        self._recipe_runners[req["python"]] = req["runner"]
+        _settings.set_recipe_interpreter(req["pack"], req["recipe"], req["python"])
+        self._status(f"recipe {req['pack']} {req['recipe']} runs in {req['runner'].describe()} on this computer",
+                     GREEN)
+        self._recipe_interp_changed(req["pack"], req["recipe"])
+
+    def _recipe_interp_changed(self, pack_id: str, recipe_id: str) -> None:
         self._check_cache.clear()
         if self.pack_picker.current_pack_id() == pack_id and self.pack_picker.current_recipe_id() == recipe_id:
             self.refresh_card()
         self._show_engine()
-        return True
 
     # ------------------------------------------------------------------ system packs
-    def refresh_packs(self, choose_route: bool = False) -> list[_packs.PackEntry]:
-        """List the packs through the engine runner (``python -m germquant.packs list --json`` for a subprocess
-        engine) and fill the pack picker. ``choose_route``: switch to the pack route when packs are listed (the
-        dock's first look at a configured engine)."""
+    def refresh_packs(self, choose_route: bool = False) -> None:
+        """List the packs again through the engine runner (``python -m germquant.packs list --json`` for a
+        subprocess engine), in the check worker, and fill the pack picker when the list is back.
+        ``choose_route``: switch to the pack route when packs are listed."""
         if not _engine.packs_supported():
-            return []
+            return
         runner = self._engine_runner
         if runner is None:
             self.pack_picker.show_message(self._engine_error or "Choose the engine environment (Engine, above) to "
                                           "list its packs.", RED if self._engine_error else AMBER)
-            return []
-        try:
-            listing = runner.list_packs()
-        except RunnerError as e:
-            self.pack_picker.show_message(f"could not list the packs: {e}", RED)
+            return
+        self._want_listing = {"runner": runner, "choose_route": choose_route}
+        self.pack_picker.show_message(f"listing the packs in {runner.describe()} ...", None)
+        self._pump()
+
+    def _start_listing_job(self, req: dict) -> None:
+        runner = req["runner"]
+        if runner is not self._engine_runner:              # the engine changed meanwhile: its own listing came
+            self._pump()
+            return
+        self._start_check(lambda should_stop: runner.list_packs(should_stop=should_stop),
+                          f"listing the packs in {runner.describe()}",
+                          lambda listing: self._listing_done(req, listing, None),
+                          lambda exc: self._listing_done(req, None, _error_text(exc)))
+
+    def _listing_done(self, req: dict, listing: dict | None, error: str | None) -> None:
+        if req["runner"] is self._engine_runner:
+            self._apply_listing(listing, error, choose_route=req["choose_route"])
+
+    def _first_look(self, usable_ids: list[str]) -> tuple[str, str | None] | None:
+        """The pack the picker shows when nothing is picked yet: the pack and recipe the user last picked, else
+        the C. elegans germline pack, else the first usable pack."""
+        last_pack, last_recipe = _settings.last_pack()
+        if last_pack in usable_ids:
+            return last_pack, last_recipe
+        if FIRST_LOOK_PACK in usable_ids:
+            return FIRST_LOOK_PACK, None
+        return (usable_ids[0], None) if usable_ids else None
+
+    def _apply_listing(self, listing: dict | None, error: str | None, *, choose_route: bool) -> None:
+        """Fill the picker from an engine's listing. The pack shown stays when it is still listed; otherwise the
+        first look (``_first_look``). ``choose_route``: switch to the pack route (the dock's first look at a
+        configured engine)."""
+        if not _engine.packs_supported():
+            return
+        runner = self._engine_runner
+        if error is not None or listing is None:
+            self.pack_picker.show_message(f"could not list the packs: {error}", RED)
+            self._listing = None
             self._entries = []
             self.pack_picker.set_entries([])
-            return []
+            self._on_pack_selection()
+            return
         try:                                       # this environment's own pack discovery sees what is new too
             from germquant import packs as _gq_packs
 
@@ -479,21 +655,15 @@ class RunWidget(QWidget):
         self._listing = listing
         self._check_cache.clear()
         self._entries = _packs.listing_entries(listing)
-        usable = [e for e in self._entries if e.usable_manifest]
-        note = f"{len(usable)} pack(s) found by {runner.describe()}"
+        usable = [e.id for e in self._entries if e.usable_manifest]
+        note = f"{len(usable)} pack(s) found by {runner.describe() if runner else 'the engine'}"
         if listing.get("message"):
             note += f". {listing['message']}"
         self.pack_picker.show_message(note, AMBER if listing.get("message") or not usable else None)
+        current = self.pack_picker.current_pack_id()
         select = None
-        if choose_route:
-            last_pack, last_recipe = _settings.last_pack()
-            ids = [e.id for e in usable]
-            if last_pack in ids:
-                select = (last_pack, last_recipe)
-            elif "celegans_germline" in ids:
-                select = ("celegans_germline", None)
-            elif ids:
-                select = (ids[0], None)
+        if choose_route or current is None or current not in [e.id for e in self._entries]:
+            select = self._first_look(usable)
         self.pack_picker.blockSignals(True)
         try:
             self.pack_picker.set_entries(self._entries, select=select)
@@ -503,7 +673,6 @@ class RunWidget(QWidget):
             self._use_route(PACK)
         else:
             self._on_pack_selection()
-        return list(self._entries)
 
     @property
     def pack_entries(self) -> list[_packs.PackEntry]:
@@ -511,7 +680,7 @@ class RunWidget(QWidget):
 
     @property
     def pack_status(self) -> dict | None:
-        """The last pack check of the selected recipe."""
+        """The pack check of the selected recipe (None while it is being checked)."""
         return self._pack_status
 
     def _use_route(self, route: str) -> None:
@@ -540,23 +709,32 @@ class RunWidget(QWidget):
         return self._source
 
     def select_pack(self, pack_id: str, recipe: str | None = None, version: str | None = None) -> None:
-        """Pick a pack (and recipe) from the engine's list and use it for the run."""
+        """Pick a pack (and recipe) from the engine's list and use it for the run (as a user's pick: it is
+        remembered as the last pack)."""
         if not _engine.packs_supported():
             raise RuntimeError(_engine.packs_unavailable_message())
         if not self._entries:
-            self.refresh_packs()
+            raise ValueError("no packs are listed yet: choose the engine (Choose engine...) and wait for its list")
         self.pack_picker.blockSignals(True)
         try:
             self.pack_picker.select(pack_id, recipe, version)
         finally:
             self.pack_picker.blockSignals(False)
+        self._remember_pack()
         self._use_route(PACK)
 
     def select_recipe(self, recipe: str) -> None:
         self.pack_picker.select_recipe(recipe)
 
+    def _remember_pack(self) -> None:
+        """Store the picker's pack and recipe as the user's last pick (only ever for a pick the user made)."""
+        entry, rid = self.pack_picker.current_entry(), self.pack_picker.current_recipe_id()
+        if entry is not None and rid and entry.usable_manifest:
+            _settings.set_last_pack(entry.id, rid)
+
     def _on_user_pack_selection(self) -> None:
-        """A pack or recipe picked in the picker: use it for the run (the pack route)."""
+        """A pack or recipe picked in the picker: remember it and use it for the run (the pack route)."""
+        self._remember_pack()
         if _engine.packs_supported() and self._source != PACK:
             self._use_route(PACK)
         else:
@@ -564,8 +742,6 @@ class RunWidget(QWidget):
 
     def _on_pack_selection(self) -> None:
         entry, rid = self.pack_picker.current_entry(), self.pack_picker.current_recipe_id()
-        if entry is not None and rid and entry.usable_manifest:
-            _settings.set_last_pack(entry.id, rid)
         if self._source == PACK:
             if entry is not None and rid and entry.usable_manifest:
                 self.set_recipe(Recipe.from_pack(entry.ref, rid, hint=entry.profile_path(rid)))
@@ -574,14 +750,21 @@ class RunWidget(QWidget):
                 self.refresh()
         self.refresh_card()
 
+    def _card_key(self, runner: EngineRunner, entry: _packs.PackEntry, rid: str | None) -> tuple:
+        image = str(self._image) if self._image is not None and self._image.exists() else None
+        return runner.key, entry.ref, rid, image
+
     def refresh_card(self, force: bool = False) -> dict | None:
-        """Check the selected pack recipe in the environment that will run it (``pack check --json``, with the
-        image when one is chosen), render the card, grey what cannot run and set the Run button. A check is
-        kept until the pack list is refreshed or models or examples are fetched; ``force`` checks again."""
+        """The card of the selected pack recipe. Its check (``pack check --json``, with the image when one is
+        chosen) runs in the environment that will run it, in the check worker: until it is back the card says
+        "checking" and Run is off; then the card is rendered, what cannot run is greyed and Run is set. A check
+        is kept until the pack list is refreshed or models or examples are fetched; ``force`` checks again.
+        Returns the check when it is already known, else None."""
         if force:
             self._check_cache.clear()
         entry, rid = self.pack_picker.current_entry(), self.pack_picker.current_recipe_id()
         self._pack_status = None
+        self._card_pending = False
         if entry is None:
             self._update_run_button()
             return None
@@ -596,20 +779,62 @@ class RunWidget(QWidget):
             self.pack_picker.show_status(entry, rid, None, engine_text="no engine chosen yet")
             self._update_run_button()
             return None
-        image = str(self._image) if self._image is not None and self._image.exists() else None
-        key = (runner.key, entry.ref, rid, image)
-        st = self._check_cache.get(key)
+        st = self._check_cache.get(self._card_key(runner, entry, rid))
         if st is None:
+            self.pack_picker.show_status(entry, rid, None, engine_text=runner.describe(), pending=True)
+            self._card_pending = True
+            self._want_card = True
+            self._update_run_button()
+            self._pump()
+            return None
+        self._render_card(entry, rid, st, runner)
+        return st
+
+    def _start_card_job(self) -> None:
+        entry, rid = self.pack_picker.current_entry(), self.pack_picker.current_recipe_id()
+        runner = self.engine_runner(entry.id, rid) if entry is not None and entry.usable_manifest else None
+        if runner is None:
+            self._pump()
+            return
+        key = self._card_key(runner, entry, rid)
+        if key in self._check_cache:
+            self.refresh_card()
+            self._pump()
+            return
+        own = runner is not self._engine_runner
+        image = key[3]
+
+        def job(should_stop):
             try:
-                if runner is not self._engine_runner:
-                    runner.version()                 # a recipe's own interpreter: EngineTooOld names the fix
-                st = runner.check(entry.ref, rid, image)
+                if own:
+                    runner.version(should_stop=should_stop)  # a recipe's own interpreter: EngineTooOld names the fix
+                return key, runner.check(entry.ref, rid, image, should_stop=should_stop)
+            except RunCancelled:
+                raise
             except RunnerError as e:
-                st = {"pack": entry.id, "version": entry.version, "recipe": rid, "usable": False,
-                      "blockers": [{"what": str(e), "fix": "choose a working engine (Choose engine..., or Recipe "
-                                                           "interpreter... for this recipe)"}],
-                      "warnings": [], "models": []}
-            self._check_cache[key] = st
+                return key, {"pack": entry.id, "version": entry.version, "recipe": rid, "usable": False,
+                             "blockers": [{"what": str(e), "fix": "choose a working engine (Choose engine..., or "
+                                                                  "Recipe interpreter... for this recipe)"}],
+                             "warnings": [], "models": []}
+
+        self._start_check(job, f"checking {entry.ref} {rid}", self._card_checked,
+                          lambda exc: self._card_failed(key, exc))
+
+    def _card_checked(self, res: tuple) -> None:
+        key, st = res
+        self._check_cache[key] = st
+        self.refresh_card()                     # shows it when it is still the selection, else checks that
+        self._show_engine()                     # a recipe interpreter's version is known now
+
+    def _card_failed(self, key: tuple, exc: BaseException) -> None:
+        if isinstance(exc, RunCancelled):       # napari is closing
+            return
+        self._check_cache[key] = {"pack": key[1], "recipe": key[2], "usable": False, "warnings": [], "models": [],
+                                  "blockers": [{"what": _error_text(exc), "fix": "Refresh, or choose a working "
+                                                                                 "engine"}]}
+        self.refresh_card()
+
+    def _render_card(self, entry: _packs.PackEntry, rid: str | None, st: dict, runner: EngineRunner) -> None:
         self.pack_picker.show_status(entry, rid, st, engine_text=runner.describe())
         info = []
         try:
@@ -625,14 +850,18 @@ class RunWidget(QWidget):
         self.pack_picker.info_label.setText("\n".join(info))
         self._pack_status = st
         self._update_run_button()
-        return st
 
     def _update_run_button(self) -> None:
         busy = self._worker is not None
+        checking = self._source == PACK and self._card_pending
         blocked = self._source == PACK and self._pack_status is not None and not self._pack_status.get("usable")
-        self.run_btn.setEnabled(not busy and not blocked)
-        self.run_btn.setToolTip(("this recipe cannot run here:\n" + _packs.blocker_text(self._pack_status))
-                                if blocked else "")
+        self.run_btn.setEnabled(not busy and not blocked and not checking)
+        if blocked:
+            self.run_btn.setToolTip("this recipe cannot run here:\n" + _packs.blocker_text(self._pack_status))
+        elif checking:
+            self.run_btn.setToolTip("the recipe is being checked in the engine environment")
+        else:
+            self.run_btn.setToolTip("")
 
     def _expected_segmenters(self, recipe: Recipe | None) -> list[str] | None:
         if recipe is None or not recipe.is_pack:
@@ -651,16 +880,28 @@ class RunWidget(QWidget):
         if entry is None or runner is None:
             self._status("choose the engine and a pack recipe first", AMBER)
             return False
-        self.last_pack_result, self.last_pack_error = None, None
-        self.pack_picker.set_busy(True)
-        started = self.pack_worker.start(lambda: runner.fetch_models(entry.ref, rid, say=_say),
-                                         label=f"getting the models of {entry.ref} {rid}",
-                                         returned=self._on_models_fetched, errored=self._on_pack_error,
-                                         finished=self._on_pack_finished)
-        if not started:
-            self.pack_picker.set_busy(False)
+        stop = self.pack_worker.should_stop
+        return self._start_pack_operation(lambda: runner.fetch_models(entry.ref, rid, say=_say, should_stop=stop),
+                                          f"getting the models of {entry.ref} {rid}", self._on_models_fetched,
+                                          runner)
+
+    def _start_pack_operation(self, func, label: str, returned, runner: EngineRunner) -> bool:
+        if self.pack_worker.busy:
             self._status("a model or example download is already running", AMBER)
-        return started
+            return False
+        self.last_pack_result, self.last_pack_error = None, None
+        self.pack_picker.set_busy(True, cancellable=runner.cancellable)
+        self.pack_worker.start(func, label=label, returned=returned, errored=self._on_pack_error,
+                               finished=self._on_pack_finished)
+        return True
+
+    def cancel_pack_operation(self) -> bool:
+        """Cancel: stop the running Get models or Get example (its engine process and children are ended)."""
+        if not self.pack_worker.cancel():
+            return False
+        self.pack_picker.cancel_btn.setEnabled(False)
+        self._status("cancelling the download: ending the engine process ...", AMBER)
+        return True
 
     def _on_models_fetched(self, res: dict) -> None:
         self.last_pack_result = res
@@ -679,16 +920,9 @@ class RunWidget(QWidget):
         if entry is None or runner is None:
             self._status("choose the engine and a pack first", AMBER)
             return False
-        self.last_pack_result, self.last_pack_error = None, None
-        self.pack_picker.set_busy(True)
-        started = self.pack_worker.start(lambda: runner.fetch_example(entry.ref, say=_say),
-                                         label=f"getting the example of {entry.ref}",
-                                         returned=self._on_example_fetched, errored=self._on_pack_error,
-                                         finished=self._on_pack_finished)
-        if not started:
-            self.pack_picker.set_busy(False)
-            self._status("a model or example download is already running", AMBER)
-        return started
+        stop = self.pack_worker.should_stop
+        return self._start_pack_operation(lambda: runner.fetch_example(entry.ref, say=_say, should_stop=stop),
+                                          f"getting the example of {entry.ref}", self._on_example_fetched, runner)
 
     def _on_example_fetched(self, rec: dict) -> None:
         self.last_pack_result = rec
@@ -722,6 +956,9 @@ class RunWidget(QWidget):
 
     def _on_pack_error(self, exc: BaseException) -> None:
         self.last_pack_error = exc
+        if isinstance(exc, RunCancelled):
+            self._status(f"cancelled: {exc}", AMBER)
+            return
         self._status(f"FAILED: {format_exception(exc, 1200)}", RED)
 
     def _on_pack_finished(self) -> None:
@@ -1003,13 +1240,14 @@ class RunWidget(QWidget):
         return self.engine_runner()
 
     def _engine_description(self, plan: RunPlan) -> dict | None:
+        """The engine line of the commands file, from the version check already made (no engine call here)."""
         runner = self._engine_for_plan(plan)
         if runner is None:
             return None
-        try:
-            v = runner.version()
-        except RunnerError:
-            return {"python": runner.python, "line": "version unknown (the engine did not answer)"}
+        v = runner.cached_version()
+        if v is None:
+            return {"python": runner.python, "line": "version unknown (the engine has not answered its version "
+                                                     "check)"}
         return {"python": runner.python, "kind": runner.kind,
                 "line": f"{v.get('germquant')} git {v.get('git_sha')} python {v.get('python')}"}
 
@@ -1032,14 +1270,17 @@ class RunWidget(QWidget):
 
     def run(self) -> None:
         """Run the plan in a napari thread worker through the engine runner; results load as layers when it
-        returns. With no engine chosen, ask for one (and run once it is chosen) instead of running here."""
+        returns. With no engine chosen, ask for one (and run once it is chosen, if the recipe is still the one
+        Run was pressed with) instead of running here."""
         if self._worker is not None:
             self._status("a run is already in progress", AMBER)
             return
         if self._source == PACK and self._current_runner() is None:
-            self._pending_run = True
-            self._status("Choose the engine environment first: Run starts once it is chosen", AMBER)
-            self.ask_for_engine()
+            self._ask_before_run()
+            return
+        if self._source == PACK and self._card_pending:
+            self._status("the recipe is still being checked in the engine environment: press Run when its card "
+                         "is back", AMBER)
             return
         try:
             plan = self.plan()
@@ -1048,9 +1289,7 @@ class RunWidget(QWidget):
             return
         runner = self._engine_for_plan(plan)
         if runner is None:
-            self._pending_run = True
-            self._status("Choose the engine environment first: Run starts once it is chosen", AMBER)
-            self.ask_for_engine()
+            self._ask_before_run()
             return
         if plan.recipe.is_pack and self._pack_status is not None and not self._pack_status.get("usable"):
             self._status("this recipe cannot run here:\n" + _packs.blocker_text(self._pack_status), RED)
@@ -1072,16 +1311,46 @@ class RunWidget(QWidget):
             msg += " (" + " ".join(f"--no-{n}" for n in plan.disabled) + ")"
         self._status(msg + " ...", None)
         set_viewer_status(self.viewer, msg)
+        cancel = threading.Event()
+        holder: dict = {}
+
+        def should_stop() -> bool:              # Cancel, or napari quitting (it asks every worker to quit)
+            worker = holder.get("worker")
+            return cancel.is_set() or bool(worker is not None and getattr(worker, "abort_requested", False))
 
         def work():
             return execute_run(runner, plan, config_hash=config_hash, prefer=prefer,
-                               interpreter_source="recipe" if own else "default", say=_say)
+                               interpreter_source="recipe" if own else "default", say=_say, should_stop=should_stop)
 
+        self._run_cancel = cancel
+        self._run_cancellable = runner.cancellable
         # an explicit errored connection: without one napari re-raises the exception in the Qt event loop
         self._worker = create_worker(
             work,
             _connect={"returned": self._on_returned, "errored": self._on_errored, "finished": self._on_finished},
         )
+        holder["worker"] = self._worker
+        self.cancel_btn.setEnabled(runner.cancellable)
+
+    def _ask_before_run(self) -> None:
+        self._pending_run = True
+        self._pending_recipe = self._recipe
+        self._status("Choose the engine environment first: Run starts once it is chosen", AMBER)
+        self.ask_for_engine()
+
+    def cancel_run(self) -> bool:
+        """Cancel: stop the run in progress. Its engine process and every process it started are ended, and the
+        run log records image_failed with the cancellation. A run in this napari environment cannot be stopped."""
+        if self._worker is None or self._run_cancel is None:
+            return False
+        if not self._run_cancellable:
+            self._status("a run in this napari environment cannot be stopped from the dock; it ends on its own",
+                         AMBER)
+            return False
+        self._run_cancel.set()
+        self.cancel_btn.setEnabled(False)
+        self._status("cancelling: ending the engine process ...", AMBER)
+        return True
 
     def _tick(self) -> None:
         elapsed = int(time.monotonic() - self._t0)
@@ -1117,8 +1386,12 @@ class RunWidget(QWidget):
         log_path = getattr(exc, "run_log", None)
         if log_path:
             self.last_run_log = Path(log_path)
-        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1500:]
         where = f"\nrun log {log_path}" if log_path else ""
+        if isinstance(exc, RunCancelled):
+            self._status(f"run cancelled: {exc}{where}", AMBER)
+            set_viewer_status(self.viewer, "germquant run cancelled")
+            return
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1500:]
         self._status(f"run FAILED: {type(exc).__name__}: {exc}{where}\n{tb}", RED)
         set_viewer_status(self.viewer, f"germquant failed: {type(exc).__name__}: {exc}")
         try:
@@ -1132,6 +1405,8 @@ class RunWidget(QWidget):
         self._timer.stop()
         self._bridge.detach()
         self._worker = None
+        self._run_cancel = None
+        self.cancel_btn.setEnabled(False)
         self._update_run_button()
 
     # ------------------------------------------------------------------ status

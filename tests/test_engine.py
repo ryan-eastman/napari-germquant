@@ -134,3 +134,22 @@ def test_export_writes_a_loadable_overlay_and_the_commands(tmp_path, engine_root
     overlay_line = [ln for ln in body.splitlines() if "--config" in ln][-1]
     assert str(overlay) in overlay_line and "--no-spots" not in overlay_line
     assert "run_timestamp" in body and str(api.__version__) in body
+
+
+def test_the_runner_line_of_the_commands_file_runs_in_powershell(monkeypatch):
+    """PowerShell reads a line that starts with a quoted string as an expression and rejects `-m`: on Windows a
+    quoted interpreter path gets the call operator & (with a note for cmd); an unquoted one, or another system,
+    gets none."""
+    plan = RunPlan(image=Path("D:/data/a b.nd2"), recipe=Recipe.from_profile("rad51_foci"), out=Path("D:/data/a b_r"))
+    tail = ' -m germquant run "' + str(Path("D:/data/a b.nd2")) + '" --profile rad51_foci --out "' + \
+        str(Path("D:/data/a b_r")) + '"'
+    for windows, spaced, want_amp in ((True, True, True), (True, False, False), (False, True, False)):
+        monkeypatch.setattr(_engine, "_on_windows", lambda w=windows: w)
+        python = "C:/Program Files/Python311/python.exe" if spaced else "C:/py311/python.exe"
+        body = plan.commands_text(engine={"python": python, "line": "0.2.0.dev0"})
+        lines = body.splitlines()
+        i = next(k for k, ln in enumerate(lines) if ln.startswith("# The same, as the dock's engine runner starts it"))
+        quoted = f'"{python}"' if spaced else python
+        assert lines[i + 1] == ("& " if want_amp else "") + quoted + tail, (windows, spaced)
+        assert ("PowerShell needs the & before a quoted interpreter path; in cmd leave the & out" in lines[i]) == \
+            want_amp

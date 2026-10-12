@@ -17,9 +17,14 @@
 #
 # Environment: Python 3.11 and uv. torch and torchvision are CPU wheels (PyPI's arm64 build on macOS); the engine
 # and the plugin resolve against the engine checkout's constraints (ci-cpu-2026-10.txt, ci-mac-arm64-2026-10.txt on
-# macOS, and readers-2026-10.txt) plus constraints/ci-plugin-2026-10.txt here (napari, PyQt6, pytest-qt). Cellpose
-# is installed as in the README's laptop install (some pack checks look for it). SpotMAX is not installed, as in
-# the workstation's plugin environment; tests that need it skip or expect it missing.
+# macOS, and readers-2026-10.txt) plus constraints/ci-plugin-2026-10.txt here (napari, PyQt6, pytest-qt, and the
+# bioio plugins of the readers extra that the engine's file leaves open). Cellpose is installed as in the README's
+# laptop install (some pack checks look for it). SpotMAX is not installed, as in the workstation's plugin
+# environment; tests that need it skip or expect it missing.
+#
+# Time: gate G1 gives a job 15 minutes. The Linux replica of this job (WSL, a fresh environment with uv's cache
+# warm) took the time the README's Continuous integration section records; timeout-minutes sits a little above
+# the budget, so a job that blows it shows as failed instead of running on.
 #
 # Qt: QT_QPA_PLATFORM=offscreen for the whole job. tests/conftest.py answers napari's two OpenGL queries with
 # constants under offscreen, so nothing is rendered and no GPU is touched (none of these runners has one).
@@ -50,7 +55,8 @@ jobs:
   test:
     name: ${{ matrix.os }}, Python 3.11
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # gate G1: 15 minutes a job; a little above, so a job over budget fails instead of running on
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

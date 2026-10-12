@@ -9,7 +9,10 @@ interpreter stored on this computer, and no engine is chosen unless the test cho
 every pack root and store a pack test could touch (as the engine's tests/packs_helpers.py does): the test pack
 copy under tests/fixtures/packs as $GERMQUANT_PACKS, an empty model store ($GERMQUANT_MODELS), an empty
 Cellpose cache, a private per-user folder and a private examples folder. A subprocess engine inherits all of
-it, so both runners see the same packs and stores."""
+it, so both runners see the same packs and stores.
+
+The Run dock checks engines, lists packs and checks recipes in a thread worker, never in the GUI thread:
+``settle(w, qtbot)`` waits until those calls are done before a test reads what they set."""
 from __future__ import annotations
 
 import os
@@ -21,8 +24,10 @@ import contextlib  # noqa: E402
 import hashlib  # noqa: E402
 import http.server  # noqa: E402
 import re  # noqa: E402
+import shutil  # noqa: E402
 import subprocess  # noqa: E402
 import sys  # noqa: E402
+import tempfile  # noqa: E402
 import threading  # noqa: E402
 from pathlib import Path  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
@@ -43,6 +48,12 @@ TINYNET_SHA = hashlib.sha256(TINYNET_BYTES).hexdigest()
 HEAVY = ("torch", "cupy", "spotmax", "cellpose")
 
 
+def settle(w, qtbot, timeout: int = 120_000) -> None:
+    """Wait until the Run dock ``w`` has no engine call (version check, pack list, card check) in flight or
+    waiting."""
+    qtbot.waitUntil(lambda: w.idle, timeout=timeout)
+
+
 @pytest.fixture(autouse=True)
 def _private_settings(tmp_path, monkeypatch):
     """A settings file of the test's own: the dock starts with no engine chosen, and the interpreter stored
@@ -55,7 +66,12 @@ def _private_settings(tmp_path, monkeypatch):
 
 @pytest.fixture
 def pack_env(tmp_path, monkeypatch):
-    """Isolated pack roots and stores (module docstring); the test pack is found under $GERMQUANT_PACKS."""
+    """Isolated pack roots and stores (module docstring); the test pack is found under $GERMQUANT_PACKS.
+
+    The model store sits in a short folder of the system temporary folder ($RUNNER_TEMP on a CI runner),
+    removed afterwards, not under tmp_path: a blob's record is <store>/models/blobs/<64 hex>/<64 hex>.json.part,
+    about 150 characters below the store, and under a long pytest base folder (a long user name, a test with a
+    long name) that passes the 260-character path limit of a Windows without long paths enabled."""
     pytest.importorskip("germquant.packs", reason="system packs need germquant 0.2.0.dev0 or later")
     from germquant import packs
 
@@ -65,8 +81,7 @@ def pack_env(tmp_path, monkeypatch):
     monkeypatch.setenv("GERMQUANT_PACKS", str(FIXTURE_PACKS))
     monkeypatch.setenv("LOCALAPPDATA", str(home / "localappdata"))
     monkeypatch.setenv("XDG_DATA_HOME", str(home / "xdg"))
-    models = tmp_path / "models_root"
-    models.mkdir()
+    models = Path(tempfile.mkdtemp(prefix="gqm", dir=os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()))
     monkeypatch.setenv("GERMQUANT_MODELS", str(models))
     cache = tmp_path / "cellpose_cache"
     cache.mkdir()
@@ -75,16 +90,17 @@ def pack_env(tmp_path, monkeypatch):
     monkeypatch.setenv("GERMQUANT_EXAMPLES", str(examples))
     monkeypatch.delenv("GERMQUANT_ALLOW_LOOPBACK_EXAMPLES", raising=False)
     packs.refresh()
-    yield SimpleNamespace(tmp=tmp_path, models=models, cache=cache, examples=examples,
-                          blobs=models / "models" / "blobs")
-    packs.refresh()
+    try:
+        yield SimpleNamespace(tmp=tmp_path, models=models, cache=cache, examples=examples,
+                              blobs=models / "models" / "blobs")
+    finally:
+        packs.refresh()
+        shutil.rmtree(models, ignore_errors=True)
 
 
 def copy_pack(src: Path, dest: Path, *, edit=None) -> Path:
     """Copy a pack folder, apply ``edit(manifest_dict)`` to its pack.yaml, and rebuild SHA256SUMS (pack.yaml is
     not hashed, so no recipe's config_hash moves)."""
-    import shutil
-
     import yaml
     from germquant import packs
 

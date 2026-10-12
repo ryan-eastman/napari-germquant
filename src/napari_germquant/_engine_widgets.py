@@ -46,7 +46,12 @@ class InterpreterDialog(QDialog):
     """Asks which Python runs germquant: one of the detected interpreters, any Python picked with Browse, or
     (explicitly) this napari environment in process. For one recipe it can also go back to the dock's engine.
     The dock opens it with ``open()`` (window-modal, never blocking the event loop) and reads ``choice()``
-    when it is accepted: a Python path, ``inprocess``, or an empty string (the dock's engine, for a recipe)."""
+    when it is accepted: a Python path, ``inprocess``, or an empty string (the dock's engine, for a recipe).
+
+    Only a candidate marked ``detected`` (the engine checkout's .venv) is preselected. Otherwise no row is
+    selected and OK stays off until the user picks one or uses Browse: napari's own Python is listed, with what
+    it lacks, but one OK click must never make it the engine. The choice is the selected row, not Qt's current
+    row (which a list gets on keyboard focus without being picked)."""
 
     def __init__(self, candidates: list[dict], *, title: str, intro: str, current: str | None = None,
                  allow_inprocess: bool = True, allow_default: bool = False, parent=None):
@@ -60,6 +65,7 @@ class InterpreterDialog(QDialog):
         text.setWordWrap(True)
         lay.addWidget(text)
         self.list = QListWidget()
+        self.list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         for c in candidates:
             self._add(str(c["python"]), str(c.get("why", "")))
         lay.addWidget(self.list)
@@ -84,13 +90,16 @@ class InterpreterDialog(QDialog):
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         lay.addWidget(self.buttons)
-        self.list.currentItemChanged.connect(lambda *_: self._update())
+        self.list.itemSelectionChanged.connect(self._update)
         if current == INPROCESS:
             self.inprocess_check.setChecked(True)
         elif current:
             self.select_path(current)
-        elif self.list.count():
-            self.list.setCurrentRow(0)
+        else:
+            for i, c in enumerate(candidates):
+                if c.get("detected"):
+                    self.list.setCurrentRow(i)
+                    break
         self._update()
 
     def _add(self, python: str, why: str) -> QListWidgetItem:
@@ -125,8 +134,8 @@ class InterpreterDialog(QDialog):
             return ""
         if self._allow_inprocess and self.inprocess_check.isChecked():
             return INPROCESS
-        item = self.list.currentItem()
-        return str(item.data(Qt.ItemDataRole.UserRole)) if item is not None else None
+        items = self.list.selectedItems()
+        return str(items[0].data(Qt.ItemDataRole.UserRole)) if items else None
 
     def _update(self) -> None:
         self.list.setEnabled(not (self._allow_inprocess and self.inprocess_check.isChecked())
@@ -167,7 +176,8 @@ class EngineBox(QGroupBox):
         self.device_combo.currentIndexChanged.connect(lambda _i: self.device_changed.emit(self.device()))
         row.addWidget(self.device_combo, 1)
         self.choose_btn = QPushButton("Choose engine...")
-        self.choose_btn.setToolTip("the Python environment that runs germquant on this computer (stored per machine)")
+        self.choose_btn.setToolTip("the Python environment that runs germquant on this computer (stored for this "
+                                   "computer only)")
         self.choose_btn.clicked.connect(self.choose_clicked.emit)
         row.addWidget(self.choose_btn)
         form.addRow("Device", row)
@@ -202,6 +212,7 @@ class PackPicker(QGroupBox):
     get_models_clicked = Signal()
     get_example_clicked = Signal()
     interpreter_clicked = Signal()
+    cancel_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__("System pack", parent)
@@ -240,9 +251,15 @@ class PackPicker(QGroupBox):
         btns.addWidget(self.get_example_btn)
         self.interpreter_btn = QPushButton("Recipe interpreter...")
         self.interpreter_btn.setToolTip("run this recipe in another Python environment (for example one with an "
-                                        "optional backend installed); stored per machine")
+                                        "optional backend installed); stored for this computer only")
         self.interpreter_btn.clicked.connect(self.interpreter_clicked.emit)
         btns.addWidget(self.interpreter_btn)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip("stop the model or example download: the engine process and its children are "
+                                   "ended (downloads in this napari environment cannot be stopped)")
+        self.cancel_btn.clicked.connect(self.cancel_clicked.emit)
+        self.cancel_btn.setEnabled(False)
+        btns.addWidget(self.cancel_btn)
         form.addRow(btns)
         self.info_label = QLabel("")
         self.info_label.setWordWrap(True)
@@ -355,12 +372,12 @@ class PackPicker(QGroupBox):
         self.message.setStyleSheet(_color_css(color))
 
     def show_status(self, entry: PackEntry, recipe_id: str | None, status: dict | None, *,
-                    engine_text: str = "") -> None:
-        """Render the card for ``entry``/``recipe_id`` with the check ``status`` (None: not checked); grey the
-        recipe (and a broken pack) with the reason when it cannot run."""
+                    engine_text: str = "", pending: bool = False) -> None:
+        """Render the card for ``entry``/``recipe_id`` with the check ``status`` (None: not checked; with
+        ``pending``, being checked); grey the recipe (and a broken pack) with the reason when it cannot run."""
         if status is not None and recipe_id:
             self._statuses[(entry.ref, recipe_id)] = status
-        self.card.setText(_packs.card_html(entry, recipe_id, status, engine_text=engine_text))
+        self.card.setText(_packs.card_html(entry, recipe_id, status, engine_text=engine_text, pending=pending))
         ri = self.recipe_combo.findData(recipe_id) if recipe_id else -1
         if ri >= 0:
             if status is not None and not status.get("usable"):
@@ -385,8 +402,10 @@ class PackPicker(QGroupBox):
         self.get_example_btn.setEnabled(example)
         self.interpreter_btn.setEnabled(interpreter)
 
-    def set_busy(self, busy: bool) -> None:
+    def set_busy(self, busy: bool, cancellable: bool = False) -> None:
+        """While a download runs: the pack and recipe stay put, and Cancel is on when the call can stop."""
         for w in (self.pack_combo, self.recipe_combo, self.refresh_btn):
             w.setEnabled(not busy)
         if busy:
             self._set_buttons(False, False, False)
+        self.cancel_btn.setEnabled(bool(busy and cancellable))

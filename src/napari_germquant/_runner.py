@@ -7,18 +7,26 @@ touches packs and runs goes:
 
 * SubprocessRunner: an engine interpreter chosen for this computer (the dock stores the choice in QSettings).
   Pack listing, checks and fetching go through the engine's torch-free entry, ``<python> -m germquant.packs``
-  (``list --json``, ``check --json``, ``fetch-models``, ``fetch-example --json`` and ``--version --json``), so a
-  pack card refresh never loads torch in the engine process. A run is ``<python> -m germquant run IMAGE ...
-  --out DIR``: the command line itself, with the arguments the dock exports. Every command is a list of
-  arguments; no shell is ever involved.
+  (``list --json``, ``check --json``, ``fetch-models``, ``fetch-example`` and ``--version --json``), so a pack
+  card refresh never loads torch in the engine process. A run is ``<python> -m germquant run IMAGE ... --out
+  DIR``: the command line itself, with the arguments the dock exports. Every command is a list of arguments; no
+  shell is ever involved.
 * InProcessRunner: this napari environment, through germquant.packs and germquant.api (in the dock's thread
   worker). The dock uses it only when the user picks it explicitly; with no engine chosen it asks instead.
+
+Every engine call of the subprocess runner can be stopped: the dock passes ``should_stop`` (its Cancel button,
+or napari quitting, which asks every thread worker to quit) and the call then ends the engine process and every
+process it started (a job object or ``taskkill /T`` on Windows, the process group elsewhere) and raises
+RunCancelled. On Windows each engine process also sits in a job that ends with napari, so killing napari never
+leaves an engine writing into an output folder. Version checks, listings and checks have their own short
+timeout; runs, model and example downloads have none (they are cancelled instead).
 
 Each GUI run also writes a run log, ``runs/<run_id>.jsonl`` in the folder that holds the output folder (section
 7.6): run_start (via, host, os, interpreter, engine version and git sha, python, device requested and selected,
 config_hash, images), then image_done or image_failed, then run_end, one fsynced JSON line each. The log never
 goes into the output folder itself, so a GUI run and ``germquant run`` write the same file list there. When that
-folder cannot be written, the log goes to the per-user folder (``user_runs_dir``) and run_start says so.
+folder cannot be written, or would be the output folder itself, the log goes to the per-user folder
+(``user_runs_dir``) and run_start says so.
 """
 from __future__ import annotations
 
@@ -29,13 +37,18 @@ import contextlib
 import datetime as _dt
 import functools
 import hashlib
+import importlib.util
 import json
 import logging
 import os
 import platform
+import queue
+import re
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -52,6 +65,10 @@ DEVICE_ENV = "GERMQUANT_DEVICE"
 PACKS_MODULE = "germquant.packs"
 # no console window flashes up for each engine call when napari runs without a console (Windows)
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# how long a version check, a pack listing or a pack check may take (runs and downloads have no limit)
+CHECK_TIMEOUT_S = 120.0
+# how often a running engine call asks should_stop
+_POLL_S = 0.1
 
 # The device probe a subprocess run starts with (run_start records the device requested and selected). It
 # imports torch in the engine environment, never CuPy, so the cuBLAS load order stays as the engine wants it.
@@ -62,6 +79,13 @@ _RUNTIME_PROBE = (
     "print(json.dumps(runtime_record(prefer)))\n"
 )
 
+# A chosen executable whose name does not start with "python" is asked to print this first (python -I -c).
+_PYTHON_PROBE_MARK = "germquant-python-probe"
+# commands that sit next to python.exe in an environment and are easily picked by mistake: refused unrun
+_NOT_PYTHON = ("germquant", "napari", "pip", "pip3")
+_CHOOSE_PYTHON = ("Choose python.exe (Windows) or bin/python (Mac, Linux) of the engine environment, not "
+                  "germquant.exe or napari.exe.")
+
 
 class RunnerError(RuntimeError):
     """An engine call that could not be made or did not succeed; the message says what to do."""
@@ -69,6 +93,15 @@ class RunnerError(RuntimeError):
 
 class EngineTooOld(RunnerError):
     """The engine has no system packs (germquant older than 0.2.0.dev0)."""
+
+
+class RunCancelled(RunnerError):
+    """The call was stopped (Cancel, or napari quitting): the engine process and its children were ended."""
+
+
+def _not_stopped(should_stop) -> None:
+    if should_stop is not None and should_stop():
+        raise RunCancelled("cancelled by the user before it started")
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -147,17 +180,42 @@ def venv_python(folder: str | Path) -> Path | None:
     return None
 
 
+def own_environment_gaps() -> tuple[list[str], list[str]]:
+    """``(what this napari environment lacks, what therefore cannot run here)``, from find_spec and the torch
+    already imported (germquant.api imports it); nothing is imported to find out."""
+    gaps, effects = [], []
+    if importlib.util.find_spec("spotmax") is None:
+        gaps.append("no SpotMAX")
+        effects.append("outside packs and the spots stage cannot run here")
+    torch = sys.modules.get("torch")
+    if torch is None and importlib.util.find_spec("torch") is None:
+        gaps.append("no torch")
+        effects.append("Cellpose recipes cannot run here")
+    elif torch is not None and sys.platform != "darwin" and getattr(getattr(torch, "version", None), "cuda", None) is None:
+        gaps.append("CPU torch")
+        effects.append("Cellpose runs on the CPU only")
+    if importlib.util.find_spec("cellpose") is None and "no torch" not in gaps:
+        gaps.append("no Cellpose")
+        effects.append("Cellpose recipes cannot run here")
+    return gaps, effects
+
+
 def detect_interpreters() -> list[dict]:
     """Suggestions for the engine interpreter, never a decision: the .venv of the engine checkout the plugin's
-    germquant comes from (when it has one), then this napari environment's own Python as a separate process.
-    Each is ``{"python", "why"}``."""
+    germquant comes from (when it has one, ``detected``: the dialog preselects only that one), then this napari
+    environment's own Python as a separate process, labelled with what it lacks. Each is ``{"python", "why",
+    "detected"}``."""
     out: list[dict] = []
     checkout = engine_checkout()
     if checkout is not None:
         p = venv_python(checkout)
         if p is not None:
-            out.append({"python": str(p), "why": f"the .venv of the engine checkout {checkout}"})
-    out.append({"python": sys.executable, "why": "this napari environment's own Python, as a separate process"})
+            out.append({"python": str(p), "why": f"the .venv of the engine checkout {checkout}", "detected": True})
+    why = "this napari environment's own Python, as a separate process"
+    gaps, effects = own_environment_gaps()
+    if gaps:
+        why += f" ({', '.join(gaps)}): " + "; ".join(dict.fromkeys(effects))
+    out.append({"python": sys.executable, "why": why, "detected": False})
     seen, unique = set(), []
     for c in out:
         key = os.path.normcase(str(Path(c["python"]).resolve()))
@@ -238,19 +296,128 @@ def read_result(plan) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------------
+# engine processes: started, read line by line, and ended with everything they started
+# ---------------------------------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1)
+def _win32():
+    """kernel32 with the job-object calls typed, and the JOBOBJECT_EXTENDED_LIMIT_INFORMATION structure."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _Basic(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class _Io(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("ReadOperationCount", "WriteOperationCount",
+                                                   "OtherOperationCount", "ReadTransferCount",
+                                                   "WriteTransferCount", "OtherTransferCount")]
+
+    class _Extended(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _Basic), ("IoInfo", _Io), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    k32.SetInformationJobObject.restype = wintypes.BOOL
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    k32.AssignProcessToJobObject.restype = wintypes.BOOL
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k32.TerminateJobObject.restype = wintypes.BOOL
+    k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return ctypes, k32, _Extended
+
+
+def _windows_job(proc: subprocess.Popen):
+    """A job object holding ``proc`` and every process it starts, set to end them all when its last handle
+    closes: when napari ends, even killed from Task Manager, the engine ends with it. None outside Windows, or
+    when no job can be made (the process then runs without one; Cancel still ends its tree)."""
+    if os.name != "nt":
+        return None
+    try:
+        ctypes, k32, extended = _win32()
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = extended()
+        info.BasicLimitInformation.LimitFlags = 0x2000           # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))   # extended limits
+        if not ok or not k32.AssignProcessToJobObject(job, int(proc._handle)):
+            k32.CloseHandle(job)
+            return None
+        return job
+    except Exception:  # noqa: BLE001 - a job is a safety net, never a reason not to run
+        return None
+
+
+def _close_job(job) -> None:
+    """Close the job handle: whatever is still in it (an orphan the engine left behind) is ended."""
+    if job is not None:
+        with contextlib.suppress(Exception):
+            _win32()[1].CloseHandle(job)
+
+
+def _end_tree(proc: subprocess.Popen, job) -> None:
+    """End ``proc`` and every process it started: the job and ``taskkill /T`` on Windows (a venv's python.exe
+    is a launcher whose child is the real interpreter), the process group elsewhere (the child was started in a
+    session of its own), then wait for it."""
+    if os.name == "nt":
+        if job is not None:
+            with contextlib.suppress(Exception):
+                _win32()[1].TerminateJobObject(job, 1)
+        if proc.poll() is None:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
+                               stdin=subprocess.DEVNULL, timeout=60, creationflags=_NO_WINDOW)
+    else:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=30)
+
+
+def _read_lines(stream, name: str, sink: queue.Queue) -> None:
+    try:
+        for raw in stream:
+            sink.put((name, raw.rstrip("\r\n")))
+    except (OSError, ValueError):                     # the stream was closed under us: nothing more to read
+        pass
+
+
+# ---------------------------------------------------------------------------------------------------
 # the runners
 # ---------------------------------------------------------------------------------------------------
 
 
 class EngineRunner:
-    """Where the dock's pack and run calls go. ``device`` is the device asked for (auto, cuda, mps or cpu)."""
+    """Where the dock's pack and run calls go. ``device`` is the device asked for (auto, cuda, mps or cpu).
+    ``should_stop`` (every call takes it) is asked while the call runs; a runner that can stop answers by
+    raising RunCancelled (``cancellable``)."""
 
     kind = "engine"
     via = ""
     python = ""
+    cancellable = False
 
     def __init__(self) -> None:
         self.device: str = "auto"
+        self.version_error: str | None = None
 
     @property
     def key(self) -> str:
@@ -260,32 +427,37 @@ class EngineRunner:
     def describe(self) -> str:
         raise NotImplementedError
 
-    def version(self) -> dict:
+    def version(self, refresh: bool = False, should_stop=None) -> dict:
         raise NotImplementedError
 
-    def list_packs(self) -> dict:
+    def cached_version(self) -> dict | None:
+        """The version check's answer when it has run (never starts one: the GUI thread reads this)."""
+        return None
+
+    def list_packs(self, should_stop=None) -> dict:
         raise NotImplementedError
 
-    def check(self, pack: str, recipe: str | None = None, image: str | Path | None = None) -> dict:
+    def check(self, pack: str, recipe: str | None = None, image: str | Path | None = None,
+              should_stop=None) -> dict:
         raise NotImplementedError
 
-    def fetch_models(self, pack: str, recipe: str | None = None, say=None) -> dict:
+    def fetch_models(self, pack: str, recipe: str | None = None, say=None, should_stop=None) -> dict:
         raise NotImplementedError
 
     def fetch_example(self, pack: str, example: str | None = None, out: str | Path | None = None,
-                      say=None) -> dict:
+                      say=None, should_stop=None) -> dict:
         raise NotImplementedError
 
-    def runtime(self, prefer: str | None = None) -> dict:
+    def runtime(self, prefer: str | None = None, should_stop=None) -> dict:
         raise NotImplementedError
 
-    def run(self, plan, say=None) -> dict:
+    def run(self, plan, say=None, should_stop=None) -> dict:
         raise NotImplementedError
 
 
 class InProcessRunner(EngineRunner):
     """This napari environment: germquant.packs for listing, checks and fetching, ``RunPlan.run``
-    (germquant.api.run) for runs. Chosen only explicitly."""
+    (germquant.api.run) for runs. Chosen only explicitly. A call that has started cannot be stopped."""
 
     kind = "inprocess"
     via = VIA_INPROCESS
@@ -297,7 +469,10 @@ class InProcessRunner(EngineRunner):
     def describe(self) -> str:
         return f"this napari environment, in process ({self.python})"
 
-    def version(self) -> dict:
+    def version(self, refresh: bool = False, should_stop=None) -> dict:
+        return dict(plugin_engine_info())
+
+    def cached_version(self) -> dict | None:
         return dict(plugin_engine_info())
 
     def _packs(self):
@@ -307,7 +482,8 @@ class InProcessRunner(EngineRunner):
 
         return packs
 
-    def list_packs(self) -> dict:
+    def list_packs(self, should_stop=None) -> dict:
+        _not_stopped(should_stop)
         P = self._packs()
         P.refresh()                                   # a pack installed or fetched since is seen now
         disc = P.discover()
@@ -316,7 +492,9 @@ class InProcessRunner(EngineRunner):
                           "roots": [{"kind": k, "path": str(r)} for k, r in disc.roots],
                           "packs": P.list_packs(all=True)})
 
-    def check(self, pack: str, recipe: str | None = None, image: str | Path | None = None) -> dict:
+    def check(self, pack: str, recipe: str | None = None, image: str | Path | None = None,
+              should_stop=None) -> dict:
+        _not_stopped(should_stop)
         P = self._packs()
         try:
             st = P.pack_status(pack, recipe=recipe, image=str(image) if image else None)
@@ -325,7 +503,8 @@ class InProcessRunner(EngineRunner):
                   "blockers": [{"what": str(e), "fix": "germquant pack list"}], "warnings": []}
         return _jsonable(st)
 
-    def fetch_models(self, pack: str, recipe: str | None = None, say=None) -> dict:
+    def fetch_models(self, pack: str, recipe: str | None = None, say=None, should_stop=None) -> dict:
+        _not_stopped(should_stop)
         P = self._packs()
         try:
             res = P.fetch_pack_models(pack, recipe, download=True, say=say)
@@ -335,7 +514,8 @@ class InProcessRunner(EngineRunner):
                 "lines": [f"{r['name']}: {r['status']} -> {r['path']}" for r in res]}
 
     def fetch_example(self, pack: str, example: str | None = None, out: str | Path | None = None,
-                      say=None) -> dict:
+                      say=None, should_stop=None) -> dict:
+        _not_stopped(should_stop)
         P = self._packs()
         try:
             return _jsonable(P.fetch_example(P.find_pack(pack), example, out, say=say))
@@ -344,7 +524,7 @@ class InProcessRunner(EngineRunner):
         except Exception as e:  # noqa: BLE001 - ExampleError, a download or assembly error: one message
             raise RunnerError(f"{type(e).__name__}: {e}") from e
 
-    def runtime(self, prefer: str | None = None) -> dict:
+    def runtime(self, prefer: str | None = None, should_stop=None) -> dict:
         try:
             from germquant.device import runtime_record
         except ImportError:                           # an engine older than the runtime record
@@ -355,7 +535,8 @@ class InProcessRunner(EngineRunner):
         with device_env(self.device):
             return _jsonable(runtime_record(prefer))
 
-    def run(self, plan, say=None) -> dict:
+    def run(self, plan, say=None, should_stop=None) -> dict:
+        _not_stopped(should_stop)
         if plan.recipe.is_pack:                       # as `germquant run --pack` does before it runs
             st = self.check(plan.recipe.pack, plan.recipe.recipe, plan.image)
             if not st.get("usable"):
@@ -369,13 +550,15 @@ class InProcessRunner(EngineRunner):
 class SubprocessRunner(EngineRunner):
     """An engine interpreter in its own process. ``env`` overrides variables of the inherited environment
     (None removes one); ``interpreter_options`` go between the interpreter and ``-m`` (for example
-    ``("-X", "importtime")`` in a test). ``history`` keeps every argument list run, newest last."""
+    ``("-X", "importtime")`` in a test); ``timeout`` bounds a version check, a listing and a check (runs and
+    downloads are unbounded and cancelled instead). ``history`` keeps every argument list run, newest last."""
 
     kind = "subprocess"
     via = VIA_SUBPROCESS
+    cancellable = True
 
     def __init__(self, python: str | Path, *, env: dict | None = None, interpreter_options=(),
-                 timeout: float = 600.0) -> None:
+                 timeout: float = CHECK_TIMEOUT_S) -> None:
         super().__init__()
         self.python = str(python)
         self.env = dict(env or {})
@@ -407,41 +590,92 @@ class SubprocessRunner(EngineRunner):
     def packs_argv(self, *args) -> list[str]:
         return [self.python, *self.interpreter_options, "-m", PACKS_MODULE, *[str(a) for a in args]]
 
-    def _call(self, argv: list[str], *, timeout: float | None = None,
-              extra_env: dict | None = None) -> subprocess.CompletedProcess:
+    def _run_proc(self, argv: list[str], *, extra_env: dict | None = None, say=None, should_stop=None,
+                  timeout: float | None = None, merge: bool = False) -> tuple[int, list[str], list[str]]:
+        """Run ``argv``: ``(returncode, stdout lines, stderr lines)``. With ``merge`` stderr joins stdout. Each
+        stdout line goes to ``say`` as it arrives. ``should_stop`` is asked every 0.1 s: when it answers True,
+        the process and every process it started are ended and RunCancelled is raised; past ``timeout``
+        seconds they are ended and RunnerError says so."""
+        _not_stopped(should_stop)
         self.history.append(list(argv))
+        options: dict = {"creationflags": _NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                  env=self.child_env(extra_env), stdin=subprocess.DEVNULL,
-                                  timeout=timeout or self.timeout, creationflags=_NO_WINDOW)
-        except subprocess.TimeoutExpired as e:
-            raise RunnerError(f"the engine interpreter {self.python} did not answer within "
-                              f"{int(timeout or self.timeout)} s") from e
-        except OSError as e:
-            raise RunnerError(f"the engine interpreter {self.python} cannot be started: {e}") from e
-        self.last_stderr = proc.stderr or ""
-        return proc
-
-    def _stream(self, argv: list[str], *, say=None, extra_env: dict | None = None) -> tuple[int, list[str]]:
-        """Run ``argv`` with stdout and stderr merged, handing each line to ``say`` as it arrives."""
-        self.history.append(list(argv))
-        try:
-            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT if merge else subprocess.PIPE,
                                     stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                                    env=self.child_env(extra_env), creationflags=_NO_WINDOW, bufsize=1)
+                                    env=self.child_env(extra_env), bufsize=1, **options)
         except OSError as e:
             raise RunnerError(f"the engine interpreter {self.python} cannot be started: {e}") from e
-        lines: list[str] = []
-        with proc:
-            assert proc.stdout is not None
-            for raw in proc.stdout:
-                line = raw.rstrip("\r\n")
-                lines.append(line)
-                if say is not None and line.strip():
-                    say(line)
-            rc = proc.wait()
-        self.last_stderr = "\n".join(lines)
-        return rc, lines
+        job = _windows_job(proc)
+        lines: queue.Queue = queue.Queue()
+        readers = [threading.Thread(target=_read_lines, args=(stream, name, lines), daemon=True)
+                   for name, stream in (("out", proc.stdout), ("err", proc.stderr)) if stream is not None]
+        for t in readers:
+            t.start()
+        out: list[str] = []
+        err: list[str] = []
+
+        def take(wait: float) -> bool:
+            try:
+                name, line = lines.get(timeout=wait) if wait > 0 else lines.get_nowait()
+            except queue.Empty:
+                return False
+            (out if name == "out" else err).append(line)
+            if say is not None and name == "out" and line.strip():
+                say(line)
+            return True
+
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        ended = ""
+        try:
+            while proc.poll() is None:
+                if should_stop is not None and should_stop():
+                    ended = "cancelled"
+                    break
+                if deadline is not None and time.monotonic() > deadline:
+                    ended = "timeout"
+                    break
+                take(_POLL_S)
+            if ended:
+                _end_tree(proc, job)
+            _close_job(job)                           # anything the engine left running ends here
+            job = None
+            until = time.monotonic() + 10             # the readers get the rest of the output (EOF), 10 s at most
+            for t in readers:
+                t.join(timeout=max(0.0, until - time.monotonic()))
+            while take(0):
+                pass
+        finally:
+            if proc.poll() is None:                   # an error in say: never leave the engine behind
+                _end_tree(proc, job)
+            _close_job(job)
+            # A stream whose reader still waits (a process that escaped the tree kill keeps the pipe open) is left
+            # to that daemon thread: closing it would wait for the blocked read, and so would napari's quit.
+            for t, stream in zip(readers, [s for s in (proc.stdout, proc.stderr) if s is not None]):
+                if not t.is_alive():
+                    with contextlib.suppress(OSError, ValueError):
+                        stream.close()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=30)
+        self.last_stderr = "\n".join(out if merge else err)
+        if ended == "cancelled":
+            raise RunCancelled(f"cancelled by the user: {self.python} and every process it started were ended")
+        if ended == "timeout":
+            raise RunnerError(f"the engine interpreter {self.python} did not answer within {int(timeout)} s "
+                              f"(it was ended)")
+        return int(proc.returncode), out, err
+
+    def _call(self, argv: list[str], *, timeout: float | None = None, extra_env: dict | None = None,
+              should_stop=None) -> subprocess.CompletedProcess:
+        rc, out, err = self._run_proc(argv, extra_env=extra_env, should_stop=should_stop,
+                                      timeout=timeout or self.timeout)
+        return subprocess.CompletedProcess(argv, rc, "\n".join(out), "\n".join(err))
+
+    def _stream(self, argv: list[str], *, say=None, extra_env: dict | None = None,
+                should_stop=None) -> tuple[int, list[str]]:
+        """Run ``argv`` with stdout and stderr merged, handing each line to ``say`` as it arrives."""
+        rc, out, _err = self._run_proc(argv, extra_env=extra_env, say=say, should_stop=should_stop, merge=True)
+        return rc, out
 
     def _module_missing(self, text: str) -> None:
         if "No module named germquant.packs" in text or "No module named 'germquant.packs'" in text:
@@ -453,43 +687,75 @@ class SubprocessRunner(EngineRunner):
             raise RunnerError(f"{self.python} has no germquant installed: choose the Python of the environment "
                               f"germquant was installed into (for example the engine checkout's .venv)")
 
-    def _json(self, argv: list[str], *, ok=(0,), timeout: float | None = None):
-        proc = self._call(argv, timeout=timeout)
+    def _json(self, argv: list[str], *, ok=(0,), timeout: float | None = None, should_stop=None):
+        proc = self._call(argv, timeout=timeout, should_stop=should_stop)
         if proc.returncode not in ok:
             text = (proc.stderr or "") + "\n" + (proc.stdout or "")
             self._module_missing(text)
             raise RunnerError(f"`{' '.join(argv[1:])}` failed (exit {proc.returncode}): {_tail(text)}")
         return _parse_json(proc.stdout)
 
+    def _check_interpreter(self, should_stop=None) -> None:
+        """Refuse what is not a Python interpreter before asking it anything: a folder, an environment's
+        germquant or napari command, or (for any other name not starting with python) an executable that does
+        not answer ``-I -c print(...)`` as Python does."""
+        p = Path(self.python)
+        if p.is_dir():
+            raise RunnerError(f"{self.python} is a folder, not a Python interpreter. {_CHOOSE_PYTHON}")
+        stem = p.name.lower().removesuffix(".exe")
+        if stem in _NOT_PYTHON:
+            raise RunnerError(f"{self.python} is not a Python interpreter but the {stem} command of an "
+                              f"environment. {_CHOOSE_PYTHON}")
+        if stem.startswith("python"):
+            return
+        rc, out, err = self._run_proc([self.python, "-I", "-c", f"print({_PYTHON_PROBE_MARK!r})"], timeout=30,
+                                      should_stop=should_stop)
+        if _PYTHON_PROBE_MARK not in out:
+            answer = _tail("\n".join(out + err), 300) or f"nothing, exit code {rc}"
+            raise RunnerError(f"{self.python} is not a Python interpreter (it answered: {answer}). {_CHOOSE_PYTHON}")
+
     # ---- the engine calls ----
-    def version(self, refresh: bool = False) -> dict:
+    def version(self, refresh: bool = False, should_stop=None) -> dict:
         """``<python> -m germquant.packs --version --json``; EngineTooOld for an engine without packs."""
         if self._version is not None and not refresh:
             return dict(self._version)
-        info = self._json(self.packs_argv("--version", "--json"), timeout=120)
-        if not isinstance(info, dict) or "germquant" not in info:
-            raise RunnerError(f"{self.python} answered --version with {info!r}")
-        if engine_too_old(info["germquant"]):
-            raise EngineTooOld(f"The engine at {self.python} is germquant {info['germquant']}, older than "
-                               f"{MIN_ENGINE}, which system packs and this plugin's runner need. Update that "
-                               f"engine checkout and reinstall it, or choose another engine interpreter.")
+        try:
+            self._check_interpreter(should_stop)
+            info = self._json(self.packs_argv("--version", "--json"), should_stop=should_stop)
+            if not isinstance(info, dict) or "germquant" not in info:
+                raise RunnerError(f"{self.python} answered --version with {info!r}")
+            if engine_too_old(info["germquant"]):
+                raise EngineTooOld(f"The engine at {self.python} is germquant {info['germquant']}, older than "
+                                   f"{MIN_ENGINE}, which system packs and this plugin's runner need. Update that "
+                                   f"engine checkout and reinstall it, or choose another engine interpreter.")
+        except RunCancelled:
+            raise
+        except RunnerError as e:
+            self.version_error = str(e)
+            raise
+        self.version_error = None
         self._version = dict(info)
         return dict(info)
 
-    def list_packs(self) -> dict:
-        return self._json(self.packs_argv("list", "--json", "--all"))
+    def cached_version(self) -> dict | None:
+        return dict(self._version) if self._version is not None else None
 
-    def check(self, pack: str, recipe: str | None = None, image: str | Path | None = None) -> dict:
+    def list_packs(self, should_stop=None) -> dict:
+        return self._json(self.packs_argv("list", "--json", "--all"), should_stop=should_stop)
+
+    def check(self, pack: str, recipe: str | None = None, image: str | Path | None = None,
+              should_stop=None) -> dict:
         args = ["check", pack]
         if recipe:
             args += ["--recipe", recipe]
         if image:
             args += ["--image", str(image)]
-        return self._json(self.packs_argv(*args, "--json"), ok=(0, 2))    # 2: unusable, still a JSON report
+        # exit 2: unusable, still a JSON report
+        return self._json(self.packs_argv(*args, "--json"), ok=(0, 2), should_stop=should_stop)
 
-    def fetch_models(self, pack: str, recipe: str | None = None, say=None) -> dict:
+    def fetch_models(self, pack: str, recipe: str | None = None, say=None, should_stop=None) -> dict:
         args = ["fetch-models", pack] + (["--recipe", recipe] if recipe else [])
-        rc, lines = self._stream(self.packs_argv(*args), say=say)
+        rc, lines = self._stream(self.packs_argv(*args), say=say, should_stop=should_stop)
         if rc not in (0, 1):
             text = "\n".join(lines)
             self._module_missing(text)
@@ -504,22 +770,37 @@ class SubprocessRunner(EngineRunner):
         return {"ok": rc == 0, "models": models, "lines": lines}
 
     def fetch_example(self, pack: str, example: str | None = None, out: str | Path | None = None,
-                      say=None) -> dict:
+                      say=None, should_stop=None) -> dict:
+        """``fetch-example`` with its progress lines streamed to ``say`` (its --json form prints nothing until
+        the end), then the record from ``fetch-example --no-download --json``, which only reads what the
+        first call left in place; the record's status is the first call's (fetched, present or local)."""
         args = ["fetch-example", pack]
         if example:
             args += ["--example", example]
         if out:
             args += ["--out", str(out)]
-        proc = self._call(self.packs_argv(*args, "--json"), timeout=24 * 3600)
-        if proc.returncode != 0:
-            text = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        rc, lines = self._stream(self.packs_argv(*args), say=say, should_stop=should_stop)
+        if rc != 0:
+            text = "\n".join(lines)
             self._module_missing(text)
-            raise RunnerError(f"fetch-example failed (exit {proc.returncode}): {_tail(text)}")
-        return _parse_json(proc.stdout)
+            raise RunnerError(f"fetch-example failed (exit {rc}): {_tail(text)}")
+        status = None
+        for line in lines:                            # "<id>@<version> example <example> (<status>): <image>"
+            m = re.match(r"^\S+ example \S+ \((\w+)\): ", line.strip())
+            if m:
+                status = m.group(1)
+        proc = self._call(self.packs_argv(*args, "--no-download", "--json"), should_stop=should_stop)
+        if proc.returncode != 0:
+            raise RunnerError(f"fetch-example --no-download --json failed (exit {proc.returncode}): "
+                              f"{_tail((proc.stderr or '') + chr(10) + (proc.stdout or ''))}")
+        rec = _parse_json(proc.stdout)
+        if status and isinstance(rec, dict):
+            rec["status"] = status
+        return rec
 
-    def runtime(self, prefer: str | None = None) -> dict:
+    def runtime(self, prefer: str | None = None, should_stop=None) -> dict:
         argv = [self.python, *self.interpreter_options, "-c", _RUNTIME_PROBE, prefer or ""]
-        proc = self._call(argv, timeout=300, extra_env=self._device_env())
+        proc = self._call(argv, timeout=300, extra_env=self._device_env(), should_stop=should_stop)
         if proc.returncode != 0:
             raise RunnerError(f"the device probe failed in {self.python} (exit {proc.returncode}): "
                               f"{_tail(proc.stderr)}")
@@ -529,8 +810,9 @@ class SubprocessRunner(EngineRunner):
         """``<python> -m germquant`` and the plan's ``germquant run`` arguments."""
         return [self.python, *self.interpreter_options, "-m", "germquant", *plan.run_argv()]
 
-    def run(self, plan, say=None) -> dict:
-        rc, lines = self._stream(self.run_argv(plan), say=say, extra_env=self._device_env())
+    def run(self, plan, say=None, should_stop=None) -> dict:
+        rc, lines = self._stream(self.run_argv(plan), say=say, extra_env=self._device_env(),
+                                 should_stop=should_stop)
         if rc != 0:
             text = "\n".join(lines)
             self._module_missing(text)
@@ -568,9 +850,16 @@ def user_runs_dir() -> Path:
 
 def runs_folder_for(out_dir: str | Path) -> tuple[Path, str]:
     """``(folder, where)``: ``<parent of the output folder>/runs`` (the place a project keeps its runs/, next to
-    its results), else the per-user folder when that cannot be written."""
+    its results), else the per-user folder: when that cannot be written, and when it would be the output folder
+    itself (an output folder named runs, or a drive or share root, whose parent is itself), because nothing but
+    what ``germquant run`` writes may go into the output folder."""
     out = Path(out_dir).absolute()
     beside = out.parent / "runs"
+    if out.parent == out or os.path.normcase(str(beside)) == os.path.normcase(str(out)):
+        fallback = user_runs_dir()
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback, ("the per-user folder (the output folder is itself named runs, or is a drive or share "
+                          "root, so a runs folder beside it would be the output folder)")
     try:
         beside.mkdir(parents=True, exist_ok=True)
         probe = beside / f".write_test_{uuid.uuid4().hex[:8]}"
@@ -619,9 +908,13 @@ def _sha256_file(path: Path) -> str | None:
 
 
 def execute_run(runner: EngineRunner, plan, *, config_hash: str | None = None, prefer: str | None = None,
-                interpreter_source: str = "default", say=None, log_dir: str | Path | None = None) -> dict:
+                interpreter_source: str = "default", say=None, log_dir: str | Path | None = None,
+                should_stop=None) -> dict:
     """Run ``plan`` through ``runner`` and write its run log: run_start before the run, image_done (or
-    image_failed, then the error is raised again) and run_end after it. Returns the run's result record with
+    image_failed, then the error is raised again; a cancelled run says so in its error) and run_end after it.
+    ``config_hash`` is the hash napari's own germquant computed; run_start records it only when that germquant
+    is the engine's (same version and git sha), and says where it came from (config_hash_source); image_done
+    always carries the run's own, read from its completion marker. Returns the run's result record with
     ``run_id`` and ``run_log`` added."""
     import germquant
 
@@ -632,25 +925,36 @@ def execute_run(runner: EngineRunner, plan, *, config_hash: str | None = None, p
     else:
         folder, where = runs_folder_for(plan.out)
     rlog = RunLog(folder, run_id)
-    version = runner.version()
+    version = runner.version(should_stop=should_stop)
     try:
-        rt = runner.runtime(prefer)
+        rt = runner.runtime(prefer, should_stop=should_stop)
+    except RunCancelled:
+        rt = {"device_requested": runner.device, "device_selected": None, "probe_error": "cancelled"}
     except RunnerError as e:                          # the run itself will say what is wrong; record the gap
         rt = {"device_requested": runner.device, "device_selected": None, "probe_error": str(e)}
+    diffs = version_mismatch(plugin_engine_info(), version)
+    if config_hash is None:
+        hash_source = "none: the recipe does not load in napari's environment (image_done carries the run's own)"
+    elif diffs:
+        config_hash = None
+        hash_source = ("none: napari's germquant is not the engine's (" + "; ".join(diffs) + "), so its hash "
+                       "could differ (image_done carries the run's own)")
+    else:
+        hash_source = "napari's germquant, the same version and git sha as the engine"
     image_id = api.image_stem(plan.image)
     rlog.event("run_start", via=runner.via, host=socket.gethostname(), os=platform.platform(),
                interpreter=runner.python, interpreter_source=interpreter_source,
                engine={"germquant": version.get("germquant"), "git_sha": version.get("git_sha")},
                python=version.get("python"), constraints=None,
                device_requested=rt.get("device_requested"), device_selected=rt.get("device_selected"),
-               config_hash=config_hash, recipe=plan.recipe.describe(), xy_stride=int(plan.xy_stride),
-               disabled_stages=list(plan.disabled), argv=list(plan.run_argv()),
+               config_hash=config_hash, config_hash_source=hash_source, recipe=plan.recipe.describe(),
+               xy_stride=int(plan.xy_stride), disabled_stages=list(plan.disabled), argv=list(plan.run_argv()),
                images=[{"path": str(plan.image), "image_id": image_id, "out_dir": str(plan.out)}],
                plugin={"napari_germquant": _plugin_version(), "germquant": str(germquant.__version__)},
                log_location=where)
     t0 = time.monotonic()
     try:
-        res = runner.run(plan, say=say)
+        res = runner.run(plan, say=say, should_stop=should_stop)
     except BaseException as e:
         rlog.event("image_failed", image_id=image_id, out_dir=str(plan.out), status="failed",
                    elapsed_s=round(time.monotonic() - t0, 3), error=f"{type(e).__name__}: {e}"[:4000])

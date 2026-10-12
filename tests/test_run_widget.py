@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import CHANNELS, IMAGE_ID, TEST_IMAGE, write_ome
+from conftest import CHANNELS, IMAGE_ID, TEST_IMAGE, TEST_PACK, copy_pack, settle, write_ome
 
 from napari_germquant._engine import Recipe
 from napari_germquant._run_widget import RED, RunWidget
@@ -102,23 +102,37 @@ def _tables(out: Path, image_id: str = IMAGE_ID) -> dict[str, pd.DataFrame]:
 @pytest.mark.parametrize("runner", ["inprocess", "subprocess"])
 @pytest.mark.parametrize("route", ["config", "pack"])
 def test_gui_run_writes_the_same_files_as_the_cli(make_napari_viewer, qtbot, synthetic_image, classical_overlay,
-                                                  tmp_path, request, route, runner):
+                                                  tmp_path, request, monkeypatch, route, runner):
     """The Run button against `germquant run` with the exported argv, through the in-process runner and the
     subprocess runner (sys.executable as the engine interpreter, as in the plugin CI): the same file list,
     cell-identical tables (run_timestamp aside) and equal completion markers (every key except finished).
-    The config route runs the synthetic gonad with the classical segmenter and spots off; the pack route runs
-    the test pack's basic recipe on its synthetic example. Only the config route in process runs with an
-    engine older than 0.2.0.dev0 (no packs, no `python -m germquant`)."""
+    The config route runs the synthetic gonad with the classical segmenter and spots off. The pack route runs a
+    copy of the test pack whose DEFAULT recipe is with_model (its model is absent, so it cannot run) on its
+    synthetic example, picking basic, at xy stride 2: a run that dropped the picked recipe for the pack's
+    default, or dropped the stride, would fail or differ from the command line. Only the config route in
+    process runs with an engine older than 0.2.0.dev0 (no packs, no `python -m germquant`)."""
     if (route == "pack" or runner == "subprocess") and importlib.util.find_spec("germquant.packs") is None:
         pytest.skip("the pack route and the subprocess runner need germquant 0.2.0.dev0 or later")
     if route == "pack":
         request.getfixturevalue("pack_env")
+        from germquant import packs
+
+        def not_the_default(d):
+            d["id"] = "test_pack_nd"
+            for r in d["recipes"]:
+                r["default"] = r["id"] == "with_model"
+        copy_pack(TEST_PACK, tmp_path / "nd" / "test_pack_nd", edit=not_the_default)
+        monkeypatch.setenv("GERMQUANT_PACKS", str(tmp_path / "nd"))
+        packs.refresh()
     viewer = make_napari_viewer()
     w = RunWidget(viewer)
     assert w.engine is None                                   # nothing chosen yet: the dock would ask
-    assert w.set_engine(sys.executable if runner == "subprocess" else INPROCESS)
+    w.set_engine(sys.executable if runner == "subprocess" else INPROCESS)
+    settle(w, qtbot)
+    assert w.engine is not None and w.engine_ok, w.engine_box.runs_label.text()
     assert w.engine.via == (VIA_SUBPROCESS if runner == "subprocess" else VIA_INPROCESS)
     out_gui, out_cli = tmp_path / "gui", tmp_path / "cli"
+    stride = 1
     if route == "config":
         image, image_id = synthetic_image, IMAGE_ID
         w.set_image(str(image))
@@ -131,12 +145,17 @@ def test_gui_run_writes_the_same_files_as_the_cli(make_napari_viewer, qtbot, syn
         image.parent.mkdir()
         shutil.copyfile(TEST_IMAGE, image)
         image_id = api.image_stem(image)
-        w.select_pack("test_pack", "basic")                   # the --pack route
+        entry = next(e for e in w.pack_entries if e.id == "test_pack_nd")
+        assert entry.default_recipe_id() == "with_model"
+        w.select_pack("test_pack_nd", "basic")                # the --pack route, not the pack's default recipe
         w.set_image(str(image))
-        assert w.route == "pack" and w.recipe == Recipe.from_pack("test_pack@0.1.0", "basic")
+        settle(w, qtbot)
+        assert w.route == "pack" and w.recipe == Recipe.from_pack("test_pack_nd@0.1.0", "basic")
         assert w.pack_status["usable"], w.pack_status
         assert w.config.get("segmentation.nuclei.method") == "classical"
-        recipe_args, tail = ["--pack", "test_pack@0.1.0", "--recipe", "basic"], []
+        stride = 2
+        w.stride_spin.setValue(stride)                        # the --xy-stride route
+        recipe_args, tail = ["--pack", "test_pack_nd@0.1.0", "--recipe", "basic"], ["--xy-stride", "2"]
     w.out_edit.setText(str(out_gui))
     plan = w.plan()
     assert plan.run_argv() == ["run", str(image), *recipe_args, "--out", str(out_gui), *tail]
@@ -164,7 +183,7 @@ def test_gui_run_writes_the_same_files_as_the_cli(make_napari_viewer, qtbot, syn
         assert not points                                     # spots were off
     else:
         assert [p.name for p in points] == [f"{image_id} spots"] and len(points[0].data) >= 1
-        assert "pack: test_pack@0.1.0   recipe: basic" in w.status_label.text()
+        assert "pack: test_pack_nd@0.1.0   recipe: basic" in w.status_label.text()
         assert "WARNING" not in w.status_label.text()         # basic expects the classical segmenter
 
     # the same settings through the command line
@@ -184,7 +203,7 @@ def test_gui_run_writes_the_same_files_as_the_cli(make_napari_viewer, qtbot, syn
         if k != "finished":                                   # stamped with the time of writing
             assert ma[k] == mb[k], k
     assert a[f"{image_id}__nuclei.csv"]["config_hash"].iloc[0] == mb["config_hash"]
-    assert not ma["failed_stages"]
+    assert not ma["failed_stages"] and ma["xy_stride"] == stride
 
     # the run log sits next to the output folder, never inside it (the file lists above are equal)
     log = w.last_run_log
@@ -193,6 +212,8 @@ def test_gui_run_writes_the_same_files_as_the_cli(make_napari_viewer, qtbot, syn
     assert [start["event"], done["event"], end["event"]] == ["run_start", "image_done", "run_end"]
     assert start["via"] == w.engine.via and start["interpreter"] == w.engine.python
     assert start["config_hash"] == mb["config_hash"] == done["config_hash"]
+    assert start["config_hash_source"].startswith("napari's germquant, the same version and git sha")
+    assert start["xy_stride"] == stride
     assert start["device_requested"] == "auto" and start["device_selected"] == "cpu"
     assert start["engine"]["germquant"] == api.__version__ and start["engine"]["git_sha"]
     assert start["images"] == [{"path": str(image), "image_id": image_id, "out_dir": str(out_gui)}]

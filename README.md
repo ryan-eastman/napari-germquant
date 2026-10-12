@@ -46,8 +46,9 @@ image canvas, so the docks are shown without it.
   for one (it never quietly runs inside napari instead); Choose engine... changes it at any time. The choice is
   stored for this computer. The box shows the engine's germquant version, git sha and Python, and an amber
   warning when they differ from the germquant napari itself uses. Device: auto (the engine picks CUDA, then Apple
-  Metal, then the CPU), cuda, mps or cpu; the line under it says which device the last run used. See "Choosing
-  the engine environment" below.
+  Metal, then the CPU), cuda, mps or cpu; the line under it says which device the last run used. napari never
+  waits for the engine: its version check, the pack list and every card check run in the background, and a card
+  says "checking" (with Run off) until its answer is back. See "Choosing the engine environment" below.
 - **System pack** (Run dock). Pick a pack (the C. elegans germline pack, cultured cells, budding yeast, or any
   pack installed for this engine) and one of its recipes. The card shows the title, the system, what one row of
   the nuclei table is (a nucleus or a whole cell), the recipe's dims (3d, projected, ...), the pack version and
@@ -55,15 +56,18 @@ image canvas, so the docks are shown without it.
   button; the backends and Python modules the recipe needs, available or missing with the extra to install;
   the validation status ("not validated" for the provisional 0.1 packs); the licence and citation; and a
   **Get example** button, which fetches the pack's public example image (checked file by file, assembled into
-  one OME-TIFF in the examples folder), opens it and makes it the run's image. A recipe that cannot run here is
-  greyed with its reason and the fix, and Run is switched off. **Recipe interpreter...** lets one recipe run in
-  another Python environment (for example one with an optional backend installed).
+  one OME-TIFF in the examples folder), opens it and makes it the run's image; the status bar shows the
+  download's progress lines. **Cancel** stops a model or example download in the engine environment. A recipe
+  that cannot run here is greyed with its reason and the fix, and Run is switched off. **Recipe
+  interpreter...** lets one recipe run in another Python environment (for example one with an optional backend
+  installed). Until you pick a pack, the picker shows the one you picked last, else the C. elegans germline
+  pack; only a pack you pick yourself is remembered.
 - **Run dock**, below the pack: image file (Browse, or the selected layer), a header read (sizes, voxel size,
   channel names), a channel-roles table resolved with the engine's own channel-map rules (red: a required role
   with no channel; amber: a role bound by position because no name matched), one checkbox per stage that has a
   `--no-<stage>` switch (greyed when the recipe has it off or the image lacks a channel role it needs), the xy
-  stride, the output folder, **Run** (in a napari thread worker, progress in the status bar) and **Export
-  profile**. **Advanced: profile or config file** holds the profile list of the engine checkout's
+  stride, the output folder, **Run** (in a napari thread worker, progress in the status bar), **Cancel** (ends a
+  run in the engine environment: the engine process and every process it started) and **Export profile**. **Advanced: profile or config file** holds the profile list of the engine checkout's
   `config/profiles/*.yaml` and the config-file picker, as before packs; tick it to run a profile instead of a
   pack. The benchmark profiles (`bench_*`) are hidden there unless "show all" is ticked.
 - **Results as layers.** When a run finishes, or from the **Results dock** (Plugins > germquant > Results) on
@@ -89,8 +93,12 @@ image canvas, so the docks are shown without it.
   it ran: through a separate process or in process, the host, the interpreter and whether it was the recipe's
   own, the engine version and git sha, Python, the device asked for and the one selected, the config_hash, the
   image), then `image_done` or `image_failed` (the completion marker's sha256, stage hashes, failed stages, QC,
-  the device Cellpose ran on, the time taken), then `run_end`. When that folder cannot be written, the log goes
-  to the per-user folder (`%LOCALAPPDATA%\napari-germquant\runs` on Windows).
+  the device Cellpose ran on, the time taken; for a cancelled run the error says so), then `run_end`. The
+  config_hash in `run_start` is the one napari's own germquant computes, recorded only when that germquant is
+  the engine's (same version and git sha; `config_hash_source` says which); `image_done` always carries the run's
+  own, from its completion marker. When that folder cannot be written, or would be the output folder itself (an
+  output folder named `runs`, or a drive root), the log goes to the per-user folder
+  (`%LOCALAPPDATA%\napari-germquant\runs` on Windows) and `run_start` says so.
 - **Training dock** (Plugins > germquant > Training). The nucleus training round of the engine's
   `docs/TIMELAPSE.md` ("Segmenting without DAPI: the training loop") in four steps:
   1. **Export slices.** A results folder, a time-lapse series folder or a batch tree goes through
@@ -160,8 +168,11 @@ image canvas, so the docks are shown without it.
   `germquant project run` runs the same way), the role editor, the parameter form, spot tuning and the 2D
   display of single-plane results come in later packages of the engine's tranche 5 (P5 and P6). The run logs
   are written now; nothing reads them back yet.
-- A run in a separate process cannot be stopped from the dock; end the `python -m germquant run` process (Task
-  Manager on Windows) or close napari.
+- Cancel stops a run, a model download or an example download in the engine environment: the engine process
+  and every process it started are ended, and the run log says the run was cancelled. Closing napari does the
+  same for anything still running (and on Windows an engine never outlives napari, even when napari is killed
+  from Task Manager). A run, a download or a check in this napari environment (the in-process runner) cannot be
+  stopped: it ends on its own, and closing napari waits for it.
 - The plugin does not run a series. The per-timepoint loop is `germquant run SERIES.nd2 --profile live_syp2
   --t all --out FOLDER` in a terminal (hours for 25 timepoints); the Time-lapse dock opens FOLDER. Track
   import (TrackMate, Imaris, Cell-ACDC), track strips and the biologist validation (`germquant track-import`,
@@ -279,30 +290,41 @@ engine's `.venv` has CUDA torch and SpotMAX. A run inside napari there would seg
 spots stage, so the dock asks:
 
 1. The first time you press Run (or Choose engine... in the Engine box), a dialog lists the Python interpreters
-   it found: the `.venv` of the engine checkout napari's germquant comes from, when there is one, and napari's own
-   Python as a separate process. These are suggestions only. On the workstation pick (with Browse... if it is not
-   listed) `C:\Users\ryane\C_elegans_germline_masking_and_spot_counting\.venv\Scripts\python.exe`; on a Mac or
+   it found: the `.venv` of the engine checkout napari's germquant comes from, when there is one (it is
+   preselected), and napari's own Python as a separate process, with what that environment lacks (on the
+   workstation: no SpotMAX, CPU torch). These are suggestions only, and napari's own Python is never
+   preselected: OK stays off until you pick a row or use Browse. On the workstation pick (with Browse... if it is
+   not listed) `C:\Users\ryane\C_elegans_germline_masking_and_spot_counting\.venv\Scripts\python.exe`; on a Mac or
    Linux `<germquant>/.venv/bin/python`. "Run in this napari environment instead (in process)" is there for an
-   environment that holds everything (Cellpose, SpotMAX, the models), and is never chosen for you.
+   environment that holds everything (Cellpose, SpotMAX, the models), and is never chosen for you. If you pressed
+   Run with a recipe already picked, the run starts once the engine is checked; with none picked yet (the pack
+   list comes from the engine), the dock asks you to pick one and press Run again.
 2. The dock checks the choice with `<python> -m germquant.packs --version` (germquant version, git sha, Python)
-   and refuses an engine without system packs (older than 0.2.0.dev0) with the fix. When the engine's version or
-   git sha differs from the germquant napari imports, the Engine box shows an amber warning: the channel roles
-   and stage list the dock shows come from napari's copy, the numbers from the engine's. Point both environments
-   at the same engine checkout to clear it.
+   and refuses an engine without system packs (older than 0.2.0.dev0) with the fix. It also refuses what is not
+   a Python interpreter (a folder, the environment's `germquant.exe` or `napari.exe`, any other program) with a
+   message that says to pick `python.exe` (Windows) or `bin/python`. When the engine's version or git sha
+   differs from the germquant napari imports, the Engine box shows an amber warning: the channel roles and stage
+   list the dock shows come from napari's copy, the numbers from the engine's. Point both environments at the
+   same engine checkout to clear it.
 3. From then on, pack lists and checks go through the engine's torch-free entry
-   (`<python> -m germquant.packs list --json`, `check ... --json`), so a pack card is refreshed in well under a
-   second and never loads torch; Get models and Get example run `fetch-models` and `fetch-example` there; and a
-   run is `<python> -m germquant run IMAGE --pack ID@VERSION --recipe R --out FOLDER` (or `--profile`,
-   `--config`), the command the Export button writes. Every command is a list of arguments; no shell is used.
+   (`<python> -m germquant.packs list --json`, `check ... --json`), in the background, so a pack card is
+   refreshed in well under a second without loading torch and napari never freezes, even when the engine is slow
+   or unreachable (a version check, a list or a check gives up after 120 s and says so); Get models and Get
+   example run `fetch-models` and `fetch-example` there; and a run is `<python> -m germquant run IMAGE --pack
+   ID@VERSION --recipe R --out FOLDER` (or `--profile`, `--config`), the command the Export button writes. Every
+   command is a list of arguments; no shell is used.
 4. Both environments can share one model store: set `GERMQUANT_MODELS` to the same folder for both (the engine
    docs recommend it), so Get models fetches a model once.
 5. A pack recipe can have its own interpreter (Recipe interpreter... on the card), for a recipe whose optional
    backend lives in another environment. Its card is checked there, its runs go there, and every run log records
    which interpreter ran.
 
-The choice is kept in QSettings for this user on this computer (the registry key
+The choice is kept in QSettings for this user (the registry key
 `HKEY_CURRENT_USER\Software\napari-germquant\napari-germquant` on Windows, a plist on a Mac, an ini file on
-Linux). Set `NAPARI_GERMQUANT_SETTINGS` to the path of an ini file to keep it there instead (the tests do).
+Linux), under this computer's host name (`engine/<host>/interpreter`, `recipe_interpreters/<host>/...`): a
+roaming Windows profile or a home folder shared by several computers (a cluster's NFS home) never hands one
+computer's engine to another, which asks for its own. The device and the last pack picked are kept per user.
+Set `NAPARI_GERMQUANT_SETTINGS` to the path of an ini file to keep it there instead (the tests do).
 
 ## The first screen
 
@@ -434,24 +456,31 @@ list), the engine glue (profiles, recipes, role rows, stage rows, the plan and i
 overlay loading through the engine), the reader (one layer per channel, the stride, the pixels equal what the
 pipeline reads, the time-lapse and multi-scene refusals from the header), the Run dock (roles table and stage
 checkboxes on the synthetic gonad and on a one-channel file, the plan, the export, and the GUI-versus-CLI
-identity run: the config route with the classical segmenter and spots off, and the test pack's basic recipe
-with `--pack`, each through the in-process runner and through the subprocess runner with this Python as the
-engine interpreter, comparing the file list, every CSV and parquet table cell and every completion-marker key
-but `finished`, and the run log beside the output folder), the system packs (`tests/test_pack_picker.py`: the
-built-in packs and the test pack under `$GERMQUANT_PACKS` listed through both runners with the card; a recipe
-whose model is missing greyed with the fix and Run off; Get models downloading a 64-byte stand-in model from a
-server the test runs on 127.0.0.1 until the recipe is usable; Get example fetching two per-channel TIFFs from
-that server, assembling them and opening the image; a pack whose rows are cells naming the Labels layer
-`<image> cells`, saying cells in the summary, and showing the banner when the pack declares Cellpose but the
-labels came from the classical segmenter; the export with `--pack` and a portable, ASCII overlay that the engine
-loads; a broken pack greyed with its problem; an output folder inside a pack refused; the test pack copy
-matching its SHA256SUMS and the engine's), the engine runners (`tests/test_engine_runner.py`: the version check
-and the warning for another version or git sha, from a stand-in engine package; the one message for an engine
-without packs, in this environment and through a subprocess; the dock asking for an engine instead of running
-in process; a recipe mapped to a second interpreter, a throwaway venv, running there with run_start recording
-it; a pack card refresh through the subprocess runner whose Python import log shows no torch, Cellpose, SpotMAX
-or CuPy and whose model check trusts the verified blob without hashing it again; the run log's place and
-format), the results loader and dock on a hand-made results folder, the Training dock (`tests/test_training.py`: two finished runs written by the test with an
+identity run: the config route with the classical segmenter and spots off, and with `--pack` a copy of the
+test pack whose default recipe cannot run, picking its basic recipe at xy stride 2, each through the in-process
+runner and through the subprocess runner with this Python as the engine interpreter, comparing the file list,
+every CSV and parquet table cell and every completion-marker key but `finished`, and the run log beside the
+output folder), the system packs (`tests/test_pack_picker.py`: the built-in packs and the test pack under
+`$GERMQUANT_PACKS` listed through both runners with the card; a recipe whose model is missing greyed with the
+fix and Run off; Get models downloading a 64-byte stand-in model from a server the test runs on 127.0.0.1 until
+the recipe is usable; Get example fetching two per-channel TIFFs from that server, assembling them and opening
+the image, its progress lines reaching the status bar, both calls made by the engine interpreter; a pack whose
+rows are cells naming the Labels layer `<image> cells`, saying cells in the summary, and showing the banner
+when the pack declares Cellpose but the labels came from the classical segmenter; the export with `--pack` and
+a portable, ASCII overlay that the engine loads; a broken pack greyed with its problem; an output folder inside
+a pack refused; Run pressed before any engine never running a pack the dock showed on its own, and only the
+user's picks remembered; the card's validation line; the test pack copy matching its SHA256SUMS and the
+engine's), the engine runners (`tests/test_engine_runner.py`: the version check and the warning for another
+version or git sha, from a stand-in engine package; the one message for an engine without packs, in this
+environment and through a subprocess; the dock asking for an engine instead of running in process, and
+preselecting only a detected engine checkout; a recipe mapped to a second interpreter, a throwaway venv,
+running there with run_start recording it; a pack card refresh through the subprocess runner whose Python
+import log shows no torch, Cellpose, SpotMAX or CuPy and whose model check trusts the verified blob without
+hashing it again; a slow stand-in engine answering while napari's event loop keeps running; Cancel, and
+napari quitting, ending a stand-in engine that never finishes, with the run log saying so; on Windows, killing
+a stand-in napari ending its engine; the interpreter kept per computer; folders, `germquant.exe`, `napari.exe`
+and other programs refused as interpreters; run_start's config_hash and its source; the device choice reaching
+the engine; the run log's place and format, also for an output folder named `runs`), the results loader and dock on a hand-made results folder, the Training dock (`tests/test_training.py`: two finished runs written by the test with an
 OME-TIFF source each; the export through the dock in a thread worker, which writes the same manifest and slices
 as `germquant export-training`; paging; a correction saved atomically with the manifest byte-identical; the
 refusals; the guard against exporting over corrections; training with the engine's Cellpose seams replaced, the
@@ -469,7 +498,9 @@ series on the lab NAS (56 GB, header only, T=25 refused) and runs only with `NAP
 
 Every test has its own settings file (`NAPARI_GERMQUANT_SETTINGS`), so no test reads or changes the engine
 stored on this computer, and the pack tests keep every pack folder and store private (`$GERMQUANT_PACKS` set to
-`tests/fixtures/packs`, an empty `$GERMQUANT_MODELS`, an empty Cellpose cache, a private examples folder). The
+`tests/fixtures/packs`, an empty `$GERMQUANT_MODELS` in a short folder of the system temporary folder, so a
+blob record stays under the 260-character path limit of a Windows without long paths, an empty Cellpose cache,
+a private examples folder). The
 test pack in `tests/fixtures/packs/test_pack` is a byte-for-byte copy of the engine's
 `tests/fixtures/packs/test_pack`; copy it again when the engine's changes.
 
@@ -509,10 +540,12 @@ touched. With `QT_QPA_PLATFORM` unset on a desktop session, napari queries the r
   recipe), role rows, stage rows, `RunPlan` (the one description a run has, executed by an engine runner and
   spelled out as commands for the terminal), the system-pack feature gate.
 - `_runner.py`: where germquant runs, no Qt: `SubprocessRunner` (the engine interpreter, the torch-free
-  `python -m germquant.packs` entry for listing, checks and fetching, `python -m germquant run` for runs) and
-  `InProcessRunner`, the version check, interpreter suggestions, and the run logs.
+  `python -m germquant.packs` entry for listing, checks and fetching, `python -m germquant run` for runs, each
+  engine process ended with everything it started on Cancel or when napari closes) and `InProcessRunner`, the
+  version check, interpreter suggestions, and the run logs.
 - `_packs.py`: an engine's pack listing and the pack card, no Qt.
-- `_settings.py`: the per-machine settings (QSettings): the engine interpreter, recipe interpreters, the device.
+- `_settings.py`: the settings (QSettings): the engine interpreter and recipe interpreters (per computer), the
+  device and the last pack (per user).
 - `_engine_widgets.py`: the Engine box, the interpreter dialog and the System pack picker.
 - `_reader.py`: the reader and the single-time-point check.
 - `_results.py`: a results folder as layer tuples, no Qt.

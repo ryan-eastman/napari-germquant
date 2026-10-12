@@ -229,14 +229,23 @@ def _mb(n) -> str:
         return "size unknown"
 
 
+def validation_unreadable(entry: PackEntry, recipe_id: str) -> bool:
+    """The recipe names a validation record that cannot be read (its status then has nothing behind it)."""
+    r = entry.recipe(recipe_id) or {}
+    return bool(r.get("validation")) and entry.validation_record(recipe_id) is None
+
+
 def validation_text(entry: PackEntry, recipe_id: str) -> str:
-    """'not validated', or the validation record's dataset and first metric."""
+    """'not validated', or the validation record's dataset and first metric (section 3.6: a record written by
+    ``germquant extbench report --final``; its exact keys are settled by package P7, so the dataset is read as
+    ``dataset.id`` or ``dataset_id`` and a metric as a number or ``{value or estimate, ci_low or lo, ci_high or
+    hi}``)."""
     r = entry.recipe(recipe_id) or {}
     rec = entry.validation_record(recipe_id)
     status = str(r.get("status") or "provisional")
     if rec is None:
         if r.get("validation"):
-            return f"{status}; the validation record {r.get('validation')} could not be read"
+            return f"status {status}, but its validation record {r.get('validation')} cannot be read"
         return f"not validated (status {status})"
     ds = rec.get("dataset")
     dataset = ds.get("id") if isinstance(ds, dict) else (ds or rec.get("dataset_id") or "dataset not named")
@@ -255,8 +264,9 @@ def validation_text(entry: PackEntry, recipe_id: str) -> str:
     return f"{status} on {dataset}" + (f": {metric}" if metric else "") + (f"; verdict {verdict}" if verdict else "")
 
 
-def card_html(entry: PackEntry, recipe_id: str | None, status: dict | None, *, engine_text: str = "") -> str:
-    """The pack card as rich text for a QLabel."""
+def card_html(entry: PackEntry, recipe_id: str | None, status: dict | None, *, engine_text: str = "",
+              pending: bool = False) -> str:
+    """The pack card as rich text for a QLabel (``pending``: its check is running in ``engine_text``)."""
     d = entry.data
     r = entry.recipe(recipe_id) or {}
     sysd = d.get("system") or {}
@@ -307,7 +317,10 @@ def card_html(entry: PackEntry, recipe_id: str | None, status: dict | None, *, e
                        "environment that has it (Recipe interpreter...).</i>")
     # validation, licence, citation, example
     if recipe_id:
-        out.append(f"<b>Validation</b>: {_e(validation_text(entry, recipe_id))}")
+        text = _e(validation_text(entry, recipe_id))
+        if validation_unreadable(entry, recipe_id):
+            text = f"<span style='color:{AMBER}'>{text}</span>"
+        out.append(f"<b>Validation</b>: {text}")
     lic = [f"pack {_e(d.get('licence') or 'not stated')}"]
     lic += [f"{_e(m.get('name'))}: {_e(m.get('licence'))}" for m in entry.models if m.get("licence")]
     out.append("<b>Licence</b>: " + "; ".join(lic))
@@ -326,6 +339,9 @@ def card_html(entry: PackEntry, recipe_id: str | None, status: dict | None, *, e
     else:
         out.append("<b>Example</b>: none")
     # availability
+    if pending:
+        out.append(f"<span style='color:{GREY}'>checking in {_e(engine_text)} ...</span>")
+        return "<br>".join(out)
     if engine_text:
         out.append(f"checked in: {_e(engine_text)}")
     if status is None:

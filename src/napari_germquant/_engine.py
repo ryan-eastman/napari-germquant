@@ -26,6 +26,7 @@ from germquant import api  # noqa: I001
 
 import dataclasses
 import datetime as _dt
+import os
 import sys
 from pathlib import Path
 
@@ -319,9 +320,17 @@ def stage_rows(cfg: Config, role_to_idx: dict[str, int | None]) -> list[StageRow
 # ---------------------------------------------------------------------------------------------------
 
 
+def _on_windows() -> bool:
+    """Whether the exported commands are for Windows (PowerShell or cmd): the system napari runs on."""
+    return os.name == "nt"
+
+
 def _quote(arg: str) -> str:
-    """Double quotes around anything with a space or a shell character: PowerShell, cmd, bash and zsh
-    all read them the same way for a path (the local gonad files have a space in their names)."""
+    """Double quotes around anything with a space or a shell character (the local gonad files have a space in
+    their names). PowerShell, cmd, bash and zsh all read a double-quoted path in argument position as one
+    argument. Two limits: a line that STARTS with a quoted program is an expression to PowerShell, which needs
+    its call operator ``&`` first (commands_text adds it), and a ``$`` or a backtick inside the quotes is still
+    expanded by PowerShell, bash and zsh (no such path is expected)."""
     s = str(arg)
     if s and not any(c in s for c in ' \t"\'()&|;<>$`'):
         return s
@@ -396,6 +405,17 @@ class RunPlan:
     def run_command(self) -> str:
         return "germquant " + " ".join(_quote(a) for a in self.run_argv())
 
+    def runner_command(self, python: str | Path) -> tuple[str, str]:
+        """``(comment tail, line)``: ``<python> -m germquant run ...``. On Windows a quoted interpreter path (one
+        with a space) gets PowerShell's call operator: PowerShell reads a line that starts with a quoted string
+        as an expression and rejects ``-m``; cmd wants the line without the ``&``."""
+        py = _quote(str(python))
+        line = " ".join([py, *(_quote(a) for a in ["-m", "germquant", *self.run_argv()])])
+        if _on_windows() and py.startswith('"'):
+            return (" (PowerShell needs the & before a quoted interpreter path; in cmd leave the & out):",
+                    "& " + line)
+        return ":", line
+
     def batch_command(self, folder: Path | None = None, out: Path | None = None) -> str:
         return "germquant " + " ".join(_quote(a) for a in self.batch_argv(folder, out))
 
@@ -443,6 +463,7 @@ class RunPlan:
         engine = engine or {}
         python = engine.get("python") or sys.executable
         version_line = engine.get("line") or f"{api.__version__} at {Path(api.__file__).parent}"
+        runner_comment, runner_line = self.runner_command(python)
         lines = [
             f"# germquant commands exported by napari-germquant on {stamp}.",
             "# The first command reproduces the run made from the GUI file for file: the GUI ran germquant with",
@@ -458,8 +479,8 @@ class RunPlan:
             "# One image, as run from the GUI:",
             self.run_command(),
             "",
-            "# The same, as the dock's engine runner starts it:",
-            " ".join(_quote(a) for a in [python, "-m", "germquant", *self.run_argv()]),
+            "# The same, as the dock's engine runner starts it" + runner_comment,
+            runner_line,
             "",
             "# Every image under the image's folder, mirroring the tree (edit the folder and the output root;",
             "# batch reads the folder's .nd2 files):",
