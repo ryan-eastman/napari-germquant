@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import sys
 import time
 from pathlib import Path
 
@@ -81,6 +82,19 @@ WRITING_TEXT = "a write is in progress: the next edit waits until it is done"
 NO_ROLE_CHANGE_TEXT = "no role change: the pack map already names these channels, so the project's map stays as it is"
 INT_LIMIT = 2 ** 31 - 1
 FLOAT_LIMIT = 1.0e12
+
+
+def _run_elsewhere(root) -> bool:
+    """Whether a Project dock of this napari runs the project in ``root`` now (unit P6-PROJECT's
+    ``_project.run_in_progress``, which every dock of the viewer reads). Looked up only when that module is
+    loaded: with no Project dock there is no such run."""
+    check = getattr(sys.modules.get("napari_germquant._project"), "run_in_progress", None)
+    if root is None or not callable(check):
+        return False
+    try:
+        return bool(check(root))
+    except Exception:  # noqa: BLE001 - the dock's bookkeeping failing must not block the tab
+        return False
 
 
 def _error_text(exc: BaseException) -> str:
@@ -389,6 +403,12 @@ class RecipeTab(QWidget):
         self.status_label.setText(text)
         self.status_label.setStyleSheet(_colour_css(colour))
 
+    def _refused(self, why: str) -> None:
+        """An edit refused for ``why`` (``_blocked``): the reason shown, and the controls set to match (a run that
+        another dock started is not announced to the tab)."""
+        self._status(why, AMBER)
+        self._update_enabled()
+
     def _show_engine(self) -> None:
         describe = getattr(self.session, "describe", None)
         warning = getattr(self.session, "warning", None)
@@ -644,7 +664,7 @@ class RecipeTab(QWidget):
         blocked = self._blocked()
         if blocked:
             self._restore_combo(role)
-            self._status(blocked, AMBER)
+            self._refused(blocked)
             return
         self._choices[role] = combo.currentData()
         self._after_role_change()
@@ -668,7 +688,7 @@ class RecipeTab(QWidget):
         r = self._view.role(role)
         blocked = self._blocked()
         if blocked:
-            self._status(blocked, AMBER)
+            self._refused(blocked)
             return
         allowed = {None, r.edit, self._choices.get(role), *self._view.channels}
         if channel not in allowed:
@@ -763,13 +783,14 @@ class RecipeTab(QWidget):
 
     def _blocked(self) -> str:
         """Why no edit can be made now (no project read, no usable engine, a run in progress, a write queued or
-        running), or "". A write's answer replaces the pending values and the role choices with what was written,
-        so an edit taken while it runs would be lost: none is taken then."""
+        running), or "". A run is the host's (``set_running``) or one a Project dock of this napari started
+        (``_run_elsewhere``). A write's answer replaces the pending values and the role choices with what was
+        written, so an edit taken while it runs would be lost: none is taken then."""
         if self._view is None or self.last_error is not None:
             return "no project is read"
         if self.engine_error:
             return f"read only: {self.engine_error}"
-        if self._running:
+        if self._running or _run_elsewhere(self._root):
             return RUNNING_TEXT
         if self._writes or self._job == "write":
             return WRITING_TEXT
@@ -798,7 +819,7 @@ class RecipeTab(QWidget):
         refuse it; the form's edits stay), or, with none saved, the unapplied choices dropped."""
         blocked = self._blocked()
         if blocked:
-            self._status(blocked, AMBER)
+            self._refused(blocked)
             return False
         saved = any(r.edit for r in self._view.roles)
         if not saved:
@@ -825,7 +846,7 @@ class RecipeTab(QWidget):
         blocked = self._blocked()
         if blocked:                           # the widgets are off then; a change made all the same is put back
             self._restore_widget(row)
-            self._status(blocked, AMBER)
+            self._refused(blocked)
             return
         value = self._widget_value(row)
         if _params._same(value, row.shown):
@@ -856,7 +877,7 @@ class RecipeTab(QWidget):
         value = t.check(value)
         blocked = self._blocked()
         if blocked:
-            self._status(blocked, AMBER)
+            self._refused(blocked)
             return
         row = self.form_rows[key]
         self._show_value(row, value)
@@ -869,7 +890,7 @@ class RecipeTab(QWidget):
         t = self._view.tunable(key)
         blocked = self._blocked()
         if blocked:
-            self._status(blocked, AMBER)
+            self._refused(blocked)
             return
         row = self.form_rows[key]
         if t.edited:
@@ -935,7 +956,7 @@ class RecipeTab(QWidget):
         its dry run."""
         blocked = self._blocked()
         if blocked:
-            self._status(blocked, AMBER)
+            self._refused(blocked)
             return False
         edits, unset = self._form_change()
         if not (edits or unset):
@@ -958,7 +979,7 @@ class RecipeTab(QWidget):
         --revert``). ``confirm`` asks first (the button does; a script passes False)."""
         blocked = self._blocked()
         if blocked:
-            self._status(blocked, AMBER)
+            self._refused(blocked)
             return False
         if confirm:
             answer = QMessageBox.question(self, "Back to the pack recipe",

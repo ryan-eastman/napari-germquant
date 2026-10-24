@@ -471,6 +471,48 @@ def test_amber_and_unreadable_headers_and_a_required_role_unbound(qtbot, tmp_pat
     assert not tab.apply_roles_btn.isEnabled()                     # a problem is left
 
 
+def test_a_run_started_by_a_project_dock_of_this_napari_blocks_edits(qtbot, tmp_path, monkeypatch):
+    """P6-PROJECT keeps the runs of its docks in _project.run_in_progress(root), which every dock of the viewer
+    reads: a run of the project shown blocks the tab's edits as the host's own run does (review N11); a run of
+    another project does not, and without that module no run is known."""
+    from types import SimpleNamespace
+
+    from napari_germquant._recipe_widget import RUNNING_TEXT
+
+    def answer(kw):
+        changed = any((kw.get("roles") or {}).values())
+        if kw.get("dry_run"):
+            return preview_record(_bind(), config_hash="bbbbbbbbbbbb" if changed else PACK_HASH, changed=changed)
+        return {**preview_record(_bind(), config_hash="bbbbbbbbbbbb"), "dry_run": False,
+                "written": ["channel_map.yaml", "recipe.yaml", "germquant_project.yaml"]}
+
+    running: set[str] = set()
+    monkeypatch.setitem(sys.modules, "napari_germquant._project",
+                        SimpleNamespace(run_in_progress=lambda root: str(root) in running))
+    fake = FakeRunner(answer)
+    tab = _tab(qtbot, tmp_path, session=FakeSession(fake), reader=lambda root, reference=None: fake_view(tmp_path))
+    running.add(str(tmp_path / "another"))
+    tab.choose_channel("dna", "DAPI")                              # another project runs: no block
+    _settle(tab, qtbot)
+    assert tab.role_choice("dna") == "DAPI" and tab.apply_roles_btn.isEnabled()
+    running.add(str(tmp_path))                                     # this one now, from another dock
+    tab.choose_channel("foci", "DAPI")
+    assert tab.role_choice("foci") is None and tab.status_label.text() == RUNNING_TEXT
+    assert not tab.role_combos["foci"].isEnabled() and not tab.apply_roles_btn.isEnabled()
+    assert not tab.apply_roles() and all(c.get("dry_run") for c in fake.calls)
+    running.discard(str(tmp_path))
+    assert tab.apply_roles()
+    _settle(tab, qtbot)
+    assert [c for c in fake.calls if not c.get("dry_run")] == [{"root": str(tmp_path),
+                                                                "roles": {"dna": "DAPI", "foci": ""}}]
+    monkeypatch.delitem(sys.modules, "napari_germquant._project")
+    running.add(str(tmp_path))
+    assert tab.role_combos["dna"].isEnabled()                      # no Project dock module: no run known
+    tab.choose_channel("foci", "foci")
+    assert tab.role_choice("foci") == "foci"
+    _settle(tab, qtbot)
+
+
 def test_a_run_in_progress_and_a_refused_write_leave_the_project_as_it_was(qtbot, tmp_path):
     """While the host says a run of the project goes, the role editor and the form take no edit; a write the
     engine refuses shows its reason, emits nothing and keeps the choices, and the project is read again (a write
