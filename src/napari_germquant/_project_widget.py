@@ -23,7 +23,7 @@ What the dock shows:
   missing), qc_pass, the objects (nuclei or cells, by the pack's object_kind) and spots of its results, the last
   run and the device used. While a run goes the rows follow the run's own log (``project run`` tailed by the
   runner); when it ends the engine's status is asked again. Double-click opens the image's results as layers
-  with its source image.
+  with its source image (an image with timepoints is named as a time series, for the Time-lapse dock).
 
 Where things happen (the train's decision D39): every write that can change the config_hash or the manifest goes
 through the engine runner, with this plugin's version (``--plugin-version``) on every one: ``project new`` (then
@@ -31,8 +31,11 @@ through the engine runner, with this plugin's version (``--plugin-version``) on 
 stage switches, the run settings), ``unlock``. The status, runs, collect and export-commands are the engine's
 too. The dock reads the manifest, the image headers, the run logs, the results and the sample sheet in process.
 The GUI thread never waits: engine calls run one at a time in a thread worker (``engine_worker``), a project run
-in its own (``run_worker``), header reads in a third (``header_worker``). Every recipe edit and sample edit is off
-while a run of the project goes (``_project.run_in_progress`` tells the viewer's other docks too).
+in its own (``run_worker``), header reads in a third (``header_worker``) and results opened from the board in a
+fourth (``results_worker``). Every recipe edit and sample edit is off while a run of the project goes
+(``_project.run_in_progress`` tells the viewer's other docks too); the Run tab's settings and the sample table are
+off while one of the dock's writes is in flight too. A write or a reading that comes back after the project was
+closed (or another one opened) is not applied to the dock: a write's message says it was made all the same.
 
 Other docks and tabs: ``project_hub(viewer)`` says which project the viewer's Project dock has open and whether it
 runs (Training's project mode, Spot tuning). A tab of this dock is a ProjectTab subclass named in EXTRA_TABS
@@ -106,6 +109,9 @@ EXTRA_TABS: list[tuple[str, str]] = [
 ]
 
 BOARD_COLUMNS = ("Image", "Status", "qc_pass", "nuclei", "spots", "Last run", "Device")
+# the engine-worker jobs that write the project: while one is in flight or waiting, the Run tab's settings and the
+# sample table are off as during a run (what they show would be set back by the write's reading)
+WRITE_KINDS = ("new", "save", "edit", "add", "unlock")
 IMAGE_COLUMNS = ("Image id", "Path", "Size", "Header", "Excluded")
 STATUS_COLORS = {"done": GREEN, "stale": AMBER, "failed": RED, "unreachable": AMBER, "missing": None,
                  "waiting": None, "unknown": None, "excluded": None}
@@ -151,7 +157,9 @@ class ProjectState:
     record (None until the engine answered, or when it cannot), the board rows, the image headers read so far
     ({image_id: header or {"error"}}), the pack's object kind, the recipe's Config without the stage switches
     (None when this germquant cannot load it: ``config_error`` says why), the config_hash this germquant computes
-    (``own_hash``), the sample table, and why the status could not be had (``status_error``)."""
+    (``own_hash``), the sample table, why the sample sheet cannot be written from this dock (``sheet_problem``:
+    napari's germquant has no sheet writer, or the engine lacks the sample sheet; the table is read-only then) and
+    why the status could not be had (``status_error``)."""
 
     root: Path
     manifest: dict
@@ -164,6 +172,7 @@ class ProjectState:
     own_hash: str | None = None
     samples: P.SampleTable | None = None
     samples_error: str | None = None
+    sheet_problem: str | None = None
     status_error: BaseException | None = None
 
     @property
@@ -465,6 +474,8 @@ class ProjectWidget(QWidget):
         self.hub = project_hub(napari_viewer)
         self._state: ProjectState | None = None
         self._jobs: list[dict] = []
+        self._current_kind: str | None = None         # the kind of the engine-worker job in flight
+        self._epoch = 0                                 # one more at every close: a job's result names its project
         self._loaded_settings: dict | None = None
         self._run_root: Path | None = None
         self._run_id: str | None = None
@@ -479,6 +490,8 @@ class ProjectWidget(QWidget):
         self.engine_worker = WorkerRunner(napari_viewer, self)
         self.run_worker = WorkerRunner(napari_viewer, self)
         self.header_worker = WorkerRunner(None, self)
+        self.results_worker = WorkerRunner(napari_viewer, self)
+        self._results_id: str | None = None
         self._bridge = _Bridge(self)
         self._bridge.events.connect(self._on_events)
         self.extra_tabs: dict[str, ProjectTab] = {}
@@ -543,6 +556,13 @@ class ProjectWidget(QWidget):
         self.hash_label = QLabel("")
         self.hash_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         hform.addRow("config_hash", self.hash_label)
+        # the hash this napari environment's germquant computes, when it is not the engine's (plugin_specs 3: two
+        # germquant checkouts show red, with the fix)
+        self.hash_warn = QLabel("")
+        self.hash_warn.setWordWrap(True)
+        self.hash_warn.setStyleSheet(css(RED))
+        self.hash_warn.setVisible(False)
+        hform.addRow("", self.hash_warn)
         self.badge_label = QLabel("")
         hform.addRow("Validation", self.badge_label)
         self.warnings_label = QLabel("")
@@ -740,9 +760,14 @@ class ProjectWidget(QWidget):
     # ------------------------------------------------------------------ engine calls, one at a time
     @property
     def idle(self) -> bool:
-        """No engine call, run or header read in flight or waiting."""
+        """No engine call, run, header read or results read in flight or waiting."""
         return (not self.engine_worker.busy and not self.run_worker.busy and not self.header_worker.busy
-                and not self._jobs)
+                and not self.results_worker.busy and not self._jobs)
+
+    @property
+    def writing(self) -> bool:
+        """Whether one of the dock's project writes (WRITE_KINDS) is in flight or waiting in the engine worker."""
+        return self._current_kind in WRITE_KINDS or any(j["kind"] in WRITE_KINDS for j in self._jobs)
 
     def wait_idle(self, timeout_s: float = 300.0) -> bool:
         """For a script driving the dock: run the Qt event loop until ``idle`` (True) or ``timeout_s`` (False)."""
@@ -766,14 +791,39 @@ class ProjectWidget(QWidget):
             self._jobs = [j for j in self._jobs if j["kind"] != kind]
         self._jobs.append(job)
         self._pump()
+        self._update_buttons()
 
     def _pump(self) -> None:
         if self.engine_worker.busy or not self._jobs:
             return
         job = self._jobs.pop(0)
         worker = self.engine_worker
-        worker.start(lambda: job["func"](worker.should_stop), label=job["label"], returned=job["returned"],
-                     errored=job["errored"], finished=self._pump)
+        self._current_kind = job["kind"]
+        try:
+            worker.start(lambda: job["func"](worker.should_stop), label=job["label"], returned=job["returned"],
+                         errored=job["errored"], finished=self._job_finished)
+        except BaseException:
+            self._current_kind = None
+            raise
+
+    def _job_finished(self) -> None:
+        self._current_kind = None
+        self._pump()
+        self._update_buttons()
+
+    def _for_this_project(self, apply, closed=None):
+        """A returned callback that applies ``apply(result)`` only while the project the job was submitted for is
+        still the one open; after a Close (or another project opened) it calls ``closed(result)`` instead, when
+        given: a write was made all the same, and only its reading is not applied."""
+        epoch = self._epoch
+
+        def returned(result):
+            if self._epoch == epoch:
+                apply(result)
+            elif closed is not None:
+                closed(result)
+
+        return returned
 
     def engine_call(self, job, label: str, returned, errored=None, *, features=("projects",)) -> None:
         """For a tab: ``job(runner, should_stop)`` with the engine (``features`` required) in the engine worker;
@@ -911,25 +961,64 @@ class ProjectWidget(QWidget):
             state.samples = P.SampleTable.from_project(root, manifest, regex=regex, defaults=defaults)
         except Exception as e:  # noqa: BLE001 - the Samples tab says why
             state.samples_error = f"{type(e).__name__}: {e}"
+        state.sheet_problem = self._sheet_problem_now()
         return state
+
+    def _sheet_problem_now(self) -> str | None:
+        """Why this dock cannot write the sample sheet: napari's germquant has no sheet writer, or the checked
+        engine (the one that records the sheet with ``project edit --samples``) lacks the sample sheet. None when
+        it can, or when no engine is checked yet (Save then says why it cannot). Never starts a process."""
+        if P.sheet_module() is None:
+            return _feature_text("sample_sheet", None)
+        runner = self.session.runner()
+        if runner is None:
+            return None
+        return self._sheet_problem(runner, None)
+
+    @staticmethod
+    def _sheet_problem(runner, should_stop) -> str | None:
+        """The sheet check of ``_sheet_problem_now`` against ``runner`` (FeatureMissing as its message)."""
+        if P.sheet_module() is None:
+            return _feature_text("sample_sheet", None)
+        try:
+            runner.require("projects", "sample_sheet", should_stop=should_stop)
+        except FeatureMissing as e:
+            return str(e)
+        return None
+
+    @staticmethod
+    def _folder(folder) -> Path:
+        """A folder the user gave, as an absolute path (a relative one would resolve against whatever napari's
+        working folder is later; a UNC path stays a UNC path)."""
+        return Path(os.path.abspath(str(folder).strip().strip('"')))
 
     def open_project(self, folder) -> None:
         """Open the project in ``folder``: the manifest read in process, the hash computed again and the status
-        asked of the engine (design 7.3), then the image headers read."""
+        asked of the engine (design 7.3), then the image headers read. A Close before it is read cancels it."""
         if self.running:
             self._message("a run is in progress: cancel it or wait for it before opening another project", AMBER)
             return
-        root = Path(str(folder).strip().strip('"'))
+        root = self._folder(folder)
         self._submit("open", lambda should_stop: self._load(root, should_stop), f"opening the project {root}",
-                     lambda state: self._opened(state, fresh=True), self._open_failed, replace=True)
+                     self._for_this_project(lambda state: self._opened(state, fresh=True)),
+                     self._open_failed_for(self._epoch), replace=True)
 
     def reload(self) -> None:
-        """Read the open project again (the manifest, the engine's status, the board)."""
+        """Read the open project again (the manifest, the engine's status, the board); a Close meanwhile drops it."""
         if self._state is None:
             return
         root = self._state.root
         self._submit("open", lambda should_stop: self._load(root, should_stop), f"reading the project {root}",
-                     lambda state: self._opened(state, fresh=False), self._open_failed, replace=True)
+                     self._for_this_project(lambda state: self._opened(state, fresh=False)),
+                     self._open_failed_for(self._epoch), replace=True)
+
+    def _open_failed_for(self, epoch: int):
+        """The errored callback of an open or a reading: dropped when the project was closed meanwhile."""
+        def errored(exc: BaseException) -> None:
+            if self._epoch == epoch:
+                self._open_failed(exc)
+
+        return errored
 
     def _open_failed(self, exc: BaseException) -> None:
         self.last_error = exc
@@ -1002,6 +1091,7 @@ class ProjectWidget(QWidget):
         self._update_buttons()
 
     def _close(self, *, signal: bool = True) -> None:
+        self._epoch += 1                               # what comes back for the project closed is not applied
         self._state = None
         self._loaded_settings = None
         self.board.setRowCount(0)
@@ -1016,7 +1106,8 @@ class ProjectWidget(QWidget):
         self._show_project()
 
     def close_project(self) -> bool:
-        """Close the open project (refused while it runs)."""
+        """Close the open project (refused while it runs). A write in flight is still made; its reading and any
+        reading in flight or waiting are not applied."""
         if self.running:
             self._message("a run of this project is in progress: cancel it or wait for it before closing", AMBER)
             return False
@@ -1088,32 +1179,41 @@ class ProjectWidget(QWidget):
                     images=()) -> None:
         """``germquant project new FOLDER --pack PACK [--recipe R] [--images ...] [--name N] --plugin-version V``
         through the engine, then this computer's device, runner and interpreter recorded (``project edit``, D42),
-        then the project opened."""
+        then the project opened (also when that record could not be written: the message says so, Save writes
+        it)."""
         if self.running:
             self._message("a run is in progress: cancel it or wait for it before making another project", AMBER)
             return
-        root = Path(str(folder).strip().strip('"'))
+        root = self._folder(folder)
         paths = [str(p) for p in ([images] if isinstance(images, (str, os.PathLike)) else list(images or ()))]
 
         def job(should_stop):
             runner = self.session.require("projects", should_stop=should_stop)
             rec = runner.project_new(root, pack, recipe=recipe, images=paths, name=name,
                                      plugin_version=plugin_version(), should_stop=should_stop)
-            manifest = P.read_manifest(root)
-            here = self._here(manifest, should_stop)
-            changes = P.settings_changes(manifest, device=here["device"], runner=here["runner"],
-                                         interpreter=(manifest["pack"].get("recipe"), here["python"]))
-            if changes:
-                runner.project_edit(root, **changes, plugin_version=plugin_version(), should_stop=should_stop)
-            return rec, self._load(root, should_stop)
+            note = None
+            try:                                       # the project exists now: it opens whatever happens here
+                manifest = P.read_manifest(root)
+                here = self._here(manifest, should_stop)
+                changes = P.settings_changes(manifest, device=here["device"], runner=here["runner"],
+                                             interpreter=(manifest["pack"].get("recipe"), here["python"]))
+                if changes:
+                    runner.project_edit(root, **changes, plugin_version=plugin_version(), should_stop=should_stop)
+            except RunCancelled:
+                raise
+            except (RunnerError, P.ProjectFileError) as e:
+                why = " ".join(_error_text(e).split())[:400] or type(e).__name__
+                note = (f"this computer's device, runner and interpreter were not recorded in the project ({why}): "
+                        f"Save records them")
+            return rec, self._load(root, should_stop), note
 
         def done(res):
-            rec, state = res
+            rec, state, note = res
             self._opened(state, fresh=True)
             refused = rec.get("refused") or []
             if refused:
                 self.refused_label.setText("\n".join(f"not added: {r.get('path')}: {r.get('reason')}" for r in refused))
-            warn = [str(w) for w in rec.get("warnings") or []]
+            warn = [str(w) for w in rec.get("warnings") or []] + ([note] if note else [])
             self._done(f"made the project {root} ({state.pack_ref} {state.recipe_id})"
                        + ("; " + "; ".join(warn) if warn else ""), state, AMBER if refused or warn else GREEN)
 
@@ -1167,49 +1267,62 @@ class ProjectWidget(QWidget):
 
     def save(self, *, sheet: bool = False) -> bool:
         """Save: the Run tab's settings that differ from the manifest in one ``project edit`` (with this plugin's
-        version), and the sample sheet when it was edited (``sheet``: write it even without edits)."""
+        version), and the sample sheet when it was edited (``sheet``: write it even without edits) and can be
+        written from here (``ProjectState.sheet_problem``; the settings are saved all the same)."""
         st = self._state
         if st is None:
             return False
         if self._blocked("save"):
             return False
         changes = self._pending()
-        samples = st.samples if st.samples is not None and (st.samples.dirty or sheet) else None
+        want_sheet = st.samples is not None and (st.samples.dirty or sheet)
+        samples = st.samples if want_sheet and st.sheet_problem is None else None
         if not changes and samples is None:
-            self._message("nothing to save: the project records every setting shown", None)
+            if want_sheet:
+                self._message(f"the sample sheet cannot be written from this dock: {st.sheet_problem}", AMBER)
+            else:
+                self._message("nothing to save: the project records every setting shown", None)
             return False
         root = st.root
         records = samples.records() if samples is not None else None
+        skipped = st.sheet_problem if want_sheet and samples is None else None
 
         def job(should_stop):
-            self._write_settings(root, changes, records, should_stop)
-            return self._load(root, should_stop)
+            wrote, problem = self._write_settings(root, changes, records, should_stop)
+            return wrote, problem or skipped, self._load(root, should_stop)
 
-        def done(state):
-            if samples is not None:
+        def done(res):
+            wrote, problem, state = res
+            if wrote:
                 samples.mark_saved()
             self._opened(state, fresh=False)
-            self._done(f"saved {root}", state)
+            if problem:
+                self._done(f"saved the settings of {root}; the sample sheet was not written: {problem}", state, AMBER)
+            else:
+                self._done(f"saved {root}", state)
 
-        self._submit("save", job, f"saving {root}", done)
+        self._submit("save", job, f"saving {root}", self._for_this_project(
+            done, lambda _res: self._message(f"saved {root} (the project was closed meanwhile)", None)))
         return True
 
-    def _write_settings(self, root: Path, changes: dict, records: list | None, should_stop) -> bool:
+    def _write_settings(self, root: Path, changes: dict, records: list | None,
+                        should_stop) -> tuple[bool, str | None]:
         """The worker's part of Save (and of a run's save first): the sheet through the engine's writer, then one
-        ``project edit``. True when it wrote the sheet."""
+        ``project edit``. Returns ``(wrote the sheet, why it was not written)``: a sheet napari's germquant or the
+        engine cannot write is left as it is on disk, and the settings are written all the same."""
         changes = dict(changes)
         runner = self.session.require("projects", should_stop=should_stop)
+        wrote, problem = False, None
         if records is not None:
-            sheet = P.sheet_module()
-            if sheet is None:                         # this napari environment's germquant has no sheet writer
-                raise FeatureMissing(_feature_text("sample_sheet", None), "sample_sheet")
-            runner.require("sample_sheet", should_stop=should_stop)
-            sheet.write_sample_sheet(root / P.SAMPLES_NAME, records)
-            if P.read_manifest(root).get("samples") != P.SAMPLES_NAME:
-                changes["samples"] = P.SAMPLES_NAME
+            problem = self._sheet_problem(runner, should_stop)
+            if problem is None:
+                P.sheet_module().write_sample_sheet(root / P.SAMPLES_NAME, records)
+                wrote = True
+                if P.read_manifest(root).get("samples") != P.SAMPLES_NAME:
+                    changes["samples"] = P.SAMPLES_NAME
         if changes:
             runner.project_edit(root, **changes, plugin_version=plugin_version(), should_stop=should_stop)
-        return records is not None
+        return wrote, problem
 
     def edit(self, *, on_done=None, **kwargs) -> bool:
         """``project edit`` with ``kwargs`` (the runner's project_edit keywords: edits, unset, roles, revert, ...),
@@ -1237,15 +1350,30 @@ class ProjectWidget(QWidget):
             if on_done is not None:
                 on_done(rec)
 
-        self._submit("edit", job, f"editing {root}", done)
+        def closed(res):
+            if not dry:
+                self._message(f"recorded the edit of {root}: config_hash {res[0].get('config_hash')} (the project was "
+                              f"closed meanwhile)", None)
+
+        # a dry run (a preview) writes nothing, so it does not count as a write in flight
+        self._submit("preview" if dry else "edit", job, f"editing {root}", self._for_this_project(done, closed))
         return True
 
-    def _blocked(self, what: str) -> bool:
+    def _why_blocked(self, what: str, *, writes: bool = False) -> str | None:
+        """Why ``what`` must wait, or None: a run of this project goes (any dock of this napari), or, with
+        ``writes``, one of the dock's writes is in flight (its reading would set back what ``what`` changes)."""
         st = self._state
         if st is not None and (self.running or P.run_in_progress(st.root)):
-            self._message(f"a run of this project is in progress: the {what} waits until it has finished", AMBER)
-            return True
-        return False
+            return f"a run of this project is in progress: the {what} waits until it has finished"
+        if st is not None and writes and self.writing:
+            return f"a write of this project is in progress: the {what} waits until it has finished"
+        return None
+
+    def _blocked(self, what: str, *, writes: bool = False) -> bool:
+        why = self._why_blocked(what, writes=writes)
+        if why is not None:
+            self._message(why, AMBER)
+        return why is not None
 
     # ------------------------------------------------------------------ images
     def add_paths(self, paths) -> bool:
@@ -1279,7 +1407,12 @@ class ProjectWidget(QWidget):
                                                          if refused else ""), state, AMBER if refused else GREEN)
             self._show_images()
 
-        self._submit("add", job, f"adding {len(paths)} path(s) to {root}", done)
+        def closed(res):
+            rec = res[0]
+            self._message(f"added {len(rec.get('added') or [])} image(s) to {root} (the project was closed "
+                          f"meanwhile)", None)
+
+        self._submit("add", job, f"adding {len(paths)} path(s) to {root}", self._for_this_project(done, closed))
         return True
 
     def _browse_add_files(self) -> None:
@@ -1303,19 +1436,28 @@ class ProjectWidget(QWidget):
     def samples(self) -> P.SampleTable | None:
         return self._state.samples if self._state is not None else None
 
-    def set_sample(self, image_id: str, column: str, value) -> None:
-        """One cell of the sample table (ValueError for a value the sheet cannot hold, naming the cell)."""
+    def _check_sample_edit(self, what: str) -> None:
+        """ValueError when the sample table cannot be edited now: no project, a run or a write of it in progress,
+        or a sheet this dock cannot write (ProjectState.sheet_problem)."""
         if self.samples is None:
             raise ValueError("no sample table: open a project first")
-        if self._blocked("sample edit"):
-            raise ValueError("a run of this project is in progress: sample edits wait until it has finished")
+        why = self._why_blocked(what, writes=True)
+        if why is not None:
+            raise ValueError(why)
+        problem = self._state.sheet_problem
+        if problem:
+            raise ValueError(f"the sample sheet cannot be written from this dock, so the table is read-only: {problem}")
+
+    def set_sample(self, image_id: str, column: str, value) -> None:
+        """One cell of the sample table (ValueError for a value the sheet cannot hold, naming the cell, and while
+        the table cannot be edited)."""
+        self._check_sample_edit("sample edit")
         self.samples.set(image_id, column, value)
         self._show_samples()
         self._update_buttons()
 
     def add_sample_column(self, name: str) -> None:
-        if self.samples is None:
-            raise ValueError("no sample table: open a project first")
+        self._check_sample_edit("new column")
         self.samples.add_column(name)
         self._show_samples()
         self._update_buttons()
@@ -1416,20 +1558,25 @@ class ProjectWidget(QWidget):
         self._update_buttons()
 
     def _apply_settings_widgets(self, manifest: dict, *, force: bool) -> None:
-        """The Run tab's widgets from the manifest: always for a project just opened or saved, else only when the
-        manifest's settings changed (so the user's unsaved changes survive a status refresh)."""
-        rec = P.recorded_settings(manifest)
-        if not force and self._loaded_settings == rec:
+        """The Run tab's widgets from the manifest: every one for a project just opened (``force``), else only when
+        the manifest's settings changed, and then only the widgets that still show the last reading: an unsaved
+        change (also one made while a write was in flight) is never set back by a refresh."""
+        rec, old = P.recorded_settings(manifest), self._loaded_settings
+        if not force and old == rec:
             return
         self._loaded_settings = rec
-        for w in (self.stride_spin, *self.stage_checks.values()):
+        fresh = force or old is None
+        widgets = (self.stride_spin, *self.stage_checks.values())
+        for w in widgets:
             w.blockSignals(True)
         try:
-            self.stride_spin.setValue(int(rec["xy_stride"]))
+            if fresh or int(self.stride_spin.value()) == int(old["xy_stride"]):
+                self.stride_spin.setValue(int(rec["xy_stride"]))
             for name, cb in self.stage_checks.items():
-                cb.setChecked(name not in rec["disabled"])
+                if fresh or cb.isChecked() == (name not in old["disabled"]):
+                    cb.setChecked(name not in rec["disabled"])
         finally:
-            for w in (self.stride_spin, *self.stage_checks.values()):
+            for w in widgets:
                 w.blockSignals(False)
         self._sync_device_combo()
 
@@ -1464,8 +1611,9 @@ class ProjectWidget(QWidget):
     def run(self, images=None, *, resume: bool = True) -> bool:
         """``germquant project run`` of ``images`` (None: all) through the engine runner of the project's recipe,
         with this computer's device, a run id of the dock's and ``--via``; the settings that differ from the
-        manifest are recorded first. The board follows the run's log; the engine's status is asked again at its
-        end."""
+        manifest are recorded first (the sample edits too, when the sheet can be written from here; otherwise the
+        run uses the sheet on disk and says so). The board follows the run's log; the engine's status is asked
+        again at its end."""
         st = self._state
         if st is None:
             self._message("open a project first", AMBER)
@@ -1478,20 +1626,34 @@ class ProjectWidget(QWidget):
             return False
         root = st.root
         changes = self._pending()
-        samples = st.samples if st.samples is not None and st.samples.dirty else None
+        dirty = st.samples is not None and st.samples.dirty
+        samples = st.samples if dirty and st.sheet_problem is None else None
         records = samples.records() if samples is not None else None
         device = self.session.device()
         run_id = new_run_id()
         pack_id, recipe_id = st.pack_id, st.recipe_id
         ids = list(images) if images else None
         bridge = self._bridge
-        wrote = {"sheet": False}
+        wrote = {"sheet": False, "problem": st.sheet_problem if dirty and samples is None else None}
         self._run_sheet = (samples, wrote)
+
+        def cancelled_before_start():
+            err = RunCancelled("cancelled by the user before the run started")
+            err.run_id, err.before_start = run_id, True
+            return err
 
         def job():
             stop = self.run_worker.should_stop
+            if stop():
+                raise cancelled_before_start()
             if changes or records is not None:
-                wrote["sheet"] = self._write_settings(root, changes, records, stop)
+                # never ended by Cancel: a write ended while it holds the project's lock leaves a lock that no one
+                # removes for 12 h (D18). It is short and torch-free; Cancel then stops the run before it starts.
+                sheet_written, problem = self._write_settings(root, changes, records, None)
+                wrote["sheet"] = sheet_written
+                wrote["problem"] = wrote["problem"] or problem
+            if stop():
+                raise cancelled_before_start()
             runner = self.session.runner_for(pack_id, recipe_id, should_stop=stop)
             runner.require("projects", should_stop=stop)
             return runner.project_run(root, images=ids, resume=resume, device=device, run_id=run_id, say=_say,
@@ -1522,22 +1684,36 @@ class ProjectWidget(QWidget):
         st.rows = P.apply_events(st.rows, events)
         self._show_board()
 
+    def _sheet_note(self) -> str:
+        """What the run says of sample edits it could not write first ('' when there were none)."""
+        _samples, wrote = getattr(self, "_run_sheet", (None, {}))
+        problem = wrote.get("problem")
+        return (f"; the unsaved sample edits were not written ({problem}): this run used the sheet on disk"
+                if problem else "")
+
     def _run_returned(self, result: dict) -> None:
         self.last_result = result
         text, level = P.run_text(result)
+        note = self._sheet_note()
+        text += note
         self.last_message = text
         self.run_label.setText(text)
-        self.run_label.setStyleSheet(css(LEVELS[level]))
+        self.run_label.setStyleSheet(css(LEVELS["warn" if note and level == "ok" else level]))
 
     def _run_errored(self, exc: BaseException) -> None:
         self.last_error = exc
-        if isinstance(exc, RunCancelled):
+        rid = getattr(exc, "run_id", self._run_id)
+        if isinstance(exc, RunCancelled) and getattr(exc, "before_start", False):
+            text = (f"run {rid} cancelled before it started (the settings the Run tab shows were recorded first)"
+                    + self._sheet_note())
+            self.run_label.setStyleSheet(css(AMBER))
+        elif isinstance(exc, RunCancelled):
             outcome = run_outcome(list(getattr(exc, "events", None) or []), alive=False)
-            text = (f"run {getattr(exc, 'run_id', self._run_id)} interrupted (cancelled): "
-                    f"{P.counts_text(outcome['counts'])}; the image in progress has no results")
+            text = (f"run {rid} interrupted (cancelled): {P.counts_text(outcome['counts'])}; the image in progress "
+                    f"has no results" + self._sheet_note())
             self.run_label.setStyleSheet(css(AMBER))
         else:
-            text = f"run {getattr(exc, 'run_id', self._run_id)} could not be made: {_error_text(exc)}"
+            text = f"run {rid} could not be made: {_error_text(exc)}"
             self.run_label.setStyleSheet(css(RED))
         self.last_message = text
         self.run_label.setText(text)
@@ -1576,12 +1752,8 @@ class ProjectWidget(QWidget):
             return self.session.require("projects", should_stop=should_stop).project_collect(root,
                                                                                             should_stop=should_stop)
 
-        def done(rec):
-            tables = rec.get("tables") if isinstance(rec, dict) else None
-            text = ", ".join(str(t) for t in tables) if isinstance(tables, list) else str(rec)[:600]
-            self._message(f"collected: {text}", GREEN)
-
-        self._submit("collect", job, f"collecting the tables of {root}", done)
+        self._submit("collect", job, f"collecting the tables of {root}",
+                     lambda rec: self._message(P.collect_text(rec), GREEN))
         return True
 
     def export_commands(self, out, *, shell: str | None = None) -> bool:
@@ -1611,12 +1783,19 @@ class ProjectWidget(QWidget):
             self.export_commands(path, shell="ps1" if path.lower().endswith(".ps1") else "sh")
 
     def remove_stale_lock(self) -> bool:
-        """``germquant project unlock`` with the holder's host and pid as the status shows them."""
+        """``germquant project unlock`` with the holder's host and pid as the status shows them, for a stale lock
+        only (older than 12 h, D18: a younger one belongs to a command that is writing). A lock file the engine
+        cannot read has no holder to name: the message says where to delete it by hand. True when the unlock was
+        sent."""
         st = self._state
         lock = (st.status or {}).get("lock") if st is not None else None
-        if not isinstance(lock, dict) or not lock.get("held"):
+        if not isinstance(lock, dict) or not lock.get("held") or not lock.get("stale") or self.running:
             return False
-        root, host, pid = st.root, str(lock.get("host")), int(lock.get("pid"))
+        holder = P.lock_holder(lock)
+        if holder is None:
+            self._message(P.unreadable_lock_text(st.root), AMBER)
+            return False
+        root, (host, pid) = st.root, holder
 
         def job(should_stop):
             runner = self.session.require("projects", should_stop=should_stop)
@@ -1629,7 +1808,11 @@ class ProjectWidget(QWidget):
             self._done(f"removed the lock of {host} (pid {pid})" if rec.get("removed") else
                        "the project was not locked any more", state)
 
-        self._submit("unlock", job, f"removing the lock of {host} pid {pid}", done)
+        def closed(res):
+            self._message(f"removed the lock of {root} ({host}, pid {pid}; the project was closed meanwhile)"
+                          if res[0].get("removed") else f"{root} was not locked any more", None)
+
+        self._submit("unlock", job, f"removing the lock of {host} pid {pid}", self._for_this_project(done, closed))
         return True
 
     # ------------------------------------------------------------------ results
@@ -1638,28 +1821,50 @@ class ProjectWidget(QWidget):
         if st is not None and 0 <= row < len(st.rows):
             self.open_results(st.rows[row].image_id)
 
-    def open_results(self, image_id: str) -> list:
-        """The image's results as layers, with its source image on the run's grid (the Results dock's loader)."""
-        from ._results import ResultsSet, load_results_layers, summary_line
-
+    def open_results(self, image_id: str) -> bool:
+        """The image's results as layers, with its source image on the run's grid (the Results dock's loader). The
+        tables, labels and the source image are read in the results worker (a NAS path never blocks napari); the
+        layers are added in the GUI thread. True when the read started (``idle`` once it is done)."""
         st = self._state
         if st is None:
-            return []
+            return False
+        if self.results_worker.busy:
+            self._message(f"still opening the results of {self._results_id}: wait for it", AMBER)
+            return False
         row = next((r for r in st.rows if r.image_id == image_id), None)
         folder = Path(row.out_dir) if row is not None and row.out_dir else st.root / "results" / image_id
-        rs = ResultsSet(folder, image_id)
-        if not rs.has("image_summary.csv"):
-            self._message(f"{image_id} has no results yet ({folder})", AMBER)
-            return []
-        try:
-            layers = load_results_layers(rs, include_source=True)
-            added = add_layer_tuples(self.viewer, layers)
-        except Exception as e:  # noqa: BLE001 - the results could not be loaded: say so, keep the dock alive
-            self._message(f"the results of {image_id} could not be opened: {_error_text(e)}", RED)
-            return []
-        self._message(f"opened {len(added)} layer(s) of {image_id}: {summary_line(rs)}", GREEN)
-        set_viewer_status(self.viewer, f"germquant: {image_id} results opened")
-        return added
+
+        def job():
+            from ._results import ResultsSet, load_results_layers, summary_line
+
+            rs = ResultsSet(folder, image_id)
+            if not rs.has("image_summary.csv"):
+                return ("series" if P.series_result(folder, image_id) else "none"), None, None
+            return "layers", load_results_layers(rs, include_source=True), summary_line(rs)
+
+        def done(res):
+            what, layers, line = res
+            if what == "series":
+                self._message(f"{image_id} is a time series: open {folder} in the Time-lapse dock", AMBER)
+                return
+            if what == "none":
+                self._message(f"{image_id} has no results yet ({folder})", AMBER)
+                return
+            try:
+                added = add_layer_tuples(self.viewer, layers)
+            except Exception as e:  # noqa: BLE001 - the results could not be shown: say so, keep the dock alive
+                self._message(f"the results of {image_id} could not be opened: {_error_text(e)}", RED)
+                return
+            self._message(f"opened {len(added)} layer(s) of {image_id}: {line}", GREEN)
+            set_viewer_status(self.viewer, f"germquant: {image_id} results opened")
+
+        def failed(exc):
+            self.last_error = exc
+            self._message(f"the results of {image_id} could not be opened: {_error_text(exc)}", RED)
+
+        self._results_id = image_id
+        return self.results_worker.start(job, label=f"opening the results of {image_id}", returned=done,
+                                         errored=failed)
 
     # ------------------------------------------------------------------ what is shown
     @property
@@ -1709,8 +1914,9 @@ class ProjectWidget(QWidget):
         self._show_engine()
         if st is None:
             for label in (self.name_label, self.folder_label, self.pack_label, self.hash_label, self.badge_label,
-                          self.warnings_label, self.lock_label):
+                          self.warnings_label, self.lock_label, self.hash_warn):
                 label.setText("")
+            self.hash_warn.setVisible(False)
             self.badge_label.setToolTip("")
             self._fill_recent()
             self._show_images()
@@ -1742,7 +1948,7 @@ class ProjectWidget(QWidget):
         self.badge_label.setStyleSheet(css(LEVELS[level]))
         why = ((st.status or {}).get("validated") or m.get("validated") or {}).get("why")
         self.badge_label.setToolTip(str(why or ""))
-        lock = P.lock_text((st.status or {}).get("lock"))
+        lock = P.lock_text((st.status or {}).get("lock"), root=st.root)
         self.lock_label.setText(lock or "")
         self.lock_label.setStyleSheet(css(AMBER if lock else None))
         self._show_notes()
@@ -1758,6 +1964,8 @@ class ProjectWidget(QWidget):
         st = self._state
         if st is None:
             self.warnings_label.setText("")
+            self.hash_warn.setText("")
+            self.hash_warn.setVisible(False)
             return
         here = self._this_computer()
         notes = [str(w) for w in (st.status or {}).get("warnings") or []]
@@ -1767,10 +1975,13 @@ class ProjectWidget(QWidget):
                          f"(packs/{st.pack_id}/): the engine resolves the pinned version elsewhere, or not at all")
         notes += P.setting_notes(st.manifest, device=here["device"], runner=here["runner"],
                                  interpreter=(st.recipe_id, here["python"]))
+        two = ""
         if st.own_hash and st.status is not None and st.own_hash != st.status.get("config_hash"):
-            notes.append(f"this napari environment's germquant computes config_hash {st.own_hash} for the project, the "
-                         f"engine {st.status.get('config_hash')}: the two are different germquant checkouts (update "
-                         f"both to the same commit)")
+            two = (f"this napari environment's germquant computes config_hash {st.own_hash} for the project, the "
+                   f"engine {st.status.get('config_hash')}: they are two different germquant checkouts. Update both "
+                   f"to the same commit (git pull in each, then reinstall), and restart napari")
+        self.hash_warn.setText(two)
+        self.hash_warn.setVisible(bool(two))
         for model in (st.status or {}).get("models") or []:
             if isinstance(model, dict) and model.get("mismatch"):
                 notes.append(f"model {model.get('ref')}: {model.get('mismatch')}")
@@ -1815,6 +2026,7 @@ class ProjectWidget(QWidget):
                 note = "" if st is None else f"no sample table: {st.samples_error or 'the project lists no images'}"
                 self.samples_note.setText(note)
                 return
+            read_only = bool(st.sheet_problem)
             self.samples_table.setColumnCount(len(t.columns))
             self.samples_table.setHorizontalHeaderLabels(t.columns)
             self.samples_table.setRowCount(len(t.ids))
@@ -1822,12 +2034,12 @@ class ProjectWidget(QWidget):
                 row = t.row(iid)
                 for j, c in enumerate(t.columns):
                     item = QTableWidgetItem(str(row.get(c, "")))
-                    if c == "image_id":
+                    if c == "image_id" or read_only:
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self.samples_table.setItem(i, j, item)
             notes = list(t.warnings)
-            if P.sheet_module() is None:
-                notes.append(_feature_text("sample_sheet", None) + " The table can be edited; Save needs it.")
+            if read_only:
+                notes.append(f"{st.sheet_problem} The table is read-only until then: an edit could not be saved.")
             missing = t.not_in_sheet()
             if t.saved is None:
                 notes.append("no sample sheet yet: the rows are prefilled from the file names where the recipe's rule "
@@ -1900,9 +2112,10 @@ class ProjectWidget(QWidget):
         st = self._state
         has = st is not None
         running = self.running
+        busy = running or self.writing                # a write in flight counts like a run for the settings
         engine_ok = has and st.status is not None
         unsaved = self.unsaved
-        self.save_btn.setEnabled(has and not running)
+        self.save_btn.setEnabled(has and not busy)
         self.save_btn.setText("Save (unsaved changes)" if unsaved else "Save")
         self.close_btn.setEnabled(has and not running)
         self.new_btn.setEnabled(not running)
@@ -1914,15 +2127,14 @@ class ProjectWidget(QWidget):
         for b in (self.add_files_btn, self.add_folder_btn, self.paste_btn, self.paste_edit):
             b.setEnabled(has and not running)
         for cb in self.stage_checks.values():
-            cb.setEnabled(has and not running and cb.property("selectable") is not False)
-        self.stride_spin.setEnabled(has and not running)
-        self.interpreter_btn.setEnabled(has and not running)
-        self.samples_table.setEnabled(has and not running)
+            cb.setEnabled(has and not busy and cb.property("selectable") is not False)
+        for w in (self.stride_spin, self.interpreter_btn, self.device_combo, self.samples_table):
+            w.setEnabled(has and not busy)
         for b in (self.add_column_btn, self.save_sheet_btn, self.column_edit):
-            b.setEnabled(has and not running and st.samples is not None)
+            b.setEnabled(has and not busy and st.samples is not None and not st.sheet_problem)
         lock = (st.status or {}).get("lock") if has else None
         self.unlock_btn.setEnabled(bool(isinstance(lock, dict) and lock.get("held") and lock.get("stale"))
-                                   and not running)
+                                   and P.lock_holder(lock) is not None and not running)
 
 
 def _feature_text(feature: str, runner) -> str:
