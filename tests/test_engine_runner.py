@@ -53,6 +53,7 @@ from napari_germquant._runner import (
     execute_run,
     mismatch_warning,
     plugin_engine_info,
+    project_run_result,
     read_run_log,
     run_outcome,
     runs_folder_for,
@@ -836,10 +837,11 @@ def test_the_project_run_log_is_tailed_with_partial_lines_kept(tmp_path):
         fh.write(b"not json\n" + (end + "\r\n").encode("ascii"))
     assert [e["event"] for e in tail.read()] == ["run_end"] and tail.bad == ["not json"]
 
+    # pauses of three log reads and more (TAIL_S), so each of the three batches below arrives on its own
     spec = run_spec(ids=["a", "b", "c"], steps=[
         {"event": "image_done", "image_id": "a"},
-        {"event": "image_done", "image_id": "b", "sleep": 0.5, "partial": 1.0},
-        {"event": "image_skipped", "image_id": "c", "sleep": 0.5}])
+        {"event": "image_done", "image_id": "b", "sleep": 0.5, "partial": 1.5},
+        {"event": "image_skipped", "image_id": "c", "sleep": 1.5}])
     r = _standin_runner(tmp_path, FAKE_PROJECT_RUN=spec)
     project = tmp_path / "proj"
     project.mkdir()
@@ -897,7 +899,7 @@ def test_cancel_ends_a_hung_project_run_and_the_board_says_interrupted(tmp_path)
     assert [x["event"] for x in events] == ["run_start", "image_done"] == [x["event"] for x in e.value.events]
     assert [x["event"] for x in seen] == ["run_start", "image_done"]
     board = run_outcome(events, alive=False)
-    assert board["state"] == "interrupted" and board["images"] == {"a": "done"} and not board["ended"]
+    assert board["state"] == "interrupted" and board["images"] == {"a": "done"} and not board["finished"]
     assert run_outcome(events)["state"] == "running"                 # while the engine still runs
     assert board["counts"] == {"done": 1, "failed": 0, "skipped": 0}
 
@@ -907,6 +909,12 @@ def test_project_run_exit_codes_map_to_the_dock_states(tmp_path):
     before any image, with the reason and fix the engine printed. A crash (exit 1 without run_end) and any other
     code are errors, with the run's log attached."""
     assert [state_for_exit(c) for c in (0, 1, 2, 3, -1)] == ["done", "failed", "refused", None, None]
+    # the exit code is the contract: 0 stays done without a readable log; a run_end that says interrupted wins
+    rid, log = "20261023T120000Z_0123abcd", tmp_path / "runs" / "x.jsonl"
+    assert project_run_result(rid, log, [], 0, [])["state"] == "done"
+    stopped = [{"event": "run_start", "run_id": rid}, {"event": "run_end", "run_id": rid, "interrupted": True,
+                                                       "counts": {"done": 1, "failed": 0, "skipped": 0}}]
+    assert project_run_result(rid, log, stopped, 0, [])["state"] == "interrupted"
     project = tmp_path / "proj"
     project.mkdir()
     done = run_spec(ids=["a", "b"], steps=[{"event": "image_done", "image_id": "a"},

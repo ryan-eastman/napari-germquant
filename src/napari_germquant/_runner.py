@@ -291,7 +291,8 @@ def run_outcome(events: list[dict], *, alive: bool = True) -> dict:
     """What a run log says, for the status board: ``state`` (running while there is no run_end and the engine
     is ``alive``, interrupted once it is gone without one or when run_end says so, failed when an image failed,
     else done), ``counts`` (run_end's, or tallied from the image events), ``images`` ({image_id: status} from
-    the image events, the last one winning), ``started``, ``ended`` and ``interrupted``."""
+    the image events, the last one winning), ``started`` and ``ended`` (their times), ``finished`` (whether
+    there is a run_end) and ``interrupted``."""
     start = next((e for e in events if e.get("event") == "run_start"), None)
     end = next((e for e in reversed(events) if e.get("event") == "run_end"), None)
     images: dict[str, str] = {}
@@ -313,7 +314,8 @@ def run_outcome(events: list[dict], *, alive: bool = True) -> dict:
     else:
         state = "done"
     return {"run_id": (start or end or {}).get("run_id"), "state": state, "counts": counts, "images": images,
-            "started": (start or {}).get("time"), "ended": (end or {}).get("time"), "interrupted": interrupted}
+            "started": (start or {}).get("time"), "ended": (end or {}).get("time"), "finished": end is not None,
+            "interrupted": interrupted}
 
 
 def project_run_result(run_id: str, log_path: str | Path, events: list[dict], exit_code: int,
@@ -325,14 +327,14 @@ def project_run_result(run_id: str, log_path: str | Path, events: list[dict], ex
     outcome = run_outcome(events, alive=False)
     text = "\n".join(output)
     state = state_for_exit(exit_code)
-    ended = outcome["ended"] is not None
+    ended = outcome["finished"]
     if state is None or (exit_code == 1 and not ended):
         why = "before the end of the run" if exit_code == 1 else "(not 0, 1 or 2)"
         err = RunnerError(f"germquant project run exited with code {exit_code} {why}:\n{_tail(text, 2500)}")
         err.run_id, err.run_log, err.events = run_id, str(log_path), list(events)
         raise err
-    if state != "refused" and outcome["state"] == "interrupted":
-        state = "interrupted"
+    if state in ("done", "failed") and ended and outcome["interrupted"]:
+        state = "interrupted"                         # the engine stopped between images and said so
     return {"run_id": run_id, "log": str(log_path), "exit_code": int(exit_code), "state": state,
             "counts": outcome["counts"], "images": outcome["images"], "interrupted": outcome["interrupted"],
             "message": _tail(text, 2500) if state in ("refused", "failed") else "", "events": list(events)}
@@ -742,7 +744,7 @@ class EngineRunner:
                     shard: str | None = None, run_id: str | None = None, say=None, progress=None,
                     should_stop=None) -> dict:
         """``project run``: project_run_result's record. ``progress(events)`` gets the run log's new events as
-        the engine writes them."""
+        the engine writes them, in the calling thread (the dock's worker: it hands them on to the GUI thread)."""
         raise NotImplementedError
 
     def project_status(self, root, *, should_stop=None) -> dict:
