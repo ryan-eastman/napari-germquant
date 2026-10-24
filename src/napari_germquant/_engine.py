@@ -17,6 +17,13 @@ any other parameter, is done by choosing or writing a profile, never by a hidden
 System packs (docs/DESIGN_system_packs.md, section 8) need germquant 0.2.0.dev0 or later: every pack feature
 is gated on ``hasattr(api, "list_packs")`` (``packs_supported``), and an older engine gets one message
 (``packs_unavailable_message``) while profiles and config files keep working.
+
+Projects, the sample sheet, imported labels, learning curves, derived packs, spot tuning and post-stages need
+the tranche-5 Train B engine (design 8.9). The engine version string cannot tell it apart (it stays 0.2.0.dev0),
+so an engine says what it has in the ``features`` list of ``python -m germquant.packs --version --json``; in this
+environment the project features are also gated on ``hasattr(api, "open_project")`` (``projects_supported``).
+An engine without a feature gets one message (``feature_missing_message``), and packs and the Run dock keep
+working.
 """
 from __future__ import annotations
 
@@ -53,6 +60,54 @@ def packs_unavailable_message() -> str:
     return (f"System packs need germquant {MIN_ENGINE} or later. The germquant this napari environment uses is "
             f"{api.__version__} ({Path(api.__file__).parent}). Update that engine checkout (git pull), reinstall it "
             f"into this environment and restart napari. Profiles and config files (Advanced, below) still work.")
+
+
+# ---------------------------------------------------------------------------------------------------
+# the tranche-5 Train B features: the gate and its one message
+# ---------------------------------------------------------------------------------------------------
+
+# the names an engine's version document lists (``features``), in the engine's order
+FEATURES = ("packs", "planar", "labels_from", "projects", "sample_sheet", "import_labels", "train_curve",
+            "pack_derive", "tune_spots", "post_stages")
+# what each feature is called in a message, and the verb that goes with it
+_FEATURE_WORDS = {
+    "packs": ("System packs", "need"),
+    "planar": ("Single-plane images", "need"),
+    "labels_from": ("Labels read from files", "need"),
+    "projects": ("Projects", "need"),
+    "sample_sheet": ("The sample sheet", "needs"),
+    "import_labels": ("Importing labels", "needs"),
+    "train_curve": ("Learning curves", "need"),
+    "pack_derive": ("Deriving a pack", "needs"),
+    "tune_spots": ("Spot tuning", "needs"),
+    "post_stages": ("Post-stages", "need"),
+}
+TRAIN_B_ENGINE = "the tranche-5 Train B engine"
+
+
+def projects_supported() -> bool:
+    """Whether this environment's germquant has projects (``api.open_project``, which both name lists of the
+    design share)."""
+    return hasattr(api, "open_project")
+
+
+def feature_missing_message(feature: str, *, info: dict | None = None, interpreter: str | None = None) -> str:
+    """The one message an engine without ``feature`` gets. ``interpreter`` names an engine in its own process
+    (``info`` is its version document); without it the message is about this napari environment's germquant."""
+    if feature == "packs" and interpreter is None:
+        return packs_unavailable_message()
+    what, verb = _FEATURE_WORDS.get(feature, (f"The {feature} feature", "needs"))
+    info = info or {}
+    head = f"{what} {verb} {TRAIN_B_ENGINE} (germquant with the {feature!r} feature). "
+    if interpreter is not None:
+        body = (f"The engine at {interpreter} is germquant {info.get('germquant')} (git "
+                f"{str(info.get('git_sha'))[:12]}), which does not have it. Update that engine checkout (git pull) "
+                f"and reinstall it into its environment, or choose another engine.")
+    else:
+        body = (f"The germquant this napari environment uses is {api.__version__} ({Path(api.__file__).parent}), "
+                f"which does not have it. Update that engine checkout (git pull), reinstall it into this "
+                f"environment and restart napari, or choose another engine.")
+    return head + body + " Packs and the Run dock keep working."
 
 
 # ---------------------------------------------------------------------------------------------------

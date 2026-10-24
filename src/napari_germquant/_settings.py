@@ -10,9 +10,14 @@ those values to every computer the user logs in to, so the interpreter keys incl
 an interpreter chosen on one computer is never used on another, where the same path may hold another engine or
 nothing. ``$NAPARI_GERMQUANT_SETTINGS`` names an ini file to use instead: the tests set it, so they never touch
 the real settings, and a script driving the docks can do the same.
+
+The project docks (tranche 5 Train B) add the recent projects, kept per computer like the interpreter (a project
+folder's path, a UNC path kept verbatim, means nothing on another computer), and the annotator, the short name a
+spot-tuning truth-point file carries (annotations/<image_id>__points_<annotator>.csv), kept per user.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import socket
@@ -29,6 +34,11 @@ _DEVICE = "engine/device"
 _RECIPES = "recipe_interpreters/{host}"
 _LAST_PACK = "ui/last_pack"
 _LAST_RECIPE = "ui/last_recipe"
+_RECENT = "projects/{host}/recent"
+_ANNOTATOR = "tuning/annotator"
+RECENT_MAX = 10
+# the annotator of a truth-point file name (letters, digits, dash and underscore)
+ANNOTATOR_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
 def host_key() -> str:
@@ -113,3 +123,50 @@ def last_pack() -> tuple[str | None, str | None]:
 def set_last_pack(pack_id: str | None, recipe_id: str | None) -> None:
     _set(_LAST_PACK, pack_id)
     _set(_LAST_RECIPE, recipe_id)
+
+
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def recent_projects() -> list[str]:
+    """The project folders opened on this computer, the most recent first (at most RECENT_MAX), as given."""
+    raw = _get(_RECENT.format(host=host_key()))
+    try:
+        items = json.loads(raw) if raw else []
+    except ValueError:
+        items = []
+    if not isinstance(items, list):
+        return []
+    return [p for p in items if isinstance(p, str) and p.strip()][:RECENT_MAX]
+
+
+def add_recent_project(path) -> list[str]:
+    """Put ``path`` first in this computer's recent projects (once: an earlier entry of the same folder goes);
+    returns the list."""
+    p = str(path)
+    items = [p, *[q for q in recent_projects() if not _same_path(q, p)]][:RECENT_MAX]
+    _set(_RECENT.format(host=host_key()), json.dumps(items))
+    return items
+
+
+def remove_recent_project(path) -> list[str]:
+    items = [q for q in recent_projects() if not _same_path(q, str(path))]
+    _set(_RECENT.format(host=host_key()), json.dumps(items) if items else None)
+    return items
+
+
+def annotator() -> str | None:
+    """The annotator name stored for this user, or None (the Spot tuning dock asks)."""
+    value = _get(_ANNOTATOR)
+    return value if value and ANNOTATOR_RE.fullmatch(value) else None
+
+
+def set_annotator(name: str | None) -> None:
+    """Store the annotator name (letters, digits, dash and underscore, 1 to 32 of them); None forgets it."""
+    if name is None:
+        _set(_ANNOTATOR, None)
+        return
+    if not isinstance(name, str) or not ANNOTATOR_RE.fullmatch(name):
+        raise ValueError(f"not an annotator name: {name!r} (letters, digits, dash and underscore, at most 32)")
+    _set(_ANNOTATOR, name)
