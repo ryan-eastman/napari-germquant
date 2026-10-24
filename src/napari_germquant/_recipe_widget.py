@@ -26,8 +26,9 @@ of the project is in progress (``set_running``) the tab takes no edit.
 
 The host: the Project dock (unit P6-PROJECT) shows the tab through one line of its EXTRA_TABS,
 ``("Recipe", "napari_germquant._recipe_widget:RecipeProjectTab")``. RecipeProjectTab follows the dock's tab
-protocol (``project_changed(state)``, ``running_changed(running)``) and asks the dock to read the project again
-after each write. The tab also works alone (``set_project``, ``set_running``, ``set_reference_image``).
+protocol (``project_changed(state)``, ``running_changed(running)``), asks the dock to read the project again
+after each write, and leaves the role preview until it is shown. The tab also works alone (``set_project``,
+``set_running``, ``set_reference_image``).
 """
 from __future__ import annotations
 
@@ -705,8 +706,14 @@ class RecipeTab(QWidget):
         return self._view is not None and self.role_choices() != _params.role_choices(self._view.roles,
                                                                                       self._view.saved_roles())
 
+    def _previews_now(self) -> bool:
+        """Whether the role preview is asked for now: the engine's dry run reads the header of every image of the
+        project. Always here; RecipeProjectTab waits while it is hidden in the dock."""
+        return True
+
     def _after_role_change(self) -> None:
-        if self._view is not None and self._view.roles and self._current_role_record() is None:
+        if (self._view is not None and self._view.roles and self._current_role_record() is None
+                and self._previews_now()):
             self._want_roles = {"roles": self.role_choices(), "digest": self._view.digest}
             self._pump()
         self._show_preview()
@@ -1041,7 +1048,8 @@ class RecipeTab(QWidget):
         if self._want_load is not None:
             req, self._want_load = self._want_load, None
             choices = dict(self._choices) if req.get("keep") else None
-            self._start("load", lambda: self._load_job(root, reference, choices, req), "reading the project")
+            preview = self._previews_now()            # asked here: the worker thread must not touch the widget
+            self._start("load", lambda: self._load_job(root, reference, choices, req, preview), "reading the project")
         elif self._want_reference is not None:
             ref, self._want_reference = self._want_reference, None
             self._start("reference", lambda: {"root": root, "view": self._reader(root, reference=ref)},
@@ -1080,9 +1088,10 @@ class RecipeTab(QWidget):
                 raise
 
     # -- in the worker thread
-    def _load_job(self, root, reference, choices, req) -> dict:
-        """The project read here, then the engine's role preview of its current choices. An engine that cannot
-        be used (none chosen, too old, no projects feature) leaves the view shown, read only, with its message."""
+    def _load_job(self, root, reference, choices, req, preview=True) -> dict:
+        """The project read here, then (with ``preview``) the engine's role preview of its current choices. An
+        engine that cannot be used (none chosen, too old, no projects feature) leaves the view shown, read only,
+        with its message."""
         view = self._reader(root, reference=reference)
         out = {"root": root, "view": view, "record": None, "sent": None, "keep": bool(req.get("keep")),
                "runner_key": None, "engine_error": None}
@@ -1093,7 +1102,7 @@ class RecipeTab(QWidget):
             return out
         out["runner_key"] = getattr(runner, "key", None)
         out["sent"] = _params.role_choices(view.roles, choices if choices is not None else view.saved_roles())
-        if view.roles:
+        if view.roles and preview:
             try:
                 out["record"] = runner.project_edit(root, roles=out["sent"], dry_run=True,
                                                     should_stop=self.worker.should_stop)
@@ -1261,12 +1270,22 @@ class RecipeProjectTab(RecipeTab):
     in its EXTRA_TABS, made with the dock): ``project_changed(state)`` at every new reading of the open project
     (None when it closes) and ``running_changed(running)`` when a run starts or ends. The tab takes the dock's
     viewer and engine session; after each write it asks the dock to read the project again (``dock.reload``), so
-    the header and the status board follow the new config_hash."""
+    the header and the status board follow the new config_hash. While the tab is hidden (another tab of the dock
+    is shown) it follows the dock's readings, but the role preview, a dry run that reads every image's header,
+    waits until it is shown."""
 
     def __init__(self, dock) -> None:
         super().__init__(getattr(dock, "viewer", None), dock, session=getattr(dock, "session", None))
         self.dock = dock
         self.applied.connect(self._reload_dock)
+
+    def _previews_now(self) -> bool:
+        return self.isVisible()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        super().showEvent(event)
+        if self._view is not None and self.last_error is None and not self.engine_error:
+            self._after_role_change()          # the role preview that waited while the tab was hidden
 
     def project_changed(self, state) -> None:
         root = getattr(state, "root", None) if state is not None else None

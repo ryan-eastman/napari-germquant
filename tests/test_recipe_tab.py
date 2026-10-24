@@ -181,7 +181,8 @@ class _Dock(QWidget):
 def test_the_tab_follows_the_project_docks_tab_protocol(qtbot, tmp_path):
     """RecipeProjectTab, the class the Project dock's EXTRA_TABS line names: it follows the dock's readings of the
     project (a reading with no write since its own is not read again), its runs, and after a write it asks the
-    dock to read the project again."""
+    dock to read the project again. While it is hidden it reads the project, but its role preview (a dry run that
+    reads every image's header) waits until it is shown (review N12)."""
     def answer(kw):
         changed = any((kw.get("roles") or {}).values())
         if kw.get("dry_run"):
@@ -194,12 +195,22 @@ def test_the_tab_follows_the_project_docks_tab_protocol(qtbot, tmp_path):
     dock = _Dock(FakeSession(fake))
     qtbot.addWidget(dock)
     views = [fake_view(tmp_path, saved={"at": "t0"})]
+    reads = []
+
+    def reader(root, reference=None):
+        reads.append(str(root))
+        return views[-1]
+
     tab = RecipeProjectTab(dock)
-    tab._reader = lambda root, reference=None: views[-1]
+    tab._reader = reader
     assert tab.session is dock.session and tab.dock is dock
     tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t0"}}))
     _settle(tab, qtbot)
-    assert tab.root == Path(tmp_path) and len(fake.calls) == 1
+    assert tab.root == Path(tmp_path) and tab.config_hash == "02bb83cf74f9" and len(reads) == 1
+    assert fake.calls == [] and tab.preview_states() == {}            # hidden: no role preview yet
+    dock.show()                                                       # the dock shows the tab
+    _settle(tab, qtbot)
+    assert len(fake.calls) == 1 and tab.preview_states() == {"img1": {"dna": "name", "foci": "name"}}
     tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t0"}}))
     _settle(tab, qtbot)
     assert len(fake.calls) == 1                         # read again with no write since: nothing to do
@@ -227,5 +238,14 @@ def test_the_tab_follows_the_project_docks_tab_protocol(qtbot, tmp_path):
     tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest=dict(tuned)))
     _settle(tab, qtbot)
     assert len(fake.calls) == n + 2 and tab.view.manifest == tuned
+    dock.hide()                                                       # another tab of the dock, say
+    views.append(fake_view(tmp_path, saved={"at": "t3"}, digest="d4"))
+    k = len(reads)
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t3"}}))
+    _settle(tab, qtbot)
+    assert len(reads) == k + 1 and tab.view.saved == {"at": "t3"} and len(fake.calls) == n + 2
+    dock.show()
+    _settle(tab, qtbot)
+    assert len(fake.calls) == n + 3 and tab.preview_states() == {"img1": {"dna": "name", "foci": "name"}}
     tab.project_changed(None)
     assert tab.root is None and tab.view is None
