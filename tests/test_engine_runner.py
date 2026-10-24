@@ -5,7 +5,12 @@ engine instead of running in process (and preselecting only a detected engine ch
 second interpreter running there with run_start recording it, a pack card refresh through the subprocess runner
 that loads no torch in the engine process and does not re-hash a verified blob, the run log's place and format,
 the device choice reaching the engine, a GUI thread that never waits for the engine, Cancel and napari quitting
-ending a hung engine, the interpreter kept per computer, and executables that are not Python refused."""
+ending a hung engine, the interpreter kept per computer, and executables that are not Python refused.
+
+Project runs (tranche 5 Train B, unit P6-RUNNER; stand-in engines from tests/_p6_runner.py): a project pack
+listing through the subprocess runner loads no torch, the engine's run log is tailed with a partial last line
+kept for the next read, Cancel ends a hung ``project run`` and its log reads as interrupted, the exit codes 0, 1
+and 2 map to the dock's states, and an engine without the projects feature gets one message."""
 from __future__ import annotations
 
 import importlib.util
@@ -15,25 +20,30 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
-from conftest import HEAVY, TEST_IMAGE, TINYNET_SHA, settle
+from _p6_runner import run_spec, standin_engine
+from conftest import HEAVY, TEST_IMAGE, TEST_PACK, TINYNET_SHA, copy_pack, need_features, settle
 from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QDialogButtonBox
 
 from napari_germquant import _engine, _settings
-from napari_germquant._engine import Recipe, RunPlan
+from napari_germquant._engine import Recipe, RunPlan, feature_missing_message
 from napari_germquant._engine_widgets import InterpreterDialog
 from napari_germquant._run_widget import RunWidget
 from napari_germquant._runner import (
     MIN_ENGINE,
     VIA_INPROCESS,
     VIA_SUBPROCESS,
+    EngineRefused,
     EngineRunner,
     EngineTooOld,
+    FeatureMissing,
     InProcessRunner,
+    LogTail,
     RunCancelled,
     RunLog,
     RunnerError,
@@ -44,7 +54,9 @@ from napari_germquant._runner import (
     mismatch_warning,
     plugin_engine_info,
     read_run_log,
+    run_outcome,
     runs_folder_for,
+    state_for_exit,
     user_runs_dir,
     version_mismatch,
 )
@@ -766,3 +778,200 @@ def test_the_device_choice_reaches_the_engine_and_a_runs_folder_keeps_only_engin
     argv[argv.index("--out") + 1] = str(tmp_path / "cli")
     assert cli.main(argv) == 0
     assert sorted(f.name for f in out.iterdir()) == sorted(f.name for f in (tmp_path / "cli").iterdir())
+
+
+# ---------------------------------------------------------------------------------------------------
+# project runs (tranche 5 Train B): listing, tailing, Cancel, exit codes, the features gate
+# ---------------------------------------------------------------------------------------------------
+
+ALL_FEATURES = list(_engine.FEATURES)
+
+
+def _standin_runner(tmp_path: Path, name: str = "engine", *, features=ALL_FEATURES, python=None,
+                    **env) -> SubprocessRunner:
+    """A subprocess runner on a stand-in engine (tests/_p6_runner.py) that answers with napari's own germquant
+    version and git sha, so no mismatch is reported."""
+    own = plugin_engine_info()
+    root = standin_engine(tmp_path / name, version=_accepted(own["germquant"]), git_sha=str(own["git_sha"]),
+                          features=features)
+    return SubprocessRunner(python or sys.executable, env={"PYTHONPATH": str(root), **env})
+
+
+@needs_packs
+def test_a_project_listing_through_the_subprocess_runner_loads_no_torch(pack_env, tmp_path):
+    """``python -m germquant.packs list --project DIR`` lists the project's own packs first (a vendored or derived
+    pack under <project>/packs/<id>/<version>/) and loads no torch in the engine process."""
+    need_features("projects")
+    project = tmp_path / "proj"
+    copy_pack(TEST_PACK, project / "packs" / "lab_pack" / "0.1.0", edit=lambda d: d.update(id="lab_pack"))
+    r = SubprocessRunner(sys.executable, interpreter_options=("-X", "importtime"))
+    listing = r.list_packs(project=project)
+    assert r.history[-1][3:] == ["-m", "germquant.packs", "list", "--json", "--all", "--project", str(project)]
+    assert "project" in {root["kind"] for root in listing["roots"]}
+    assert [p["source"] for p in listing["packs"] if p["id"] == "lab_pack"] == ["project"]
+    imported = _imported(r.last_stderr)
+    assert "germquant.packs" in imported and "yaml" in imported                       # the log was read
+    assert not [m for m in imported if m.split(".")[0] in HEAVY], sorted(imported)
+    assert "germquant.pipeline" not in imported
+
+
+def test_the_project_run_log_is_tailed_with_partial_lines_kept(tmp_path):
+    """The tailer hands over complete lines only and keeps a partial last line for the next read; a project run
+    through the subprocess runner streams its log events to ``progress`` while the engine writes them."""
+    log = tmp_path / "runs" / "20261023T000000Z_abcdef12.jsonl"
+    tail = LogTail(log)
+    assert tail.read() == [] and tail.path == log                    # no log yet
+    log.parent.mkdir()
+    a = json.dumps({"event": "run_start", "run_id": "r", "time": "t0"}) + "\n"
+    b = json.dumps({"event": "image_done", "run_id": "r", "image_id": "img1", "status": "done"}) + "\n"
+    with open(log, "ab") as fh:
+        fh.write((a + b[:11]).encode("ascii"))
+    assert [e["event"] for e in tail.read()] == ["run_start"]        # the half line waits
+    assert tail.read() == []
+    with open(log, "ab") as fh:
+        fh.write(b[11:].encode("ascii"))
+    assert [(e["event"], e["image_id"]) for e in tail.read()] == [("image_done", "img1")]
+    end = json.dumps({"event": "run_end", "run_id": "r", "counts": {"done": 1, "failed": 0, "skipped": 0}})
+    with open(log, "ab") as fh:
+        fh.write(b"not json\n" + (end + "\r\n").encode("ascii"))
+    assert [e["event"] for e in tail.read()] == ["run_end"] and tail.bad == ["not json"]
+
+    spec = run_spec(ids=["a", "b", "c"], steps=[
+        {"event": "image_done", "image_id": "a"},
+        {"event": "image_done", "image_id": "b", "sleep": 0.5, "partial": 1.0},
+        {"event": "image_skipped", "image_id": "c", "sleep": 0.5}])
+    r = _standin_runner(tmp_path, FAKE_PROJECT_RUN=spec)
+    project = tmp_path / "proj"
+    project.mkdir()
+    batches: list[list[dict]] = []
+    said: list[str] = []
+    res = r.project_run(project, progress=lambda events: batches.append(list(events)), say=said.append)
+    events = [e for batch in batches for e in batch]
+    assert [(e["event"], e.get("image_id")) for e in events] == [
+        ("run_start", None), ("image_done", "a"), ("image_done", "b"), ("image_skipped", "c"), ("run_end", None)]
+    assert len(batches) >= 3                                         # streamed while the engine ran
+    assert all(e["run_id"] == res["run_id"] for e in events)
+    assert res["state"] == "done" and res["exit_code"] == 0 and res["events"] == events
+    assert res["counts"] == {"done": 2, "failed": 0, "skipped": 1}
+    assert res["log"] == str(project / "runs" / f"{res['run_id']}.jsonl") and read_run_log(res["log"]) == events
+    assert f"project run {res['run_id']} via {VIA_SUBPROCESS}" in said
+    assert events[0]["via"] == VIA_SUBPROCESS
+    assert events[0]["argv"][-4:] == ["--run-id", res["run_id"], "--via", VIA_SUBPROCESS]
+
+
+def test_cancel_ends_a_hung_project_run_and_the_board_says_interrupted(tmp_path):
+    """Cancel during a ``project run`` that never ends: the engine and the process it started are ended (the
+    base interpreter runs the stand-in, so no venv launcher ends the child for us), RunCancelled names the run
+    and its log, and the log, which has no run_end, reads as interrupted."""
+    psutil = pytest.importorskip("psutil")
+    pid_file = tmp_path / "engine.pid"
+    spec = run_spec(ids=["a", "b"], steps=[{"event": "image_done", "image_id": "a"}], hang=str(pid_file))
+    r = _standin_runner(tmp_path, python=BASE_PYTHON, FAKE_PROJECT_RUN=spec)
+    project = tmp_path / "proj"
+    project.mkdir()
+    stop = threading.Event()
+    seen: list[dict] = []
+
+    def cancel_when_hung():
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if pid_file.exists() and len(pid_file.read_text(encoding="ascii").split()) == 2:
+                break
+            time.sleep(0.05)
+        stop.set()
+
+    helper = threading.Thread(target=cancel_when_hung, daemon=True)
+    helper.start()
+    t0 = time.monotonic()
+    with pytest.raises(RunCancelled) as e:
+        r.project_run(project, progress=seen.extend, should_stop=stop.is_set)
+    helper.join(5)
+    assert time.monotonic() - t0 < 60
+    pids = _pids(pid_file)
+    deadline = time.monotonic() + 15
+    while any(psutil.pid_exists(p) for p in pids) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not any(psutil.pid_exists(p) for p in pids), "the engine or its child outlived Cancel"
+    assert Path(e.value.run_log) == project / "runs" / f"{e.value.run_id}.jsonl"
+    events = read_run_log(e.value.run_log)
+    assert [x["event"] for x in events] == ["run_start", "image_done"] == [x["event"] for x in e.value.events]
+    assert [x["event"] for x in seen] == ["run_start", "image_done"]
+    board = run_outcome(events, alive=False)
+    assert board["state"] == "interrupted" and board["images"] == {"a": "done"} and not board["ended"]
+    assert run_outcome(events)["state"] == "running"                 # while the engine still runs
+    assert board["counts"] == {"done": 1, "failed": 0, "skipped": 0}
+
+
+def test_project_run_exit_codes_map_to_the_dock_states(tmp_path):
+    """0: every image done or skipped; 1: some images failed (a result, not an error of the call); 2: refused
+    before any image, with the reason and fix the engine printed. A crash (exit 1 without run_end) and any other
+    code are errors, with the run's log attached."""
+    assert [state_for_exit(c) for c in (0, 1, 2, 3, -1)] == ["done", "failed", "refused", None, None]
+    project = tmp_path / "proj"
+    project.mkdir()
+    done = run_spec(ids=["a", "b"], steps=[{"event": "image_done", "image_id": "a"},
+                                           {"event": "image_skipped", "image_id": "b"}])
+    res = _standin_runner(tmp_path, "e0", FAKE_PROJECT_RUN=done).project_run(project)
+    assert (res["state"], res["exit_code"], res["counts"]) == ("done", 0, {"done": 1, "failed": 0, "skipped": 1})
+    assert res["images"] == {"a": "done", "b": "skipped"} and not res["interrupted"]
+    failed = run_spec(ids=["a", "b"], exit=1, steps=[{"event": "image_done", "image_id": "a"},
+                                                     {"event": "image_failed", "image_id": "b", "error": "boom"}])
+    res = _standin_runner(tmp_path, "e1", FAKE_PROJECT_RUN=failed).project_run(project)
+    assert (res["state"], res["exit_code"], res["counts"]["failed"]) == ("failed", 1, 1)
+    assert res["images"] == {"a": "done", "b": "failed"}
+    refused = run_spec(refuse="model digest mismatch for cpsam_v2@0f1cc3f7; fix: germquant pack fetch-models")
+    res = _standin_runner(tmp_path, "e2", FAKE_PROJECT_RUN=refused).project_run(project)
+    assert (res["state"], res["exit_code"], res["events"]) == ("refused", 2, [])
+    assert "REFUSED: model digest mismatch for cpsam_v2@0f1cc3f7" in res["message"] and "fix:" in res["message"]
+    crash = run_spec(ids=["a"], crash=True, steps=[{"event": "image_done", "image_id": "a"}])
+    with pytest.raises(RunnerError, match="exited with code 1 before the end of the run") as e:
+        _standin_runner(tmp_path, "e3", FAKE_PROJECT_RUN=crash).project_run(project)
+    assert "the stand-in engine crashed" in str(e.value) and not isinstance(e.value, RunCancelled)
+    assert run_outcome(e.value.events, alive=False)["state"] == "interrupted"
+    odd = run_spec(ids=[], exit=3)
+    with pytest.raises(RunnerError, match="exited with code 3"):
+        _standin_runner(tmp_path, "e4", FAKE_PROJECT_RUN=odd).project_run(project)
+    # a one-shot command refused by the engine (exit 2) raises EngineRefused with what it printed
+    with pytest.raises(EngineRefused, match="import-labels") as e:
+        _standin_runner(tmp_path, "e5", FAKE_ENGINE_EXIT="2").import_labels(
+            tmp_path / "seg.npy", "cellpose-npy", tmp_path / "img.ome.tif", tmp_path / "pairs")
+    assert e.value.exit_code == 2 and '"module": "germquant"' in e.value.output
+
+
+def test_an_engine_without_the_projects_feature_gives_one_message(tmp_path, monkeypatch):
+    """An engine from before the features list (tranche 5 train A: its version document has none) has packs and
+    nothing else: every project call gets the same one message before any project command starts, while pack
+    listing goes on working. In this environment, ``api.open_project`` gates projects."""
+    r = _standin_runner(tmp_path, "trainA", features=None)
+    assert r.features() == frozenset({"packs"})
+    msg = feature_missing_message("projects", info=r.cached_version(), interpreter=sys.executable)
+    assert msg.startswith("Projects need the tranche-5 Train B engine (germquant with the 'projects' feature). "
+                          f"The engine at {sys.executable} is germquant ") and "git pull" in msg
+    assert msg.endswith("Packs and the Run dock keep working.")
+    project = tmp_path / "proj"
+    calls = [lambda: r.project_new(project, "test_pack@0.1.0"), lambda: r.project_add(project, [TEST_IMAGE]),
+             lambda: r.project_edit(project, edits={"spots.log.min_snr": 2.0}), lambda: r.project_run(project),
+             lambda: r.project_status(project), lambda: r.project_rounds(project),
+             lambda: r.list_packs(project=project), lambda: r.check("test_pack", project=project)]
+    for call in calls:
+        with pytest.raises(FeatureMissing) as e:
+            call()
+        assert str(e.value) == msg and e.value.feature == "projects"
+    assert all(a[1:] == ["-m", "germquant.packs", "--version", "--json"] for a in r.history)   # nothing else ran
+    with pytest.raises(FeatureMissing, match=r"^Spot tuning needs the tranche-5 Train B engine \(germquant with "
+                                             r"the 'tune_spots' feature\)"):
+        r.tune_spots(project)
+    assert r.list_packs()["argv"] == ["list", "--json", "--all"]       # packs keep working
+    # an engine whose list lacks a feature gets the same kind of message
+    partial = _standin_runner(tmp_path, "partial", features=["packs", "projects"])
+    with pytest.raises(FeatureMissing, match="Post-stages need the tranche-5 Train B engine"):
+        partial.list_post_stages()
+    assert partial.project_status(project)["argv"] == ["project", "status", str(project), "--json"]
+    # this napari environment: the api name decides
+    monkeypatch.delattr(api, "open_project", raising=False)
+    inproc = InProcessRunner()
+    assert "projects" not in inproc.features() and "packs" in inproc.features()
+    with pytest.raises(FeatureMissing) as e:
+        inproc.project_status(project)
+    assert str(e.value) == feature_missing_message("projects", info=plugin_engine_info())
+    assert "this napari environment" in str(e.value) and "restart napari" in str(e.value)
