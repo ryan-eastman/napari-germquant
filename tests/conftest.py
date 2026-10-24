@@ -373,7 +373,9 @@ def engine_features() -> frozenset[str]:
 def need_features(*names: str, have=None) -> None:
     """The one feature gate of the tests: return when the engine has every feature in ``names``; otherwise skip
     the calling test, naming each missing feature, or fail when $NAPARI_GERMQUANT_REQUIRE_FEATURES lists one of
-    them. ``have`` replaces the engine's own list (the gate's own test)."""
+    them. The reason starts with the calling test's id: pytest reports a skip at the line that raised it (here),
+    so the CI's skip list could not otherwise say which tests skipped. ``have`` replaces the engine's own list
+    (the gate's own test)."""
     unknown = [n for n in names if n not in _engine.FEATURES]
     if unknown:
         raise ValueError(f"not engine features: {unknown}; the engine features are {list(_engine.FEATURES)}")
@@ -383,8 +385,9 @@ def need_features(*names: str, have=None) -> None:
         return
     from germquant import api
 
-    text = (f"the engine lacks the feature{'s' if len(missing) > 1 else ''} {', '.join(missing)} (germquant "
-            f"{api.__version__} at {Path(api.__file__).parent})")
+    test = os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0]
+    text = (f"{test + ': ' if test else ''}the engine lacks the feature{'s' if len(missing) > 1 else ''} "
+            f"{', '.join(missing)} (germquant {api.__version__} at {Path(api.__file__).parent})")
     required = sorted(set(missing) & required_features())
     if required:
         pytest.fail(f"{text}; {REQUIRE_FEATURES_ENV} requires {', '.join(required)}", pytrace=False)

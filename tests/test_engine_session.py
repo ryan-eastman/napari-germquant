@@ -143,21 +143,27 @@ def test_recent_projects_are_kept_per_computer_and_the_annotator_per_user(monkey
 
 
 def test_a_missing_feature_skips_unless_required(monkeypatch):
+    """A gate that skipped where it must fail would make this test skip instead of failing, so each required
+    case catches the skip too and asserts that the failure is what came."""
     monkeypatch.delenv(REQUIRE_FEATURES_ENV, raising=False)
     need_features("packs", have={"packs"})                            # present: nothing happens
-    with pytest.raises(pytest.skip.Exception, match="the engine lacks the feature projects"):
+    with pytest.raises(pytest.skip.Exception, match="the engine lacks the feature projects") as e:
         need_features("projects", have={"packs"})
+    # the reason names the calling test (pytest reports the skip at the gate's line, the same for every test)
+    assert str(e.value).startswith("tests/test_engine_session.py::test_a_missing_feature_skips_unless_required: ")
     with pytest.raises(pytest.skip.Exception, match="the engine lacks the features projects, tune_spots"):
         need_features("projects", "tune_spots", have={"packs"})
     monkeypatch.setenv(REQUIRE_FEATURES_ENV, "projects, tune_spots")
-    with pytest.raises(pytest.fail.Exception, match="NAPARI_GERMQUANT_REQUIRE_FEATURES requires projects"):
+    with pytest.raises((pytest.fail.Exception, pytest.skip.Exception)) as e:      # a skip here is the bug
         need_features("projects", have={"packs"})
+    assert e.type is pytest.fail.Exception and "NAPARI_GERMQUANT_REQUIRE_FEATURES requires projects" in str(e.value)
     with pytest.raises(pytest.skip.Exception):                        # not listed: still a skip
         need_features("post_stages", have={"packs"})
     need_features("projects", have=set(_engine.FEATURES))
     monkeypatch.setenv(REQUIRE_FEATURES_ENV, "projets")
-    with pytest.raises(pytest.fail.Exception, match="unknown features"):
+    with pytest.raises((pytest.fail.Exception, pytest.skip.Exception)) as e:      # a skip here is the bug
         need_features("projects", have={"packs"})
+    assert e.type is pytest.fail.Exception and "unknown features" in str(e.value)
     with pytest.raises(ValueError, match="not engine features"):
         need_features("no_such_feature", have=set())
 
