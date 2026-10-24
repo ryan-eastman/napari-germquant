@@ -3,13 +3,13 @@ sections 7.3 and 8.5; P6 acceptance 4 and 5; tranche 5 Train B plan, decision D3
 
 The role editor offers one combo per role of the pack recipe's channel map, listing the channels of a reference
 image (the project's first image, or the one chosen in the tab's own list or by ``set_reference_image``) after
-the pack map's own binding. Below it a
-preview shows, for every image of the project, how each role binds with the choices made: by name, by the index
-fallback (amber: the run flags it), unbound (red for a required role) or two roles on one channel (red). The
-preview is the engine's dry run, ``project edit DIR --role ROLE=CHANNEL ... --dry-run --json``, so it comes from
-the code that writes the map and binds the roles in a run. Red keeps Apply off; Apply is ``project edit`` itself,
-which writes channel_map.yaml (the pack map with each edited role named by its exact channel name) and recipe.yaml
-in ASCII, and refuses an edit that still has a problem.
+the pack map's own binding. Below it a preview shows, for every image of the project, how each role binds with
+the choices made: by name, by the index fallback (amber: the run flags it), unbound (red for a required role) or
+two roles on one channel (red). The preview is the engine's dry run, ``project edit DIR --role ROLE=CHANNEL ...
+--dry-run --json``, so it comes from the code that writes the map and binds the roles in a run, and every red
+cell is a problem it names. Red keeps Apply off; Apply is ``project edit`` itself, which writes channel_map.yaml
+(the pack map with each edited role named by its exact channel name) and recipe.yaml in ASCII, and refuses an
+edit that still has a problem. Revert roles is ``project edit --unset io.channel_map``.
 
 The parameter form is built only from the recipe's tunables (pack.yaml ``recipes[].tunables``): a spin box for
 a float or an int (the declared range, the unit as suffix), a check box for a bool, a combo for a choice, a line
@@ -21,8 +21,9 @@ the pack recipe again. Back to the pack recipe is ``project edit --revert``.
 
 Where it runs: the tab reads the project in this napari environment (``_params.read_view``) and sends every
 dry run and write to the engine runner of the viewer's engine session (``_engine_session``), in a thread worker,
-one call at a time, the newest request of each kind first; the GUI thread never waits. While the host says a run
-of the project is in progress (``set_running``) the tab takes no edit.
+one call at a time, the newest request of each kind first; the GUI thread never waits. The tab takes no edit
+while a run of the project goes (the host's ``set_running``, or a run a Project dock of this napari started)
+and while one of its writes is queued or running (the write's answer replaces the values and choices shown).
 
 The host: the Project dock (unit P6-PROJECT) shows the tab through one line of its EXTRA_TABS,
 ``("Recipe", "napari_germquant._recipe_widget:RecipeProjectTab")``. RecipeProjectTab follows the dock's tab
