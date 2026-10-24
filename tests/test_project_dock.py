@@ -584,15 +584,21 @@ def test_the_settings_controls_are_off_while_a_write_is_in_flight(qtbot, tmp_pat
     controls = (w.stride_spin, w.samples_table, w.save_btn, w.stage_checks["spots"], w.device_combo,
                 w.interpreter_btn)
     assert not w.writing and all(c.isEnabled() for c in controls)
-    w.set_xy_stride(2)
-    fake.status_gate = threading.Event()
-    w.save()
+    # a Save waiting behind a reading in flight: the controls are off from the click on
+    fake.status_gate, fake.edit_gate = threading.Event(), threading.Event()
+    w.reload()
     qtbot.waitUntil(lambda: _status_calls(fake) == 2, timeout=10_000)
-    assert w.writing and not any(c.isEnabled() for c in controls) and w.close_btn.isEnabled()
+    assert not w.writing and all(c.isEnabled() for c in controls)
+    w.set_xy_stride(2)
+    assert w.save() and w.writing and not any(c.isEnabled() for c in controls) and w.close_btn.isEnabled()
+    # the Save in flight (its project edit held)
+    fake.status_gate.set()
+    qtbot.waitUntil(lambda: len(fake.called("project_edit")) == 1, timeout=10_000)
+    assert w.writing and not any(c.isEnabled() for c in controls)
     with pytest.raises(ValueError, match="in progress"):
         w.set_sample("a", "genotype", "N2")
     w.set_xy_stride(3)
-    fake.status_gate.set()
+    fake.edit_gate.set()
     settle(w, qtbot)
     assert not w.writing and all(c.isEnabled() for c in controls)
     assert read_manifest(root)["run"]["xy_stride"] == 2 and w.stride_spin.value() == 3 and w.unsaved
