@@ -15,22 +15,51 @@ Labels layer is "<id> cells" or "<id> nuclei" and the summary line counts cells 
 collects the pack id and version, recipe, config_hash, model sha256, git sha and the device used, and
 ``fallback_banner`` warns when the segmenter that made the labels (image_summary.segmentation_method) is not
 the one the pack's recipe declares.
+
+Single-plane runs (docs/DESIGN_system_packs.md 8.8): the engine's planar mode writes voxel_dz_um as NaN, so
+``spacing`` gives (1.0, dy, dx) for such a folder; its YX label and spots images gain the missing z axis; and
+the Points size is the spot size the run's own detector used, from the run's config (``spot_marker_size_um``),
+found in the folder's run_manifest.json or, for a batch, in the batch root's (``ResultsSet.run_config``).
 """
 from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from . import _engine  # import order: germquant.api before anything else
+from ._reader import PLANAR_DZ_UM
 from germquant import api
 
 LayerData = tuple
 
 SUMMARY_SUFFIX = "__image_summary.csv"
+
+# the Points size when the run's config is not found (no run_manifest.json, or a batch root of another
+# config): 2 x the RAD-51 spot_radius_um default of 0.3 um, the fixed marker of earlier versions
+DEFAULT_POINT_SIZE_UM = 0.6
+# the engine's code defaults for a config that leaves the keys out: spots.spot_radius_um (the spots stage's
+# default, SPOTMAX_DEFAULTS in germquant.spots.detect) and spots.log.diameter_um (LOG_DEFAULTS in
+# germquant.spots.log_detect); tests/test_display_2d.py compares them with the engine's
+SPOT_RADIUS_DEFAULT_UM = 0.3
+LOG_DIAMETER_DEFAULT_UM = 0.5
+# how many folders above an image folder the batch-root manifest is looked for (germquant batch mirrors the
+# input tree below its --out folder)
+MANIFEST_SEARCH_LEVELS = 8
+
+
+def _read_manifest(path: Path) -> dict | None:
+    """A run_manifest.json above an image folder as a dict, or None when it cannot be read or is not a JSON
+    object: a folder the image does not own never stops its layers from loading."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,6 +113,45 @@ class ResultsSet:
             return None
         return data if isinstance(data, dict) else None
 
+    def config_hash(self) -> str | None:
+        """The config_hash of this image's run: its done marker's, else its image_summary table's (read as
+        text, so a hash of digits only keeps its leading zeros)."""
+        value = (self.done_marker() or {}).get("config_hash")
+        if not (isinstance(value, str) and value.strip()) and self.has("image_summary.csv"):
+            try:
+                df = pd.read_csv(self.file("image_summary.csv"), dtype=str, nrows=1)
+            except (OSError, ValueError):
+                df = None
+            if df is not None and len(df) and "config_hash" in df.columns:
+                value = df["config_hash"].iloc[0]
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def run_config(self) -> dict | None:
+        """The config the run used (the "config" of a run_manifest.json). A single-image or project run writes
+        the manifest into the image's folder; ``germquant batch`` writes one manifest, into the batch root, so
+        for an image folder without one the nearest run_manifest.json above it (up to MANIFEST_SEARCH_LEVELS
+        folders) is used when its config_hash equals this image's, and the search stops at that manifest
+        either way (a later batch into the same root rewrites it). None when nothing matches."""
+        man = self.manifest()
+        if man is None:
+            want = self.config_hash()
+            folder = self.folder
+            for _ in range(MANIFEST_SEARCH_LEVELS):
+                if want is None or folder.parent == folder:
+                    break
+                folder = folder.parent
+                p = folder / "run_manifest.json"
+                try:
+                    present = p.is_file()
+                except OSError:                   # a folder above that cannot be read: stop looking
+                    break
+                if present:
+                    doc = _read_manifest(p)
+                    man = doc if doc is not None and doc.get("config_hash") == want else None
+                    break
+        cfg = (man or {}).get("config")
+        return cfg if isinstance(cfg, dict) else None
+
     def _record(self, key: str) -> dict | None:
         for doc in (self.stage_record(), self.manifest()):
             if isinstance(doc, dict) and isinstance(doc.get(key), dict):
@@ -103,7 +171,8 @@ class ResultsSet:
 
     def spacing(self) -> tuple[float, float, float]:
         """(dz, dy, dx) from the shared metadata block of image_summary (one row, always written), else
-        nuclei, else 1 um isotropic."""
+        nuclei, else 1 um isotropic. A single-plane run writes voxel_dz_um as NaN: with dy and dx finite and
+        positive that gives (1.0, dy, dx), the z step of PLANAR_DZ_UM."""
         for name in ("image_summary", "nuclei"):
             df = self.table(name)
             if df is not None and len(df) and {"voxel_dz_um", "voxel_dy_um", "voxel_dx_um"} <= set(df.columns):
@@ -111,6 +180,8 @@ class ResultsSet:
                 sp = tuple(float(row[c]) for c in ("voxel_dz_um", "voxel_dy_um", "voxel_dx_um"))
                 if all(np.isfinite(s) and s > 0 for s in sp):
                     return sp   # type: ignore[return-value]
+                if math.isnan(sp[0]) and all(np.isfinite(s) and s > 0 for s in sp[1:]):
+                    return (PLANAR_DZ_UM, sp[1], sp[2])
         return (1.0, 1.0, 1.0)
 
     def source_path(self) -> Path | None:
@@ -181,23 +252,65 @@ def labels_layer(rs: ResultsSet, suffix: str, table_name: str | None, id_column:
     return (labels, kwargs, "labels")
 
 
+def _size_um(value) -> float | None:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def spot_marker_size_um(config: dict | None, table: str = "spots") -> float:
+    """The Points size, in microns, of a spots table: the spot diameter the run's detector used, read from the
+    run's config the way the engine resolves it (plan decision D37). The log backend: spots.log.diameter_um
+    (code default 0.5); spotmax and every other backend: 2 x spots.spot_radius_um (code default 0.3). An extra
+    spot instance (``spots_<name>``) lays its own keys over the shared spots section, a mapping such as
+    ``log`` one level deep, and its own backend wins. Without a config, or for an instance the config does
+    not list, or a value that is not a positive number: DEFAULT_POINT_SIZE_UM (0.6)."""
+    spots = config.get("spots") if isinstance(config, dict) else None
+    if not isinstance(spots, dict):
+        return DEFAULT_POINT_SIZE_UM
+    section = dict(spots)
+    if table != "spots":
+        name = table[len("spots_"):] if table.startswith("spots_") else table
+        instances = spots.get("instances")
+        found = [i for i in (instances if isinstance(instances, list) else []) if isinstance(i, dict)
+                 and str(i.get("name", "")).strip() == name]
+        if not found:
+            return DEFAULT_POINT_SIZE_UM
+        for key, value in found[0].items():
+            base = section.get(key)
+            section[key] = {**base, **value} if isinstance(value, dict) and isinstance(base, dict) else value
+    if str(section.get("backend") or "spotmax") == "log":
+        log_section = section.get("log")
+        if not isinstance(log_section, dict):
+            log_section = {}
+        size = _size_um(log_section.get("diameter_um", LOG_DIAMETER_DEFAULT_UM))
+    else:
+        radius = _size_um(section.get("spot_radius_um", SPOT_RADIUS_DEFAULT_UM))
+        size = 2.0 * radius if radius is not None else None
+    return size if size is not None else DEFAULT_POINT_SIZE_UM
+
+
 def points_layer(rs: ResultsSet, spacing: tuple[float, float, float], table: str = "spots",
-                 color: str = "yellow") -> LayerData | None:
+                 color: str = "yellow", *, size_um: float | None = None) -> LayerData | None:
     """A spots table as a Points layer in microns (the table's z_um / y_um / x_um are world coordinates;
     the layer gets no scale so it lands on the scaled label and image layers). None without spots.
-    ``table`` is ``spots`` or an extra spot instance's ``spots_<name>``."""
+    ``table`` is ``spots`` or an extra spot instance's ``spots_<name>``. The marker is ``size_um`` when
+    given, else the run's spot size (``spot_marker_size_um`` on ``rs.run_config()``)."""
     spots = rs.table(table)
     if spots is None or not len(spots) or not {"z_um", "y_um", "x_um"} <= set(spots.columns):
         return None
     coords = spots[["z_um", "y_um", "x_um"]].to_numpy(float)
-    size_um = 2.0 * 0.3                       # the RAD-51 spot_radius_um default: a 0.6 um marker
+    if size_um is None:
+        size_um = spot_marker_size_um(rs.run_config(), table)
     kwargs: dict = {
         "name": f"{rs.image_id} {table}",
         "size": size_um,
         "face_color": color,
         "border_color": "black",
-        # napari 0.9: a spot is a 0.6 um sphere; thicken the z slice (right-click the slider) to see
-        # neighbouring planes' spots drawn with the disc a sphere would show
+        # napari 0.9: a spot is a sphere of the run's spot size; thicken the z slice (right-click the slider)
+        # to see neighbouring planes' spots drawn with the disc a sphere would show
         "projection_mode": "rescale_spherical",
         "features": spots.reset_index(drop=True),
         "metadata": {"napari_germquant_results": {"folder": str(rs.folder), "image_id": rs.image_id,
@@ -223,6 +336,8 @@ def spots_image_layer(rs: ResultsSet, spacing: tuple[float, float, float]) -> La
     import tifffile
 
     img = np.asarray(tifffile.imread(str(path)))
+    if img.ndim == 2:
+        img = img[None]                       # a single-plane run's YX image, on its labels' (1, Y, X) grid
     kwargs = {"name": f"{rs.image_id} spots image", "scale": spacing, "visible": False, "blending": "additive",
               "colormap": "yellow",
               "metadata": {"napari_germquant_results": {"folder": str(rs.folder), "image_id": rs.image_id,
@@ -253,11 +368,13 @@ def load_results_layers(rs: ResultsSet, *, include_source: bool = False) -> list
     blob = spots_image_layer(rs, spacing)
     if blob is not None:
         layers.append(blob)
-    pts = points_layer(rs, spacing)
+    config = rs.run_config()                  # read once: the Points size of every spots table comes from it
+    pts = points_layer(rs, spacing, size_um=spot_marker_size_um(config, "spots"))
     if pts is not None:
         layers.append(pts)
     for i, table in enumerate(instance_tables(rs)):
-        extra = points_layer(rs, spacing, table=table, color=INSTANCE_COLORS[i % len(INSTANCE_COLORS)])
+        extra = points_layer(rs, spacing, table=table, color=INSTANCE_COLORS[i % len(INSTANCE_COLORS)],
+                             size_um=spot_marker_size_um(config, table))
         if extra is not None:
             layers.append(extra)
     return layers
