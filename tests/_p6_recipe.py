@@ -157,8 +157,10 @@ def preview_record(bindings: dict, problems=(), *, config_hash="aaaaaaaaaaaa", c
 
 
 def fake_view(root: Path, *, tunables=(), others=(), roles=None, channels=("DAPI", "foci"), images=None,
-              reference=None, config_hash="02bb83cf74f9", validated=None, warnings=(), digest="d0", saved=None):
-    """A RecipeView of a project on the test pack's basic recipe, built by hand."""
+              reference=None, config_hash="02bb83cf74f9", validated=None, warnings=(), digest="d0", saved=None,
+              manifest=None):
+    """A RecipeView of a project on the test pack's basic recipe, built by hand (``manifest``: the manifest as
+    read, by default just the saved stamp)."""
     from napari_germquant._params import RecipeView, Role, Tunable
 
     if roles is None:
@@ -174,4 +176,5 @@ def fake_view(root: Path, *, tunables=(), others=(), roles=None, channels=("DAPI
                                               "record": None},
                       tunables=tun, others=list(others), roles=list(roles), match_by="name", images=images,
                       reference=reference or (images[0]["id"] if images else None), channels=list(channels),
-                      channels_error=None, warnings=list(warnings), digest=digest, saved=saved)
+                      channels_error=None, warnings=list(warnings), digest=digest, saved=saved,
+                      manifest=dict(manifest) if manifest is not None else ({"saved": saved} if saved else {}))

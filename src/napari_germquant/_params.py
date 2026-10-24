@@ -19,6 +19,7 @@ which roles the role editor bound (``recipe.roles``: {role: exact channel name})
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import math
@@ -231,7 +232,9 @@ class RecipeView:
     environment computes it on open (the engine's dry run confirms it), ``validated`` the manifest's record,
     ``digest`` the sha256 of the manifest and the two recipe files (a preview made for another digest is
     stale), ``saved`` the manifest's saved stamp (every write changes it), ``overrides`` the stage switches the
-    project turns off (the manifest's recipe overrides, ``{"spots.enabled": False}``: they enter the hash)."""
+    project turns off (the manifest's recipe overrides, ``{"spots.enabled": False}``: they enter the hash), and
+    ``manifest`` the manifest as read (a host's later reading equal to it holds no write since: the saved stamp
+    alone is to the second, so two writes in one second share it)."""
 
     root: Path
     name: str
@@ -253,6 +256,7 @@ class RecipeView:
     digest: str
     saved: dict | None = None
     overrides: dict = dataclasses.field(default_factory=dict)
+    manifest: dict = dataclasses.field(default_factory=dict)
 
     def role(self, name: str) -> Role:
         for r in self.roles:
@@ -439,7 +443,7 @@ def read_view(root, *, reference: str | None = None) -> RecipeView:
                       reference=chosen["id"] if chosen else None, channels=channels, channels_error=channels_error,
                       warnings=warnings, digest=digest,
                       saved=dict(m["saved"]) if isinstance(m.get("saved"), dict) else None,
-                      overrides=dict((m.get("recipe") or {}).get("overrides") or {}))
+                      overrides=dict((m.get("recipe") or {}).get("overrides") or {}), manifest=copy.deepcopy(m))
 
 
 # ---------------------------------------------------------------------------------------------------

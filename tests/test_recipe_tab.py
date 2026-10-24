@@ -221,5 +221,11 @@ def test_the_tab_follows_the_project_docks_tab_protocol(qtbot, tmp_path):
     tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t2"}}))   # a write elsewhere
     _settle(tab, qtbot)
     assert len(fake.calls) == n + 1 and tab.view.saved == {"at": "t2"}
+    # a write elsewhere in the same second (the saved stamp is to the second): its manifest differs all the same
+    tuned = {"saved": {"at": "t2"}, "recipe": {"origins": {"spots.log.min_snr": "tuning"}}}
+    views.append(fake_view(tmp_path, saved={"at": "t2"}, digest="d3", manifest=tuned))
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest=dict(tuned)))
+    _settle(tab, qtbot)
+    assert len(fake.calls) == n + 2 and tab.view.manifest == tuned
     tab.project_changed(None)
     assert tab.root is None and tab.view is None

@@ -1252,9 +1252,9 @@ class RecipeProjectTab(RecipeTab):
         if self.root is None or Path(root) != self.root:
             self.set_project(root)
             return
-        saved = (getattr(state, "manifest", None) or {}).get("saved")
-        if self._view is not None and saved == self._view.saved:
-            return                             # read again with no write since this tab's own reading
+        manifest = getattr(state, "manifest", None)
+        if self._view is not None and isinstance(manifest, dict) and manifest == self._view.manifest:
+            return                             # the manifest this tab read last: no write since (dicts, no file read)
         if self._want_load is None:
             self._request_load(keep=True)      # another write (the dock's, a tuning Apply): the recipe again
 
