@@ -104,6 +104,12 @@ def _decimals(t: _params.Tunable) -> int:
     return min(6, need)
 
 
+def _step_decimals(step: float) -> int:
+    """The decimals a spin box needs to move by ``step`` (a step finer than its decimals does nothing)."""
+    text = f"{step:.10f}".rstrip("0")
+    return len(text.split(".", 1)[1]) if "." in text else 0
+
+
 def _step(t: _params.Tunable) -> float:
     if t.lo is not None and t.hi is not None and t.hi > t.lo:
         span = float(t.hi - t.lo) / 100.0
@@ -540,9 +546,10 @@ class RecipeTab(QWidget):
             return None
         if t.type == "float":
             w = QDoubleSpinBox()
-            w.setDecimals(_decimals(t))
+            step = _step(t)
+            w.setDecimals(max(_decimals(t), _step_decimals(step)))
             w.setRange(float(t.lo) if t.lo is not None else -FLOAT_LIMIT, float(t.hi) if t.hi is not None else FLOAT_LIMIT)
-            w.setSingleStep(_step(t))
+            w.setSingleStep(step)
             if t.unit:
                 w.setSuffix(f" {t.unit}")
             w.valueChanged.connect(lambda _v, key=t.key: self._on_widget(key))

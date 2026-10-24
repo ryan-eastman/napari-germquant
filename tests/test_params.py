@@ -384,6 +384,19 @@ def test_values_the_widgets_cannot_show_are_named(qtbot, tmp_path):
     _settle(tab, qtbot)
 
 
+def test_a_fine_step_gets_the_decimals_it_needs(qtbot, tmp_path):
+    """A float declared on a narrow range steps by a hundredth of it: the spin box shows the decimals its step
+    needs, so a step up moves the value (review N5)."""
+    view = fake_view(tmp_path, tunables=[({"key": "a.float", "type": "float", "min": 0, "max": 0.1}, 0.05, 0.05,
+                                          None)])
+    tab, fake, _ = _form_tab(qtbot, tmp_path, views=[view])
+    box = tab.form_rows["a.float"].widget
+    assert box.singleStep() == pytest.approx(0.001) and box.decimals() == 3
+    box.stepUp()
+    assert box.value() == pytest.approx(0.051) and tab.pending() == {"a.float": pytest.approx(0.051)}
+    _settle(tab, qtbot)
+
+
 def test_a_refused_form_preview_keeps_apply_off(qtbot, tmp_path):
     def answer(kw):
         if kw.get("edits"):
