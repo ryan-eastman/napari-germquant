@@ -184,10 +184,10 @@ def test_truth_points_round_trip_on_the_runs_grid(make_napari_viewer, qtbot, tpr
     assert np.allclose(again.data, truth.data) and w2.projected_check.isChecked()
     # a single plane: one plane of labels, voxel_dz_um NaN, the done marker's planar extra
     plane = tproj / "plane"
-    src = write_source(plane / "images" / "img_p.ome.tif", shape=(1, 32, 48))
+    flat_nuclei = ((1, 0, 10, 12, 6), (2, 0, 20, 34, 7))
+    src = write_source(plane / "images" / "img_p.ome.tif", shape=(1, 32, 48), nuclei=flat_nuclei)
     write_project(plane, [image_entry("img_p", "images/img_p.ome.tif")])
-    write_finished_run(plane, "img_p", src, planar=True, labels=run_labels(shape=(1, 32, 48),
-                       nuclei=((1, 0, 10, 12, 6), (2, 0, 20, 34, 7))))
+    write_finished_run(plane, "img_p", src, planar=True, labels=run_labels(shape=(1, 32, 48), nuclei=flat_nuclei))
     w3 = SpotTuningWidget(viewer, session=StaticSession(FakeTuneRunner()))
     qtbot.addWidget(w3)
     w3.set_annotator("tester")
@@ -217,13 +217,15 @@ def test_the_count_line_names_the_detections_the_grid_means(qtbot, tproj):
     assert "spots.log.min_snr" in w.grid_label.text() and "default" in w.grid_label.text()
     grid = tproj / "grid.yaml"
     grid.write_text("spots.log.min_snr: [2, 3]\nspots.log.diameter_um: [0.4, 0.5]\n", encoding="ascii")
-    w.set_grid_file(grid)
+    w.set_grid_file(grid)                             # the file is read in the dock's file worker
+    _settle(qtbot, w)
     assert "4 LoG detections on 1 annotated image" in w.count_label.text()
     w.set_max_runs(3)
     assert "above Max runs 3" in w.count_label.text()
     bad = tproj / "bad.yaml"
     bad.write_text("spots.backend: [log]\n", encoding="ascii")
     w.set_grid_file(bad)
+    _settle(qtbot, w)
     assert "never tuned" in w.count_label.text()
     # a SpotMAX recipe: one run per image for every effect-size minimum
     write_finished_run(tproj, "img_b", tproj / "images" / "img_b.ome.tif", backend="spotmax")
@@ -231,6 +233,7 @@ def test_the_count_line_names_the_detections_the_grid_means(qtbot, tproj):
         "point_id,z_um,y_um,x_um,zi,yi,xi,object_id,projected\n0,1.0,2.0,2.4,2,10,12,1,false\n", encoding="ascii")
     write_finished_run(tproj, "img_a", tproj / "images" / "img_a.ome.tif", backend="spotmax")
     w.set_grid_file(None)
+    _settle(qtbot, w)
     w.set_max_runs(50)
     w.refresh()
     _settle(qtbot, w)

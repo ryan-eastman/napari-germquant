@@ -110,18 +110,18 @@ def source_stack(shape=SHAPE, nuclei=NUCLEI, spacing=SPACING) -> np.ndarray:
     for _lab, cz, cy, cx, r in nuclei:
         d2 = ((zz - cz) * dz / dy) ** 2 + (yy - cy) ** 2 + (xx - cx) ** 2
         dna[d2 <= r * r] = 1000
-        foci[int(round(cz)), int(cy), int(cx)] = 4000
+        foci[min(int(round(cz)), shape[0] - 1), int(cy), int(cx)] = 4000
     return np.stack([dna, foci], axis=0)
 
 
-def write_source(path, *, shape=SHAPE, spacing=SPACING) -> Path:
+def write_source(path, *, shape=SHAPE, spacing=SPACING, nuclei=NUCLEI) -> Path:
     """A two-channel OME-TIFF (dna, foci) as a microscope export would hold it."""
     import tifffile
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     dz, dy, dx = spacing
-    tifffile.imwrite(str(path), source_stack(shape, spacing=spacing), ome=True, photometric="minisblack",
+    tifffile.imwrite(str(path), source_stack(shape, nuclei, spacing), ome=True, photometric="minisblack",
                      metadata={"axes": "CZYX", "PhysicalSizeX": dx, "PhysicalSizeXUnit": UM, "PhysicalSizeY": dy,
                                "PhysicalSizeYUnit": UM, "PhysicalSizeZ": dz, "PhysicalSizeZUnit": UM,
                                "Channel": {"Name": ["dna", "foci"]}})
@@ -149,7 +149,7 @@ def write_finished_run(root, image_id: str, source, *, config_hash: str = BASE_H
     out = Path(root) / "results" / image_id
     out.mkdir(parents=True, exist_ok=True)
     lab = run_labels(xy_stride=xy_stride, z_range=z_range, spacing=spacing) if labels is None else labels
-    tifffile.imwrite(str(out / f"{image_id}__nuclei_labels.tif"), lab.astype(np.int32))
+    tifffile.imwrite(str(out / f"{image_id}__nuclei_labels.tif"), lab.astype(np.int32), photometric="minisblack")
     dz, dy, dx = spacing
     rdz, rdy, rdx = (float("nan") if planar else dz), dy * xy_stride, dx * xy_stride
     n = int(lab.max())

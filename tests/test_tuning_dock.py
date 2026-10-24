@@ -31,7 +31,6 @@ from _p6_tune import (
     read_manifest,
     standard_project,
     write_finished_run,
-    write_source,
     write_tuning_run,
 )
 
