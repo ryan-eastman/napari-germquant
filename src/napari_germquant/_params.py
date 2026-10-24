@@ -24,6 +24,7 @@ import hashlib
 import math
 import numbers
 import os
+import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -55,8 +56,9 @@ MANIFEST_NAME = "germquant_project.yaml"
 # the recipe key that names the role editor's channel_map.yaml; `project edit --unset io.channel_map` drops every
 # role edit (docs/PROJECTS.md), with no role preview, so no role problem refuses it
 CHANNEL_MAP_KEY = "io.channel_map"
-# the preview cell states, worst first: a collision and a required role unbound block Apply (red); the index
-# fallback is amber (the run flags it); an optional role unbound and a name match are plain
+# the preview cell states, worst first: a collision and a required role unbound block Apply (red: both are the
+# engine's problems); the index fallback is amber (the run flags it); an optional role unbound and a name match are
+# plain
 STATES = ("collision", "missing", "index", "unbound", "name")
 HOW_TEXT = {"name": "by name", "index": "by index", "unbound": "unbound"}
 
@@ -478,26 +480,44 @@ def form_change(tunables, pending: dict) -> tuple[dict, list[str]]:
     return edits, unset
 
 
+# the engine's problem for two roles on one channel (project/recipe.py bindings): "image <id>: the roles <a> and
+# <b> bind the same channel <index> (<name>)"
+_COLLISION = re.compile(r"the roles (?P<a>.+?) and (?P<b>.+?) bind the same channel \d")
+
+
+def collision_roles(problems, image_id) -> set[str]:
+    """The roles that the engine's problems say bind one channel of ``image_id`` (it judges by channel index, so
+    two channels that share a name are no collision)."""
+    prefix = f"image {image_id}: "
+    out: set[str] = set()
+    for p in problems or ():
+        text = str(p)
+        if text.startswith(prefix):
+            m = _COLLISION.match(text, len(prefix))
+            if m:
+                out.update(m.group("a", "b"))
+    return out
+
+
 def preview_states(record: dict | None, roles) -> dict[str, dict[str, str]]:
     """``{image_id: {role: state}}`` of a dry run's role preview: name, index, unbound (an optional role), missing
-    (a required role unbound) or collision (two roles bound to one channel of that image)."""
+    (a required role unbound) or collision (two roles on one channel of that image, as the engine's problems name
+    them: never judged here by channel names, which two channels may share)."""
     preview = (record or {}).get("preview") or {}
+    problems = [str(p) for p in preview.get("problems") or []]
     required = {r.role: r.required for r in roles}
     out: dict[str, dict[str, str]] = {}
     for image_id, binds in (preview.get("bindings") or {}).items():
         row: dict[str, str] = {}
-        seen: dict[str, list[str]] = {}
         for role, b in (binds or {}).items():
             how = str((b or {}).get("how") or "unbound")
             if how == "unbound" or (b or {}).get("channel") is None:
                 row[role] = "missing" if required.get(role) else "unbound"
             else:
                 row[role] = "index" if how == "index" else "name"
-                seen.setdefault(str(b["channel"]), []).append(role)
-        for members in seen.values():
-            if len(members) > 1:
-                for role in members:
-                    row[role] = "collision"
+        for role in collision_roles(problems, image_id):
+            if role in row:
+                row[role] = "collision"
         out[str(image_id)] = row
     return out
 

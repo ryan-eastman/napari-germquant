@@ -356,6 +356,30 @@ def test_the_role_editor_sends_every_role_and_shows_the_engines_preview(qtbot, t
     assert not tab.apply_roles_btn.isEnabled()
 
 
+def test_collisions_are_the_engines_not_shared_names(qtbot, tmp_path):
+    """Two roles bound to two channels that share a name are no collision: the engine judges by channel index and
+    reports none, so the cells are not red (review N4). A collision the engine reports is red on the roles it
+    names, on that image only."""
+    from napari_germquant._params import collision_roles, preview_states
+
+    roles = fake_view(tmp_path).roles
+    same_name = {"img1": {"dna": {"channel": "Cy5", "how": "index"}, "foci": {"channel": "Cy5", "how": "index"}}}
+    assert preview_states(preview_record(same_name), roles) == {"img1": {"dna": "index", "foci": "index"}}
+    clash = {**_bind(foci=("DAPI", "name")), **_bind(image="img2")}
+    rec = preview_record(clash, ["image img1: the roles dna and foci bind the same channel 0 (DAPI)"])
+    assert preview_states(rec, roles) == {"img1": {"dna": "collision", "foci": "collision"},
+                                          "img2": {"dna": "name", "foci": "name"}}
+    assert collision_roles(["image img10: the roles dna and foci bind the same channel 0 (DAPI)"], "img1") == set()
+    assert collision_roles(["image img1: the required role dna binds no channel"], "img1") == set()
+
+    fake = FakeRunner(lambda kw: preview_record(same_name, changed=False, config_hash=PACK_HASH))
+    tab = _tab(qtbot, tmp_path, session=FakeSession(fake),
+               reader=lambda root, reference=None: fake_view(tmp_path, channels=("Cy5", "Cy5")))
+    assert tab.preview_states() == {"img1": {"dna": "index", "foci": "index"}}
+    assert [tab.preview_table.item(0, c).background().color() for c in (1, 2)] == [AMBER, AMBER]
+    assert tab.role_problems == [] and tab.problems_label.text() == ""
+
+
 def test_a_choice_the_pack_map_already_names_is_no_role_change(qtbot, tmp_path):
     """A role choice that the pack map's role already names, alone, is no edit by the engine's rule (its dry run
     says changed: false, with the same config_hash): the tab says so and keeps Apply off, instead of a write that
