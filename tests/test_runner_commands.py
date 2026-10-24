@@ -441,7 +441,8 @@ def test_a_missing_entry_is_named_and_add_keeps_its_record_on_exit_1(tmp_path):
 def test_the_engines_answers_to_refusals_partial_adds_and_a_lock_that_is_not_there(tmp_path):
     """As the project command line answers: exit 2 is a refusal whose reason is the engine's REFUSED line (or the
     error of its JSON record); new and add exit 1 with their record when some files were refused; unlock exits 0
-    when there was no lock, and that is no removal. A revert with edits is refused before anything starts."""
+    when there was no lock, and that is no removal, and exit 2 when someone else holds it, which is a refusal as
+    for every other command. A revert with edits is refused before anything starts."""
     own = plugin_engine_info()
     version = MIN if engine_too_old(str(own["germquant"])) else str(own["germquant"])
     root = standin_engine(tmp_path / "eng", version=version, git_sha=str(own["git_sha"]),
@@ -470,6 +471,11 @@ def test_the_engines_answers_to_refusals_partial_adds_and_a_lock_that_is_not_the
     gone = runner(FAKE_ENGINE_STDOUT="the project is not locked")
     assert gone.project_unlock(P, host="h", pid=1)["removed"] is False
     assert runner(FAKE_ENGINE_STDOUT="removed the lock of h pid 1").project_unlock(P, host="h", pid=1)["removed"]
+    held = runner(FAKE_ENGINE_EXIT="2", FAKE_ENGINE_STDERR="REFUSED: the lock of P is held by h pid 2, not by h pid 1")
+    with pytest.raises(EngineRefused) as e:
+        held.project_unlock(P, host="h", pid=1)
+    assert str(e.value) == ("`germquant.project unlock` was refused by the engine (exit 2):\n"
+                            "REFUSED: the lock of P is held by h pid 2, not by h pid 1") and e.value.exit_code == 2
     n = len(gone.history)
     with pytest.raises(ValueError, match="a revert cannot be combined"):
         gone.project_edit(P, revert=True, roles={"foci": "x"})
@@ -478,6 +484,56 @@ def test_the_engines_answers_to_refusals_partial_adds_and_a_lock_that_is_not_the
     plain.project_edit(P, z_range="none", device="none")
     assert plain.history[-1][3:] == ["edit", P, "--device", "none", "--z-range", "none", "--plugin-version",
                                      plugin_version(), "--json"]
+
+
+def test_each_engine_refusal_form_reads_as_a_refusal_with_its_reason(tmp_path):
+    """The refusal forms of the Train B commands, each read as EngineRefused whose reason is the engine's own
+    words, not the whole output: REFUSED: (the project commands, train-curve), ERROR: (tune-spots), refused:
+    lines and a {"written": false, "problems"} record over many lines (post_stages write), an indented
+    {"error"} record alone, and pack derive's exit 1 with a REFUSED line; a crash of derive (exit 1, no reason)
+    stays an error. A tune-spots search that scored nothing (exit 1) keeps its record."""
+    own = plugin_engine_info()
+    version = MIN if engine_too_old(str(own["germquant"])) else str(own["germquant"])
+    root = standin_engine(tmp_path / "eng", version=version, git_sha=str(own["git_sha"]),
+                          features=list(_engine.FEATURES))
+    P = str(tmp_path / "proj")
+
+    def runner(**env) -> SubprocessRunner:
+        return SubprocessRunner(sys.executable, env={"PYTHONPATH": str(root), **env})
+
+    def reason(call, **env) -> EngineRefused:
+        with pytest.raises(EngineRefused) as e:
+            call(runner(**env))
+        return e.value
+
+    e = reason(lambda r: r.tune_spots(P), FAKE_ENGINE_EXIT="2",
+               FAKE_ENGINE_STDERR="ERROR: cannot open the project P: ProjectError: no project")
+    assert str(e) == ("`germquant tune-spots` was refused by the engine (exit 2):\n"
+                      "ERROR: cannot open the project P: ProjectError: no project")
+    problems = ["fixture_post: radius_um 9.0 is above its max 5.0", "no_such: not installed in this environment"]
+    record = json.dumps({"written": False, "problems": problems}, indent=1)
+    write = lambda r: r.write_post_stages(P, [{"name": "fixture_post", "params": {"radius_um": 9.0}}])  # noqa: E731
+    e = reason(write, FAKE_ENGINE_EXIT="2", FAKE_ENGINE_STDOUT=record)
+    assert str(e).splitlines()[1:] == [f"REFUSED: {p}" for p in problems]
+    e = reason(write, FAKE_ENGINE_EXIT="2", FAKE_ENGINE_STDOUT=record,
+               FAKE_ENGINE_STDERR="\n".join(f"refused: {p}" for p in problems))
+    assert str(e).splitlines()[1:] == [f"refused: {p}" for p in problems]
+    e = reason(lambda r: r.project_edit(P, z_range=(5, 2)), FAKE_ENGINE_EXIT="2",
+               FAKE_ENGINE_STDOUT=json.dumps({"error": "z range [5, 2] must be two planes", "kind": "ProjectError"},
+                                             indent=1))
+    assert str(e).endswith("\nREFUSED: z range [5, 2] must be two planes")
+    derive = lambda r: r.pack_derive("test_pack@0.1.0", "basic", "m", "m.card.json", "out")  # noqa: E731
+    e = reason(derive, FAKE_ENGINE_EXIT="1", FAKE_ENGINE_STDERR="REFUSED: the card names no base model",
+               FAKE_ENGINE_STDOUT=json.dumps({"ok": False, "error": "the card names no base model"}, indent=1))
+    assert e.exit_code == 1 and str(e) == ("`germquant.packs derive` was refused by the engine (exit 1):\n"
+                                           "REFUSED: the card names no base model")
+    with pytest.raises(RunnerError, match=r"`germquant.packs derive` failed \(exit 1\)") as crash:
+        derive(runner(FAKE_ENGINE_EXIT="1", FAKE_ENGINE_STDERR="Traceback (most recent call last):"))
+    assert not isinstance(crash.value, EngineRefused)
+    scored_nothing = {"run_dir": "tuning/t1", "best": None, "ranked": [], "warnings": ["no truth points scored"]}
+    t = runner(FAKE_ENGINE_EXIT="1", FAKE_ENGINE_STDOUT=json.dumps(scored_nothing, indent=1),
+               FAKE_ENGINE_STDERR="ERROR: no parameter set could be scored; see the warnings and docs/TUNING.md")
+    assert t.tune_spots(P) == scored_nothing
 
 
 def test_an_in_process_edit_means_what_the_command_means(project_env, monkeypatch):

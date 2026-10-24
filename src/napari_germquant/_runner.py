@@ -42,7 +42,9 @@ for the streamed lines. Through the subprocess runner:
   log of its own for project runs. Exit codes: 0 every image done or skipped, 1 some images failed (a result,
   not an error of the call), 2 refused before any image, with the reason and fix the engine printed
   (``state_for_exit``, ``run_outcome``).
-* A command exits 2 when the engine refuses it: EngineRefused, with what it printed.
+* A command exits 2 when the engine refuses it: EngineRefused, with what it printed (the reason is the engine's
+  REFUSED: or ERROR: lines, or the error or problems of its JSON record). ``pack derive`` refuses with exit 1
+  and a REFUSED line, which is EngineRefused too.
 
 The in-process runner calls the same commands through germquant.api (and germquant.segment.training for the
 training commands), passing the project explicitly (napari's thread workers start with no pack context).
@@ -737,7 +739,8 @@ class EngineRunner:
         raise NotImplementedError
 
     def project_unlock(self, root, *, host: str, pid: int, should_stop=None) -> dict:
-        """``project unlock``: ``removed`` (whether a lock of that host and pid was there and is gone)."""
+        """``project unlock``: ``removed`` (whether a lock of that host and pid was there and is gone; False when
+        the project was not locked). A lock someone else holds is refused: EngineRefused with the holder."""
         raise NotImplementedError
 
     def project_run(self, root, *, images=None, resume: bool = True, device: str | None = None,
@@ -788,7 +791,8 @@ class EngineRunner:
 
     def tune_spots(self, project, *, points=None, grid=None, max_runs: int | None = None, out=None, say=None,
                    should_stop=None) -> dict:
-        """``tune-spots``: ``{"run_dir", "best", "ranked"}``."""
+        """``tune-spots``: ``{"run_dir", "best", "ranked", "warnings"}``, also when the search ran but nothing
+        could be scored (the command's exit 1: ``best`` is None and the warnings say why)."""
         raise NotImplementedError
 
     def tune_apply(self, project, run_dir, *, plugin_version: str | None = None, should_stop=None) -> dict:
@@ -825,20 +829,35 @@ def _check_round(new) -> None:
         raise ValueError(f"not a round name: {new!r} (letters, digits, dash and underscore, at most 40)")
 
 
-def _refusal_reason(lines: list[str]) -> str:
-    """The reason a refused command gave: its "REFUSED: ..." lines, else the ``error`` of a JSON record."""
-    refused = [ln.strip() for ln in lines if ln.strip().startswith("REFUSED:")]
-    if refused:
-        return "\n".join(dict.fromkeys(refused))
+# the lines in which an engine command says why it refused (any case): REFUSED: (the project commands, pack
+# derive, train-curve), ERROR: (tune-spots), refused: (post_stages write)
+_REASON_PREFIXES = ("refused:", "error:")
+
+
+def _refusal_reason(lines: list[str], stdout: str | None = None) -> str:
+    """The reason a refused command gave: its REFUSED: or ERROR: lines (any case), else the ``error`` (or the
+    ``problems``) of the JSON record it printed: the whole of ``stdout`` (an indented record over many lines)
+    or a one-line record among ``lines``. An empty string when it gave none."""
+    said = [ln.strip() for ln in lines if ln.strip().lower().startswith(_REASON_PREFIXES)]
+    if said:
+        return "\n".join(dict.fromkeys(said))
+    docs = []
+    if stdout and stdout.strip():
+        with contextlib.suppress(RunnerError):
+            docs.append(_parse_json(stdout))
     for ln in lines:
         s = ln.strip()
-        if s.startswith("{") and '"error"' in s:
-            try:
-                doc = json.loads(s)
-            except ValueError:
-                continue
-            if isinstance(doc, dict) and doc.get("error"):
-                return f"REFUSED: {doc['error']}"
+        if s.startswith("{") and ('"error"' in s or '"problems"' in s):
+            with contextlib.suppress(ValueError):
+                docs.append(json.loads(s))
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        if doc.get("error"):
+            return f"REFUSED: {doc['error']}"
+        problems = doc.get("problems")
+        if isinstance(problems, list) and problems:
+            return "\n".join(f"REFUSED: {p}" for p in problems)
     return ""
 
 
@@ -1635,10 +1654,10 @@ class SubprocessRunner(EngineRunner):
             self.require(*features, should_stop=should_stop)
 
     def _command_json(self, argv: list[str], *, say=None, should_stop=None, extra_env: dict | None = None,
-                      ok=(0,)):
+                      ok=(0,), refusal_codes=()):
         """Run a ``--json`` command without a time limit (it is cancelled instead): its JSON document. Its
-        stderr lines (the engine's log) go to ``say``. Exit 2: EngineRefused with what it printed; any other
-        code not in ``ok``: RunnerError."""
+        stderr lines (the engine's log) go to ``say``. Exit 2 (or a code of ``refusal_codes`` with a reason):
+        EngineRefused with what it printed; any other code not in ``ok``: RunnerError."""
         rc, out, err = self._run_proc(argv, say=say, say_streams=("err",), should_stop=should_stop,
                                       extra_env=extra_env)
         if rc in ok:
@@ -1647,7 +1666,8 @@ class SubprocessRunner(EngineRunner):
             except RunnerError:
                 if rc == 0:
                     raise
-        self._check_exit(argv, rc, out + err)         # a code in ok without a record is an error after all
+        # a code in ok without a record is an error after all
+        self._check_exit(argv, rc, out + err, stdout="\n".join(out), refusal_codes=refusal_codes)
         raise RunnerError(f"`{_command_name(argv)}` exited with code {rc} and no record")
 
     def _entry_missing(self, text: str) -> None:
@@ -1666,16 +1686,22 @@ class SubprocessRunner(EngineRunner):
                                          tick=tick)
         return rc, lines
 
-    def _check_exit(self, argv: list[str], rc: int, lines: list[str], ok=(0,)) -> None:
+    def _check_exit(self, argv: list[str], rc: int, lines: list[str], ok=(0,), *, stdout: str | None = None,
+                    refusal_codes=()) -> None:
+        """Nothing for a code in ``ok``. Exit 2 is the engine's refusal, EngineRefused with its reason (the
+        REFUSED: or ERROR: lines, or the error or problems of its JSON record, ``stdout``); so is a code of
+        ``refusal_codes`` when the engine gave a reason (pack derive refuses with exit 1). Anything else is a
+        RunnerError with the end of what it printed."""
         if rc in ok:
             return
         text = "\n".join(lines)
         self._entry_missing(text)
         self._module_missing(text)
         what = _command_name(argv)
-        if rc == 2:
-            reason = _refusal_reason(lines) or _tail(text, 2500)
-            raise EngineRefused(f"`{what}` was refused by the engine (exit 2):\n{reason}", output=text)
+        reason = _refusal_reason(lines, stdout)
+        if rc == 2 or (rc in refusal_codes and reason):
+            raise EngineRefused(f"`{what}` was refused by the engine (exit {rc}):\n{reason or _tail(text, 2500)}",
+                                output=text, exit_code=rc)
         raise RunnerError(f"`{what}` failed (exit {rc}) in {self.python}:\n{_tail(text, 2500)}")
 
     def _lines_result(self, argv, rc, lines) -> dict:
@@ -1759,9 +1785,9 @@ class SubprocessRunner(EngineRunner):
         self._start(should_stop, "projects")
         argv = self.project_argv("unlock", root, "--host", host, "--pid", int(pid))
         rc, lines = self._command_lines(argv, should_stop=should_stop)
-        if rc not in (0, 1, 2):
-            self._check_exit(argv, rc, lines)
-        removed = rc == 0 and not any("not locked" in line for line in lines)
+        # exit 2 (a lock someone else holds, a folder that is no project): EngineRefused with the engine's reason
+        self._check_exit(argv, rc, lines)
+        removed = not any("not locked" in line for line in lines)
         return {"removed": removed, "exit_code": rc, "lines": lines}
 
     # -- the full command line
@@ -1905,7 +1931,8 @@ class SubprocessRunner(EngineRunner):
             args += ["--max-runs", int(max_runs)]
         if out is not None:
             args += ["--out", out]
-        return self._command_json(self.engine_argv(*args, "--json"), say=say, should_stop=should_stop)
+        # exit 1 with its record: the search ran but nothing could be scored (best None, the warnings say why)
+        return self._command_json(self.engine_argv(*args, "--json"), say=say, should_stop=should_stop, ok=(0, 1))
 
     def tune_apply(self, project, run_dir, *, plugin_version=None, should_stop=None) -> dict:
         """``tune-spots --project DIR --apply tuning/<run>`` (the engine stamps its own write)."""
@@ -1924,7 +1951,8 @@ class SubprocessRunner(EngineRunner):
                       out]
         if new_id:
             args += ["--id", new_id]
-        return self._command_json(self.packs_argv(*args, "--json"), should_stop=should_stop)
+        # pack derive refuses with exit 1 and a REFUSED line ({"ok": false, "error"} with --json): EngineRefused
+        return self._command_json(self.packs_argv(*args, "--json"), should_stop=should_stop, refusal_codes=(1,))
 
     # -- the torch-free post-stage entry
     def list_post_stages(self, *, should_stop=None) -> list:
