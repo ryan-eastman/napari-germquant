@@ -694,6 +694,19 @@ def test_sample_edits_need_a_sheet_writer_and_never_block_a_run(qtbot, tmp_path,
     settle(w, qtbot)
     assert w.last_result["state"] == "done" and not written and fake.called("project_run")
     assert "sample edits were not written" in w.run_label.text() and w.samples.dirty
+    # the engine loses the sample sheet between the reading and the write (another engine chosen): Save writes the
+    # settings all the same and says the sheet was not written; the edits stay for a later Save
+    monkeypatch.setattr(_project, "sheet_module", lambda: _stand_in_sheet(written))
+    w.reload()
+    settle(w, qtbot)
+    assert w.state.sheet_problem is None and w.samples.dirty
+    fake._features = frozenset(f for f in _engine.FEATURES if f != "sample_sheet")
+    w.set_xy_stride(2)
+    assert w.save()
+    settle(w, qtbot)
+    assert w.last_error is None, w.last_error
+    assert read_manifest(root)["run"]["xy_stride"] == 2 and not written and w.samples.dirty
+    assert "the sample sheet was not written" in w.status_label.text() and w.state.sheet_problem
 
 
 def test_a_new_project_opens_when_this_computers_settings_cannot_be_recorded(qtbot, tmp_path):
