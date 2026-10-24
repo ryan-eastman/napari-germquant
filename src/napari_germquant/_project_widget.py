@@ -1101,8 +1101,8 @@ class ProjectWidget(QWidget):
             if refused:
                 self.refused_label.setText("\n".join(f"not added: {r.get('path')}: {r.get('reason')}" for r in refused))
             warn = [str(w) for w in rec.get("warnings") or []]
-            self._message(f"made the project {root} ({state.pack_ref} {state.recipe_id})"
-                          + ("; " + "; ".join(warn) if warn else ""), AMBER if refused or warn else GREEN)
+            self._done(f"made the project {root} ({state.pack_ref} {state.recipe_id})"
+                       + ("; " + "; ".join(warn) if warn else ""), state, AMBER if refused or warn else GREEN)
 
         self._submit("new", job, f"making the project {root}", done)
 
@@ -1176,7 +1176,7 @@ class ProjectWidget(QWidget):
             if samples is not None:
                 samples.mark_saved()
             self._opened(state, fresh=False)
-            self._message(f"saved {root}", GREEN)
+            self._done(f"saved {root}", state)
 
         self._submit("save", job, f"saving {root}", done)
         return True
@@ -1220,7 +1220,7 @@ class ProjectWidget(QWidget):
             rec, state = res
             if state is not None:
                 self._opened(state, fresh=False)
-                self._message(f"recorded the edit: config_hash {rec.get('config_hash')}", GREEN)
+                self._done(f"recorded the edit: config_hash {rec.get('config_hash')}", state)
             if on_done is not None:
                 on_done(rec)
 
@@ -1262,8 +1262,8 @@ class ProjectWidget(QWidget):
             refused = rec.get("refused") or []
             self.refused_label.setText("\n".join(f"not added: {r.get('path')}: {r.get('reason')}" for r in refused))
             added = rec.get("added") or []
-            self._message(f"added {len(added)} image(s)" + (f"; {len(refused)} refused (named above the board)"
-                                                            if refused else ""), AMBER if refused else GREEN)
+            self._done(f"added {len(added)} image(s)" + (f"; {len(refused)} refused (named in the Images tab)"
+                                                         if refused else ""), state, AMBER if refused else GREEN)
             self._show_images()
 
         self._submit("add", job, f"adding {len(paths)} path(s) to {root}", done)
@@ -1613,8 +1613,8 @@ class ProjectWidget(QWidget):
         def done(res):
             rec, state = res
             self._opened(state, fresh=False)
-            self._message(f"removed the lock of {host} (pid {pid})" if rec.get("removed") else
-                          "the project was not locked any more", GREEN)
+            self._done(f"removed the lock of {host} (pid {pid})" if rec.get("removed") else
+                       "the project was not locked any more", state)
 
         self._submit("unlock", job, f"removing the lock of {host} pid {pid}", done)
         return True
@@ -1682,6 +1682,14 @@ class ProjectWidget(QWidget):
     def _message(self, text: str, color: QColor | None) -> None:
         self.status_label.setText(text)
         self.status_label.setStyleSheet(css(color))
+
+    def _done(self, text: str, state: ProjectState, color: QColor | None = GREEN) -> None:
+        """A write's message, naming a status the engine could not give (the board then shows unknown)."""
+        if state.status_error is not None:
+            reason = _error_text(state.status_error).strip().splitlines()
+            text += f"; the engine gave no status, so the board shows the manifest's images: {reason[0] if reason else ''}"
+            color = AMBER
+        self._message(text, color)
 
     def _show_project(self) -> None:
         st = self._state
