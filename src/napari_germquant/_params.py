@@ -341,13 +341,10 @@ def image_path(root: Path, stored: str) -> Path:
 
 def header_channels(path: Path) -> list[str]:
     """The channel names of an image, read with the engine's light header reader (germquant.project.headers, the
-    reader the engine's role preview uses), else germquant.api's."""
-    try:
-        from germquant.project.headers import read_header
-    except ImportError:
-        from germquant import api
+    reader the engine's role preview uses; no bioio, D28). read_view calls it only after germquant.project has
+    imported, which ships with headers."""
+    from germquant.project.headers import read_header
 
-        return [str(n) for n in api.read_image_metadata(path).get("channel_names") or []]
     return [str(n) for n in read_header(path).get("channel_names") or []]
 
 
