@@ -5,9 +5,17 @@ OME-TIFF, CZI, LIF and OME-Zarr), so the pixels napari shows are the pixels the 
 header is read first (``api.read_image_metadata``, no pixels) and a file with more than one time point,
 position or scene is refused with a message that says what to do: the engine's reader would silently take
 index 0, which is the wrong thing to show someone who dropped a 56 GB time-lapse on the viewer.
+
+A single plane (docs/DESIGN_system_packs.md 4.10 and 8.8): a one-plane file has no z step, so the engine's
+(dz, dy, dx) rule reports its spacing as unreadable even when the file states its pixel size. From tranche 5
+package P2b on, the engine's reader keeps that pixel size as ``Stack.spacing_yx``; a one-plane stack that has
+it is shown at (1.0, dy, dx), the z step the engine's planar mode uses too (PLANAR_DZ), so the image sits on
+the same grid as the labels of a planar run. ``header_spacing_text`` is the voxel line of a header for the
+docks: "single plane, voxel um dy=.. dx=.." for such a file.
 """
 from __future__ import annotations
 
+import math
 import warnings
 from pathlib import Path
 
@@ -22,6 +30,12 @@ META_KEY = "napari_germquant"
 
 # one colormap per channel position (DAPI grey, then the common two-colour panel); cycles past six
 COLORMAPS = ("gray", "green", "magenta", "cyan", "yellow", "red")
+
+# the z step of a single plane's layers: the placeholder the engine's planar mode gives array code
+# (germquant.planar.PLANAR_DZ, docs/DESIGN_system_packs.md 4.3); one plane has no real z extent
+PLANAR_DZ_UM = 1.0
+
+UNREADABLE_TEXT = "voxel size UNREADABLE (1 um assumed)"
 
 
 def napari_get_reader(path):
@@ -63,25 +77,60 @@ def check_single_timepoint(path: str | Path, meta: dict) -> None:
             f"file into one scene per image and open those.")
 
 
-def open_image(path: str | Path, xy_stride: int = 1) -> list[LayerData]:
+def open_image(path: str | Path, xy_stride: int = 1, *, scale=None) -> list[LayerData]:
     """Header check, then the pixels through ``api.read_image``; ``xy_stride`` keeps every n-th pixel in
-    y and x (and scales the layer accordingly), for a quick look at a 3 GB gonad on a laptop."""
+    y and x (and scales the layer accordingly), for a quick look at a 3 GB gonad on a laptop. ``scale``, a
+    grid of the caller's: see layers_from_stack."""
     path = Path(path)
     meta = api.read_image_metadata(path)
     check_single_timepoint(path, meta)
     stack = api.read_image(path, xy_stride=int(xy_stride))
-    return layers_from_stack(stack, path, meta)
+    return layers_from_stack(stack, path, meta, scale=scale)
 
 
-def layers_from_stack(stack, path: str | Path, meta: dict | None = None) -> list[LayerData]:
-    """One Image layer per channel of a germquant Stack (C, Z, Y, X), scaled by (dz, dy, dx) microns."""
+def _positive_pair(value) -> tuple[float, float] | None:
+    """``value`` as (dy, dx) when it holds exactly two finite positive numbers, else None."""
+    if isinstance(value, (str, bytes)):
+        return None
+    try:
+        dy, dx = (float(v) for v in value)
+    except (TypeError, ValueError):
+        return None
+    return (dy, dx) if all(math.isfinite(v) and v > 0 for v in (dy, dx)) else None
+
+
+def plane_spacing_yx(stack) -> tuple[float, float] | None:
+    """(dy, dx) microns of a one-plane stack whose reader kept the plane's own pixel size
+    (``Stack.spacing_yx``, on the stack's grid like ``Stack.spacing``; engine package P2b), else None. A
+    stack of several planes, or a stack from an engine without the field, gives None."""
+    data = getattr(stack, "data", None)
+    if getattr(data, "ndim", 0) != 4 or int(data.shape[1]) != 1:
+        return None
+    return _positive_pair(getattr(stack, "spacing_yx", None))
+
+
+def layers_from_stack(stack, path: str | Path, meta: dict | None = None, *, scale=None) -> list[LayerData]:
+    """One Image layer per channel of a germquant Stack (C, Z, Y, X), scaled by (dz, dy, dx) microns; a
+    one-plane stack with its own pixel size (``plane_spacing_yx``) by (1.0, dy, dx). ``scale`` (dz, dy, dx),
+    when given, is used instead: the Results dock passes the run's own grid, so the source overlays the
+    run's labels whatever pixel size the reader finds, and the "voxel size unreadable" warning then comes
+    only when that grid is the reader's own 1 um guess."""
     path = Path(path)
     stem = api.image_stem(path)
     names = [str(n) for n in (stack.channel_names or [])]
     spacing = tuple(float(s) for s in stack.spacing)
-    if not stack.spacing_ok:
-        warnings.warn(f"{path.name}: voxel size unreadable; layers use 1 um per voxel (every length the "
-                      f"pipeline writes for this file carries the voxel:UNREADABLE flag)", stacklevel=2)
+    plane_yx = plane_spacing_yx(stack)
+    if scale is not None:
+        guess, spacing = spacing, tuple(float(s) for s in scale)
+        unreadable = not stack.spacing_ok and spacing == guess
+    elif plane_yx is not None:
+        spacing, unreadable = (PLANAR_DZ_UM, *plane_yx), False
+    else:
+        unreadable = not stack.spacing_ok
+    if unreadable:
+        warnings.warn(f"{path.name}: voxel size unreadable; layers use 1 um per voxel (a run writes this "
+                      f"file's lengths at 1 um per voxel with the voxel:UNREADABLE flag unless its recipe "
+                      f"sets io.voxel_size_um)", stacklevel=2)
     layers: list[LayerData] = []
     for i in range(stack.n_channels):
         ch_name = names[i] if i < len(names) and names[i] else f"C{i}"
@@ -109,3 +158,33 @@ def image_info(layer) -> dict | None:
     except AttributeError:
         return None
     return dict(info) if isinstance(info, dict) and "path" in info else None
+
+
+def is_single_plane(meta: dict) -> bool:
+    """A header of one plane: its own ``single_plane`` record when it has one (a project's header read),
+    else the sizes, the engine's rule (docs/DESIGN_system_packs.md 4.2): no Z axis (the nd2 reader leaves it
+    out) or a Z of 1 (bioio). An empty header is not a single plane."""
+    flag = meta.get("single_plane")
+    if isinstance(flag, bool):
+        return flag
+    sizes = dict(meta.get("sizes") or {})
+    return bool(sizes) and int(sizes.get("Z", 1) or 1) == 1
+
+
+def header_spacing_text(meta: dict) -> str:
+    """The voxel line of a header, as the Run dock shows it (and the Project dock's image list): "voxel um
+    dz=.. dy=.. dx=.." for a stack; for a single plane "single plane, voxel um dy=.. dx=.." from the plane's
+    own pixel size (``spacing_yx_um``, recorded by the engine's bioio reader from package P2b on), else from
+    the file's dy and dx when its spacing is readable (an nd2 plane); and the UNREADABLE line when neither
+    is known."""
+    spacing = tuple(meta.get("spacing", (1, 1, 1)))
+    readable = meta.get("spacing_ok", True)
+    if is_single_plane(meta):
+        yx = _positive_pair(meta.get("spacing_yx_um"))
+        if yx is None and readable:
+            yx = _positive_pair(spacing[1:])
+        if yx is None:
+            return f"single plane, {UNREADABLE_TEXT}"
+        return f"single plane, voxel um dy={yx[0]:.3f} dx={yx[1]:.3f}"
+    dz, dy, dx = spacing
+    return f"voxel um dz={dz:.3f} dy={dy:.3f} dx={dx:.3f}" if readable else UNREADABLE_TEXT
