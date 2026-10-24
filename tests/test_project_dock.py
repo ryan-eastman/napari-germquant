@@ -46,15 +46,35 @@ from napari_germquant._runner import (
 from napari_germquant._settings import INPROCESS
 
 
+_DOCKS: list[tuple[ProjectWidget, FakeRunner]] = []
+
+
+@pytest.fixture(autouse=True)
+def _no_run_left_behind(qtbot):
+    """After each test: every fake run released and every dock's run cancelled and finished, so a test that failed
+    part way never leaves a worker thread blocked (napari's thread pool would wait for it at exit)."""
+    yield
+    for w, fake in _DOCKS:
+        fake.release()
+        w.cancel()
+    for w, _fake in _DOCKS:
+        qtbot.waitUntil(lambda w=w: not w.running, timeout=30_000)
+    _DOCKS.clear()
+
+
 def _dock(qtbot, runner: FakeRunner | None = None, *, viewer=None, **session_kw) -> tuple[ProjectWidget, FakeRunner]:
     runner = runner or FakeRunner()
     w = ProjectWidget(viewer, session=FakeSession(runner, **session_kw))
     qtbot.addWidget(w)
+    _DOCKS.append((w, runner))
     return w, runner
 
 
-def _project(tmp_path: Path, ids=("a", "b"), **kw) -> Path:
+def _make_project(tmp_path: Path, ids=("a", "b"), **kw) -> Path:
+    """A project folder whose manifest records this computer's choices as the fake engine and the default device
+    give them (so the dock opens it with nothing unsaved)."""
     root = tmp_path / "study"
+    kw.setdefault("run", {"device": "auto", "runner": "subprocess", "interpreters": {"basic": {"python": sys.executable}}})
     write_manifest(root, images=[image_entry(tmp_path / f"{i}.ome.tif", i) for i in ids], **kw)
     return root
 
@@ -84,6 +104,10 @@ def test_new_open_and_save_go_through_the_engine_with_the_plugin_version(qtbot, 
     assert (new["root"], new["pack"], new["recipe"], new["name"]) == (root, "test_pack@0.1.0", "basic", "study")
     assert [str(p) for p in new["images"]] == [str(img)] and new["plugin_version"] == plugin_version()
     assert fake.called("project_status")                      # the board is the engine's status
+    # this computer's device, runner and interpreter recorded at once (D42), stamped with the plugin version
+    (here,) = fake.called("project_edit")
+    assert (here["device"], here["runner"], here["interpreters"]) == ("auto", "subprocess", {"basic": fake.python})
+    assert here["plugin_version"] == plugin_version() and here["xy_stride"] is None and not here["disable"]
     assert w.root == root and w.manifest == read_manifest(root) and _board(w) == [("a", "missing")]
     assert w.name_label.text() == "study" and str(root) in w.folder_label.text()
     assert "test_pack@0.1.0" in w.pack_label.text() and "basic" in w.pack_label.text()
@@ -98,9 +122,9 @@ def test_new_open_and_save_go_through_the_engine_with_the_plugin_version(qtbot, 
     w.save()
     settle(w, qtbot)
     assert w.last_error is None, w.last_error
-    (edit,) = fake.called("project_edit")
+    _here, edit = fake.called("project_edit")
     assert edit["xy_stride"] == 3 and edit["disable"] == ["spots"] and edit["device"] == "cpu"
-    assert edit["runner"] == "subprocess" and edit["interpreters"] == {"basic": fake.python}
+    assert edit["runner"] is None and edit["interpreters"] is None        # recorded already: only what differs
     assert edit["plugin_version"] == plugin_version() and not edit["dry_run"]
     m = read_manifest(root)
     assert m["run"]["xy_stride"] == 3 and m["recipe"]["overrides"] == {"spots.enabled": False}
@@ -108,7 +132,7 @@ def test_new_open_and_save_go_through_the_engine_with_the_plugin_version(qtbot, 
     assert w.badge_label.text() == "validated: false (edited)"
     w.save()                                                  # nothing changed: nothing written
     settle(w, qtbot)
-    assert len(fake.called("project_edit")) == 1 and "nothing to save" in w.status_label.text()
+    assert len(fake.called("project_edit")) == 2 and "nothing to save" in w.status_label.text()
     # Close, then Open: the manifest read in process, the status asked of the engine again
     w.close_project()
     assert w.root is None and w.rows == [] and w.images_table.rowCount() == 0 and not w.save_btn.isEnabled()
@@ -117,10 +141,10 @@ def test_new_open_and_save_go_through_the_engine_with_the_plugin_version(qtbot, 
     assert w.root == root and w.manifest == m and len(fake.called("project_status")) == 3
     assert w.stride_spin.value() == 3 and not w.stage_checks["spots"].isChecked() and not w.unsaved
     assert w.recent_combo.itemData(0) == str(root)
-    # Open of a folder that is no project says so and keeps nothing open
+    # Open of a folder that is no project says so, and the project that is open stays open
     w.open_project(tmp_path / "nothing")
     settle(w, qtbot)
-    assert w.root is None and "not a germquant project" in w.status_label.text()
+    assert w.root == root and "not a germquant project" in w.status_label.text()
 
 
 def test_the_images_tab_shows_headers_refusals_and_unreachable_paths(qtbot, tmp_path):
@@ -160,7 +184,7 @@ def test_the_images_tab_shows_headers_refusals_and_unreachable_paths(qtbot, tmp_
 
 def test_the_board_follows_the_run_log_live_and_refreshes_at_the_end(qtbot, tmp_path):
     w, fake = _dock(qtbot)
-    root = _project(tmp_path)
+    root = _make_project(tmp_path)
     w.open_project(root)
     settle(w, qtbot)
     assert _board(w) == [("a", "missing"), ("b", "missing")] and w.board.horizontalHeaderItem(3).text() == "nuclei"
@@ -195,7 +219,7 @@ def test_the_board_follows_the_run_log_live_and_refreshes_at_the_end(qtbot, tmp_
 
 def test_cancel_ends_the_run_and_the_board_says_interrupted(qtbot, tmp_path):
     w, fake = _dock(qtbot)
-    root = _project(tmp_path)
+    root = _make_project(tmp_path)
     w.open_project(root)
     settle(w, qtbot)
     fake.gate = threading.Event()                                # never set: the run waits for Cancel
@@ -214,7 +238,7 @@ def test_cancel_ends_the_run_and_the_board_says_interrupted(qtbot, tmp_path):
 
 def test_a_refused_run_shows_the_engines_reason(qtbot, tmp_path):
     w, fake = _dock(qtbot)
-    w.open_project(_project(tmp_path))
+    w.open_project(_make_project(tmp_path))
     settle(w, qtbot)
     fake.refuse_run = "the model file models/m1 differs from the sha256 the project recorded"
     w.run_all()
@@ -226,7 +250,7 @@ def test_a_refused_run_shows_the_engines_reason(qtbot, tmp_path):
 
 def test_run_records_pending_settings_first_and_runs_the_selection(qtbot, tmp_path):
     w, fake = _dock(qtbot)
-    w.open_project(_project(tmp_path, ids=("a", "b", "c")))
+    w.open_project(_make_project(tmp_path, ids=("a", "b", "c")))
     settle(w, qtbot)
     w.set_xy_stride(2)
     w.run_selected(["b", "c"])
@@ -269,7 +293,7 @@ def test_recipe_and_sample_edits_are_off_while_a_run_goes(qtbot, tmp_path, monke
     assert titles == ["Images", "Samples", "Run", "Probe"]
     tab = w.tab("Probe")
     assert isinstance(tab, _ProbeTab) and tab.dock is w
-    root = _project(tmp_path)
+    root = _make_project(tmp_path)
     w.open_project(root)
     settle(w, qtbot)
     assert tab.seen[-1] == ("project", root)
@@ -300,7 +324,7 @@ def test_recipe_and_sample_edits_are_off_while_a_run_goes(qtbot, tmp_path, monke
 def test_a_stale_lock_is_shown_and_removed_only_with_its_holder(qtbot, tmp_path):
     w, fake = _dock(qtbot)
     fake.lock = {"host": "LABPC", "pid": 4242}
-    w.open_project(_project(tmp_path))
+    w.open_project(_make_project(tmp_path))
     settle(w, qtbot)
     assert "LABPC" in w.lock_label.text() and "4242" in w.lock_label.text() and w.unlock_btn.isEnabled()
     w.remove_stale_lock()
@@ -312,7 +336,7 @@ def test_a_stale_lock_is_shown_and_removed_only_with_its_holder(qtbot, tmp_path)
 
 def test_collect_and_export_commands_go_through_the_engine(qtbot, tmp_path):
     w, fake = _dock(qtbot)
-    root = _project(tmp_path)
+    root = _make_project(tmp_path)
     w.open_project(root)
     settle(w, qtbot)
     w.collect()
@@ -358,7 +382,7 @@ def test_an_engine_without_projects_gets_one_message(qtbot, tmp_path):
     w.new_project(tmp_path / "study", "test_pack@0.1.0")
     settle(w, qtbot)
     assert not fake.called("project_new") and w.root is None and message in w.status_label.text()
-    root = _project(tmp_path)
+    root = _make_project(tmp_path)
     w.open_project(root)                                         # the manifest still opens, read in process
     settle(w, qtbot)
     assert w.root == root and _board(w) == [("a", "unknown"), ("b", "unknown")]
@@ -373,7 +397,7 @@ def test_the_project_hub_tells_the_other_docks(qtbot, tmp_path):
     hub = project_hub(viewer)
     assert project_hub(viewer) is hub and hub.root is None and not hub.running
     w, fake = _dock(qtbot, viewer=viewer)
-    root = _project(tmp_path)
+    root = _make_project(tmp_path)
     with qtbot.waitSignal(hub.opened, timeout=10_000):
         w.open_project(root)
     settle(w, qtbot)
@@ -440,7 +464,7 @@ def test_the_samples_tab_prefills_edits_and_saves_through_the_engines_writer(qtb
 
 def test_device_and_interpreter_records_that_differ_from_this_computer_are_shown(qtbot, tmp_path):
     w, fake = _dock(qtbot)
-    root = _project(tmp_path, run={"device": "cuda", "runner": "inprocess",
+    root = _make_project(tmp_path, run={"device": "cuda", "runner": "inprocess",
                                    "interpreters": {"basic": {"python": "D:/elsewhere/python.exe"}}})
     w.open_project(root)
     settle(w, qtbot)
@@ -465,7 +489,7 @@ def test_a_stand_in_engine_run_updates_the_board_row_by_row_from_its_log(qtbot, 
     version = _engine.MIN_ENGINE if engine_too_old(str(own["germquant"])) else str(own["germquant"])
     eng = standin_engine(tmp_path / "eng", version=version, git_sha=str(own["git_sha"]), features=list(_engine.FEATURES))
     _settings.set_engine_choice(sys.executable)
-    root = _project(tmp_path)
+    root = _make_project(tmp_path)
     monkeypatch.setenv("FAKE_ENGINE_STDOUT", json.dumps(status_record(root)))
     w = ProjectWidget(None, session=EngineSession(env={"PYTHONPATH": str(eng)}))
     qtbot.addWidget(w)
@@ -581,10 +605,10 @@ def test_codeless_project_from_the_test_pack(make_napari_viewer, qtbot, served_m
     settle(w, qtbot)
     dlg.picker.select(served_model_pack.id, served_model_pack.recipe)
     settle(w, qtbot)
-    assert "missing" in dlg.picker.card.text().lower() and not dlg.ok_button().isEnabled()
-    dlg.get_models()
+    assert dlg.recipe_usable() is False and "missing" in dlg.picker.card.text().lower()
+    dlg.get_models()                                             # the served 64-byte stand-in
     settle(w, qtbot)
-    assert dlg.ok_button().isEnabled() or dlg.status_text() == ""
+    assert dlg.recipe_usable() is True, dlg.status_text()
     dlg.get_example()
     settle(w, qtbot)
     (example,) = dlg.images()

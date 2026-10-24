@@ -194,14 +194,23 @@ class FakeRunner(EngineRunner):
         self.example: Path | None = None
         self.edits: dict = {}
         self._lock = threading.Lock()
+        self._released = threading.Event()
+
+    def release(self) -> None:
+        """Let a run that waits (``gate``, a step's ``wait``) go on: a test calls it at teardown, so a test that
+        failed before setting them never leaves a worker thread blocked (napari would wait for it at exit)."""
+        self._released.set()
+        for ev in [self.gate, *[s.get("wait") for s in self.script]]:
+            if ev is not None:
+                ev.set()
 
     # ---- the plumbing ----
-    def _call(self, name: str, **kw) -> None:
+    def _call(self, _what: str, **kw) -> None:
         with self._lock:
-            self.calls.append((name, dict(kw)))
-        if name in self.refuse:
-            raise EngineRefused(f"`germquant project {name}` was refused by the engine (exit 2):\n"
-                                f"REFUSED: {self.refuse[name]}", output=self.refuse[name])
+            self.calls.append((_what, dict(kw)))
+        if _what in self.refuse:
+            raise EngineRefused(f"`germquant project {_what}` was refused by the engine (exit 2):\n"
+                                f"REFUSED: {self.refuse[_what]}", output=self.refuse[_what])
 
     def called(self, name: str) -> list[dict]:
         with self._lock:
@@ -243,11 +252,11 @@ class FakeRunner(EngineRunner):
         return {"id": "synthetic", "pack": pack, "kind": "local", "status": "local", "image": str(self.example)}
 
     # ---- the project writes (the torch-free entry) ----
-    def _check(self, name: str, kw: dict, should_stop) -> None:
+    def _check(self, _what: str, kw: dict, should_stop) -> None:
         if should_stop is not None and should_stop():
             raise RunCancelled("cancelled by the user before it started")
         self.require("projects")
-        self._call(name, **kw)
+        self._call(_what, **kw)
 
     def project_new(self, root, pack, *, recipe=None, images=(), name=None, plugin_version=None,
                     should_stop=None) -> dict:
