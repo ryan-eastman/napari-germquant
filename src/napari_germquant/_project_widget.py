@@ -973,7 +973,10 @@ class ProjectWidget(QWidget):
         runner = self.session.runner()
         if runner is None:
             return None
-        return self._sheet_problem(runner, None)
+        try:
+            return self._sheet_problem(runner, None)
+        except RunnerError:                          # only a hint for the tab: the reading goes on, Save will say
+            return None
 
     @staticmethod
     def _sheet_problem(runner, should_stop) -> str | None:

@@ -40,6 +40,7 @@ from napari_germquant._engine_session import EngineSession
 from napari_germquant._project_widget import ProjectTab, ProjectWidget, project_hub
 from napari_germquant._runner import (
     RunCancelled,
+    RunnerError,
     check_run_id,
     engine_too_old,
     plugin_engine_info,
@@ -662,6 +663,25 @@ def test_two_germquant_checkouts_with_different_hashes_are_named_in_red(qtbot, t
     w.reload()
     settle(w, qtbot)
     assert w.hash_warn.text() == ""
+
+
+def test_a_failing_sheet_check_never_stops_a_reading(qtbot, tmp_path, monkeypatch):
+    """The sheet check of every reading is only a hint for the Samples tab: an engine error there leaves the table
+    editable (Save says why when it is tried) and the project opens."""
+    monkeypatch.setattr(_project, "sheet_module", lambda: _stand_in_sheet([]))
+    w, fake = _dock(qtbot)
+    real = fake.require
+
+    def require(*features, should_stop=None):
+        if "sample_sheet" in features:
+            raise RunnerError("the engine's version check failed")
+        return real(*features, should_stop=should_stop)
+
+    monkeypatch.setattr(fake, "require", require)
+    root = _make_project(tmp_path)
+    w.open_project(root)
+    settle(w, qtbot)
+    assert w.root == root and w.last_error is None and w.state.sheet_problem is None
 
 
 def test_sample_edits_need_a_sheet_writer_and_never_block_a_run(qtbot, tmp_path, monkeypatch):
