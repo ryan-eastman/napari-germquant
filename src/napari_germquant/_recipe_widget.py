@@ -920,9 +920,11 @@ class RecipeTab(QWidget):
             self.form_hash_label.setText("checking the new values with the engine ...")
             self.form_hash_label.setStyleSheet("")
         elif isinstance(cur, dict):
+            # the dry run's warnings (PLAN 9.4 #6): a recipe file the write would refuse to replace, for one
+            warnings = [str(w) for w in cur.get("warnings") or []]
             self.form_hash_label.setText(f"with these values: config_hash {cur.get('config_hash')} (now "
-                                         f"{self._view.config_hash})")
-            self.form_hash_label.setStyleSheet("")
+                                         f"{self._view.config_hash})" + "".join(f"\nwarning: {w}" for w in warnings))
+            self.form_hash_label.setStyleSheet(_colour_css(AMBER) if warnings else "")
         else:
             self.form_hash_label.setText(str(cur))
             self.form_hash_label.setStyleSheet(_colour_css(RED))

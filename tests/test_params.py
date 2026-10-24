@@ -141,6 +141,19 @@ def test_undeclared_key_is_refused(project_env, qtbot):
     _settle(tab, qtbot)
     assert tab.config_hash == PACK_HASH
 
+    # a recipe.yaml the manifest does not record (put there by hand): the form's dry run warns that the write
+    # would refuse to replace it, the form shows the warning (review N8), and the write is refused
+    (root / "recipe.yaml").write_bytes(b"extends: pack:test_pack@0.1.0/basic\n")
+    tab.reload()
+    _settle(tab, qtbot)
+    tab.set_value(MIN_SNR, 3.0)
+    _settle(tab, qtbot)
+    assert "\nwarning: " in tab.form_hash_label.text() and "not recorded in the manifest" in tab.form_hash_label.text()
+    assert tab.apply_form()
+    _settle(tab, qtbot)
+    assert "REFUSED" in tab.status_label.text() and "not recorded in the manifest" in tab.status_label.text()
+    assert recipe_files(root)["recipe.yaml"] == b"extends: pack:test_pack@0.1.0/basic\n"
+
 
 def test_the_served_model_pack_declares_the_spot_radius(project_env, served_model_pack, qtbot):
     """The codeless round's edit (P6 acceptance 3, D38): served_model_pack's basic recipe also declares
@@ -398,6 +411,26 @@ def test_values_the_widgets_cannot_show_are_named(qtbot, tmp_path):
     c.widget.setCurrentIndex(2)                                         # back to what the project holds
     assert tab.pending() == {}
     _settle(tab, qtbot)
+
+
+def test_a_form_preview_shows_the_engines_warnings(qtbot, tmp_path):
+    """The form's dry run can warn (PLAN 9.4 #6: a recipe file the write would refuse to replace): the warnings are
+    shown under the new config_hash, in amber (review N8)."""
+    text = f"{tmp_path / 'recipe.yaml'} is not recorded in the manifest, so runs do not use it"
+
+    def answer(kw):
+        if kw.get("edits"):
+            return {**preview_record({}, config_hash="eeeeeeeeeeee", warnings=[text]), "preview": None}
+        return preview_record({}, config_hash="ffffffffffff")
+
+    view = fake_view(tmp_path, tunables=[({"key": "a.float", "type": "float"}, 1.0, 1.0, None)])
+    tab, fake, _ = _form_tab(qtbot, tmp_path, answer, views=[view])
+    tab.set_value("a.float", 2.0)
+    _settle(tab, qtbot)
+    assert tab.form_hash == "eeeeeeeeeeee"
+    want = f"with these values: config_hash eeeeeeeeeeee (now {PACK_HASH})\nwarning: {text}"
+    assert tab.form_hash_label.text() == want
+    assert "rgb(225, 160, 40)" in tab.form_hash_label.styleSheet() and tab.apply_form_btn.isEnabled()
 
 
 def test_a_fine_step_gets_the_decimals_it_needs(qtbot, tmp_path):
