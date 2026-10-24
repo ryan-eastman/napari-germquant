@@ -169,7 +169,10 @@ class FakeRunner(EngineRunner):
     the next ``project run`` ([{"event", "image_id", "status", "error", ...}, ...], each after ``pause`` seconds),
     ``run_exit`` its exit code, ``refuse_run`` a refusal text (exit 2 before any event), ``results`` image ids whose
     image_done also writes a results folder; ``statuses`` feeds ``project status``; ``headers`` the records of
-    ``project add``; ``gate`` (a threading.Event) holds a run before its first event until a test sets it."""
+    ``project add``; ``gate`` (a threading.Event) holds a run before its first event until a test sets it, and
+    ``status_gate`` and ``edit_gate`` hold ``project status`` and ``project edit`` (after the call is recorded) the
+    same way; a ``should_stop`` that turns True while one waits ends it as the subprocess runner ends an engine
+    process (RunCancelled)."""
 
     kind = "subprocess"
     via = "gui-subprocess"
@@ -191,6 +194,8 @@ class FakeRunner(EngineRunner):
         self.refuse: dict[str, str] = {}
         self.results: set[str] = set()
         self.gate: threading.Event | None = None
+        self.status_gate: threading.Event | None = None
+        self.edit_gate: threading.Event | None = None
         self.example: Path | None = None
         self.edits: dict = {}
         self._lock = threading.Lock()
@@ -200,9 +205,16 @@ class FakeRunner(EngineRunner):
         """Let a run that waits (``gate``, a step's ``wait``) go on: a test calls it at teardown, so a test that
         failed before setting them never leaves a worker thread blocked (napari would wait for it at exit)."""
         self._released.set()
-        for ev in [self.gate, *[s.get("wait") for s in self.script]]:
+        for ev in [self.gate, self.status_gate, self.edit_gate, *[s.get("wait") for s in self.script]]:
             if ev is not None:
                 ev.set()
+
+    def _hold(self, gate: threading.Event | None, should_stop, what: str) -> None:
+        """Wait until a test sets ``gate``; a ``should_stop`` that turns True meanwhile ends the call as the
+        subprocess runner ends the engine process of ``what`` (killed part way: nothing after this point is done)."""
+        while gate is not None and not gate.wait(0.02):
+            if should_stop is not None and should_stop():
+                raise RunCancelled(f"cancelled by the user: the engine process of {what} was ended")
 
     # ---- the plumbing ----
     def _call(self, _what: str, **kw) -> None:
@@ -312,6 +324,7 @@ class FakeRunner(EngineRunner):
               "interpreters": interpreters, "samples": samples, "disable": list(disable or ()), "dry_run": dry_run,
               "plugin_version": plugin_version}
         self._check("project_edit", kw, should_stop)
+        self._hold(self.edit_gate, should_stop, "project edit")
         from germquant.stages import BY_NAME
 
         m = read_manifest(root)
@@ -361,6 +374,7 @@ class FakeRunner(EngineRunner):
     # ---- the full command line ----
     def project_status(self, root, *, should_stop=None) -> dict:
         self._check("project_status", {"root": root}, should_stop)
+        self._hold(self.status_gate, should_stop, "project status")
         m = read_manifest(root)
         return status_record(root, m, statuses=self.statuses, warnings=self.status_warnings,
                              config_hash=m["recipe"]["expected_config_hash"],
@@ -422,7 +436,12 @@ class FakeRunner(EngineRunner):
 
     def project_collect(self, root, *, should_stop=None) -> dict:
         self._check("project_collect", {"root": root}, should_stop)
-        return {"out": str(Path(root) / "results"), "tables": ["batch_nuclei.csv", "batch_image_summary.csv"]}
+        # the engine's record (project/collect.py, collect_project): counts is batch.collect's {table: rows}
+        ids = [e["id"] for e in read_manifest(root)["images"] if not e.get("excluded")]
+        results = Path(root) / "results"
+        return {"root": str(root), "results": str(results), "outlier_factor": 1.0e9, "images": len(ids),
+                "counts": {"nuclei": 3 * len(ids), "spots": 0, "image_summary": len(ids)},
+                "summary": str(results / "batch_summary.csv")}
 
     def project_export_commands(self, root, *, shell="sh", shards=None, out=None, should_stop=None) -> dict:
         self._check("project_export_commands", {"root": root, "shell": shell, "shards": shards, "out": out},

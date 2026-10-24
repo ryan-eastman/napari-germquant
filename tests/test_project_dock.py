@@ -10,10 +10,12 @@ real engine and skip, naming the feature, until it has projects (conftest.need_f
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -30,6 +32,7 @@ from _p6_project import (
 )
 from _p6_runner import run_spec, standin_engine
 from conftest import CHANNELS, need_features, settle, write_ome
+from qtpy.QtCore import Qt
 
 from napari_germquant import _engine, _project, _settings
 from napari_germquant import _project_widget as PW
@@ -343,7 +346,10 @@ def test_collect_and_export_commands_go_through_the_engine(qtbot, tmp_path):
     settle(w, qtbot)
     w.collect()
     settle(w, qtbot)
-    assert fake.called("project_collect") == [{"root": root}] and "batch_nuclei.csv" in w.status_label.text()
+    # the engine's record in words (images, the summary table, the rows per table), never the raw record
+    text = w.status_label.text()
+    assert fake.called("project_collect") == [{"root": root}] and "collected 2 image(s)" in text
+    assert "batch_summary.csv" in text and "nuclei 6" in text and "{" not in text
     out = tmp_path / "run_study.ps1"
     w.export_commands(out, shell="ps1")
     settle(w, qtbot)
@@ -351,10 +357,21 @@ def test_collect_and_export_commands_go_through_the_engine(qtbot, tmp_path):
     assert (exp["shell"], exp["out"]) == ("ps1", out) and out.is_file() and str(out) in w.status_label.text()
 
 
-def test_double_click_opens_the_results_with_their_source(make_napari_viewer, qtbot, tmp_path):
-    """Through napari's public proxy of the viewer (what a dock opened from the Plugins menu gets)."""
+def test_double_click_opens_the_results_with_their_source(make_napari_viewer, qtbot, tmp_path, monkeypatch):
+    """Through napari's public proxy of the viewer (what a dock opened from the Plugins menu gets). The results
+    and the source image are read in a worker, never in the GUI thread (a NAS path over VPN)."""
     from napari.utils._proxies import PublicOnlyProxy
 
+    from napari_germquant import _results
+
+    threads = []
+    real_load = _results.load_results_layers
+
+    def load(rs, **kw):
+        threads.append(threading.current_thread())
+        return real_load(rs, **kw)
+
+    monkeypatch.setattr(_results, "load_results_layers", load)
     viewer = make_napari_viewer()
     src = write_ome(tmp_path / "a.ome.tif", np.zeros((3, 2, 16, 24), np.uint16), CHANNELS)
     root = tmp_path / "study"
@@ -365,6 +382,8 @@ def test_double_click_opens_the_results_with_their_source(make_napari_viewer, qt
     w.open_project(root)
     settle(w, qtbot)
     w.board.cellDoubleClicked.emit(0, 0)
+    settle(w, qtbot)
+    assert threads and all(t is not threading.main_thread() for t in threads)
     names = [layer.name for layer in viewer.layers]
     assert "a nuclei" in names and "a spots" in names and len(names) >= 5     # three source channels too
     labels = next(layer for layer in viewer.layers if layer.name == "a nuclei")
@@ -374,7 +393,8 @@ def test_double_click_opens_the_results_with_their_source(make_napari_viewer, qt
     write_manifest(root, images=[image_entry(src, "a"), image_entry(tmp_path / "b.ome.tif", "b")])
     w.reload()
     settle(w, qtbot)
-    w.open_results("b")
+    assert w.open_results("b")
+    settle(w, qtbot)
     assert "no results" in w.status_label.text()
 
 
@@ -444,7 +464,24 @@ def test_the_new_dialog_lists_the_engines_packs_and_makes_the_project(qtbot, tmp
     assert [str(p) for p in new["images"]] == [str(fake.example)] and w.root == tmp_path / "codeless"
 
 
-def test_the_samples_tab_prefills_edits_and_saves_through_the_engines_writer(qtbot, tmp_path):
+def _stand_in_sheet(written: list) -> SimpleNamespace:
+    """germquant.io.sample_sheet as far as the dock uses it (write_sample_sheet: ASCII, LF, the rows as given, every
+    column), for the dock's flow on an engine without P5-SHEET; the engine's own writer runs where it exists."""
+    def write_sample_sheet(path, rows):
+        rows = [dict(r) for r in rows]
+        written.append(rows)
+        cols = list(rows[0])
+        text = ",".join(cols) + "\n" + "".join(",".join(str(r[c]) for c in cols) + "\n" for r in rows)
+        Path(path).write_bytes(text.encode("ascii"))
+        return Path(path)
+
+    return SimpleNamespace(write_sample_sheet=write_sample_sheet)
+
+
+def test_the_samples_tab_prefills_edits_and_saves_through_the_engines_writer(qtbot, tmp_path, monkeypatch):
+    engine_sheet = _project.sheet_module()
+    written: list = []
+    monkeypatch.setattr(_project, "sheet_module", lambda: _stand_in_sheet(written))
     w, fake = _dock(qtbot)
     worm = "20251105_n2_nohs_HERM_001"
     root = tmp_path / "study"
@@ -452,22 +489,34 @@ def test_the_samples_tab_prefills_edits_and_saves_through_the_engines_writer(qtb
     w.open_project(root)
     settle(w, qtbot)
     assert w.samples is not None and w.samples.ids == [worm, "f"]
-    assert _cells(w.samples_table, 0) == [worm, "f"]
+    assert _cells(w.samples_table, 0) == [worm, "f"] and w.state.sheet_problem is None
     w.add_sample_column("lane")
     w.set_sample("f", "genotype", "CB4856")
     w.set_sample("f", "lane", "2")
     assert w.unsaved and w.samples.dirty
     with pytest.raises(ValueError, match="ASCII"):
         w.set_sample("f", "genotype", "caf" + chr(0xE9))
+    w.save()
+    settle(w, qtbot)
+    assert w.last_error is None, w.last_error
+    (rows,) = written
+    assert [r["image_id"] for r in rows] == [worm, "f"] and rows[1]["genotype"] == "CB4856" and rows[1]["lane"] == "2"
+    edit = fake.called("project_edit")[-1]
+    assert edit["samples"] == "samples.csv" and edit["plugin_version"] == plugin_version()
+    assert read_manifest(root)["samples"] == "samples.csv" and not w.unsaved and not w.samples.dirty
+    assert w.samples.row("f")["lane"] == "2"                     # the sheet read back from the project
+    # the engine's own writer (P5-SHEET): ASCII with LF line endings
     need_features("sample_sheet")
+    monkeypatch.setattr(_project, "sheet_module", lambda: engine_sheet)
+    w.reload()
+    settle(w, qtbot)
+    w.set_sample("f", "genotype", "JK574")
     w.save()
     settle(w, qtbot)
     assert w.last_error is None, w.last_error
     data = (root / "samples.csv").read_bytes()
-    assert data.decode("ascii") and b"\r\n" not in data and b"CB4856" in data and b"lane" in data
-    edit = fake.called("project_edit")[-1]
-    assert edit["samples"] == "samples.csv" and edit["plugin_version"] == plugin_version()
-    assert read_manifest(root)["samples"] == "samples.csv" and not w.unsaved
+    assert data.decode("ascii") and b"\r\n" not in data and b"JK574" in data and b"lane" in data
+    assert not w.unsaved
 
 
 def test_device_and_interpreter_records_that_differ_from_this_computer_are_shown(qtbot, tmp_path):
@@ -485,6 +534,198 @@ def test_device_and_interpreter_records_that_differ_from_this_computer_are_shown
     edit = fake.called("project_edit")[-1]
     assert (edit["device"], edit["runner"], edit["interpreters"]) == ("auto", "subprocess", {"basic": fake.python})
     assert "records device" not in w.warnings_label.text()
+
+
+def _status_calls(fake: FakeRunner) -> int:
+    return len(fake.called("project_status"))
+
+
+def test_save_then_close_leaves_the_project_closed(qtbot, tmp_path):
+    """A write that comes back after Close does not open the project again: the save is made all the same, and its
+    message says the project was closed meanwhile."""
+    w, fake = _dock(qtbot)
+    root = _make_project(tmp_path)
+    w.open_project(root)
+    settle(w, qtbot)
+    w.set_xy_stride(2)
+    fake.status_gate = threading.Event()                         # the save's reading waits until the test lets it go
+    assert w.save()
+    qtbot.waitUntil(lambda: _status_calls(fake) == 2, timeout=10_000)
+    assert w.close_project() and w.root is None and w.hub.root is None
+    fake.status_gate.set()
+    settle(w, qtbot)
+    assert w.root is None and w.rows == [] and w.hub.root is None and w.hub.state is None
+    assert read_manifest(root)["run"]["xy_stride"] == 2           # written before the project was closed
+    assert "saved" in w.status_label.text() and "closed meanwhile" in w.status_label.text()
+
+
+def test_close_right_after_a_run_leaves_the_project_closed(qtbot, tmp_path):
+    w, fake = _dock(qtbot)
+    root = _make_project(tmp_path)
+    w.open_project(root)
+    settle(w, qtbot)
+    fake.script = [{"event": "image_done", "image_id": "a"}]
+    fake.status_gate = threading.Event()                         # the end-of-run reading waits
+    w.run_all()
+    qtbot.waitUntil(lambda: not w.running and _status_calls(fake) == 2, timeout=10_000)
+    assert w.close_project() and w.root is None
+    fake.status_gate.set()
+    settle(w, qtbot)
+    assert w.root is None and w.rows == [] and w.board.rowCount() == 0
+
+
+def test_the_settings_controls_are_off_while_a_write_is_in_flight(qtbot, tmp_path):
+    """A write in flight counts like a run for the Run tab's settings and the sample table, and a setting changed
+    meanwhile (through the controls' programmatic twin) is kept as unsaved, never set back by the write's reading."""
+    w, fake = _dock(qtbot)
+    root = _make_project(tmp_path)
+    w.open_project(root)
+    settle(w, qtbot)
+    controls = (w.stride_spin, w.samples_table, w.save_btn, w.stage_checks["spots"], w.device_combo,
+                w.interpreter_btn)
+    assert not w.writing and all(c.isEnabled() for c in controls)
+    w.set_xy_stride(2)
+    fake.status_gate = threading.Event()
+    w.save()
+    qtbot.waitUntil(lambda: _status_calls(fake) == 2, timeout=10_000)
+    assert w.writing and not any(c.isEnabled() for c in controls) and w.close_btn.isEnabled()
+    with pytest.raises(ValueError, match="in progress"):
+        w.set_sample("a", "genotype", "N2")
+    w.set_xy_stride(3)
+    fake.status_gate.set()
+    settle(w, qtbot)
+    assert not w.writing and all(c.isEnabled() for c in controls)
+    assert read_manifest(root)["run"]["xy_stride"] == 2 and w.stride_spin.value() == 3 and w.unsaved
+
+
+def test_a_young_or_unreadable_lock_is_never_removed_from_the_dock(qtbot, tmp_path):
+    """Remove stale lock is for a lock older than 12 h with its holder's host and pid (D18); a lock file the
+    engine cannot read is removed by hand, and the dock says where it is."""
+    w, fake = _dock(qtbot)
+    fake.lock = {"host": "LABPC", "pid": 4242, "stale": False}
+    root = _make_project(tmp_path)
+    w.open_project(root)
+    settle(w, qtbot)
+    assert "LABPC" in w.lock_label.text() and "a command is writing" in w.lock_label.text()
+    assert not w.unlock_btn.isEnabled() and not w.remove_stale_lock()
+    settle(w, qtbot)
+    assert not fake.called("project_unlock")
+    # the engine's lock_report of a lock file it cannot read: held, without a host or pid
+    fake.lock = {"host": None, "pid": None, "since": None, "stale": True}
+    w.reload()
+    settle(w, qtbot)
+    assert "cannot be read" in w.lock_label.text() and "None" not in w.lock_label.text()
+    assert str(root / "germquant_project.lock") in w.lock_label.text() and not w.unlock_btn.isEnabled()
+    assert not w.remove_stale_lock()
+    settle(w, qtbot)
+    assert not fake.called("project_unlock") and "by hand" in w.status_label.text()
+
+
+def test_cancel_before_a_run_never_kills_the_settings_write(qtbot, tmp_path):
+    """The settings a run records first are written to their end (a write killed while it holds the project's
+    lock would leave a lock no one removes for 12 h); Cancel then stops the run before it starts."""
+    w, fake = _dock(qtbot)
+    root = _make_project(tmp_path)
+    w.open_project(root)
+    settle(w, qtbot)
+    w.set_xy_stride(2)
+    fake.edit_gate = threading.Event()
+    w.run_all()
+    qtbot.waitUntil(lambda: len(fake.called("project_edit")) == 1, timeout=10_000)
+    assert w.cancel()
+    qtbot.wait(300)                         # long enough for a write that polls Cancel to be ended (20 ms polls)
+    fake.edit_gate.set()
+    qtbot.waitUntil(lambda: not w.running, timeout=10_000)
+    settle(w, qtbot)
+    assert read_manifest(root)["run"]["xy_stride"] == 2 and not fake.called("project_run")
+    assert isinstance(w.last_error, RunCancelled) and "before it started" in w.run_label.text()
+    assert not _project.run_in_progress(root) and not w.unsaved
+
+
+def test_two_germquant_checkouts_with_different_hashes_are_named_in_red(qtbot, tmp_path, monkeypatch):
+    """plugin_specs 3: the config_hash this napari environment's germquant computes is checked against the
+    engine's, and a difference (two checkouts) shows red with the fix."""
+    monkeypatch.setattr(_project, "own_config_hash", lambda root: "ffffffffffff")
+    w, fake = _dock(qtbot)
+    w.open_project(_make_project(tmp_path))
+    settle(w, qtbot)
+    assert "ffffffffffff" in w.hash_warn.text() and BASE_HASH in w.hash_warn.text()
+    assert "same commit" in w.hash_warn.text() and w.hash_warn.styleSheet() == PW.css(PW.RED)
+    assert "ffffffffffff" not in w.warnings_label.text()
+    monkeypatch.setattr(_project, "own_config_hash", lambda root: BASE_HASH)
+    w.reload()
+    settle(w, qtbot)
+    assert w.hash_warn.text() == ""
+
+
+def test_sample_edits_need_a_sheet_writer_and_never_block_a_run(qtbot, tmp_path, monkeypatch):
+    """Without germquant's sample sheet writer the table is read-only and says why; edits made before the writer
+    went away never stop a run, which then uses the sheet on disk and says so."""
+    monkeypatch.setattr(_project, "sheet_module", lambda: None)
+    w, fake = _dock(qtbot)
+    root = _make_project(tmp_path)
+    w.open_project(root)
+    settle(w, qtbot)
+    assert w.state.sheet_problem and "sample sheet" in w.samples_note.text() and "read-only" in w.samples_note.text()
+    assert not (w.samples_table.item(0, 1).flags() & Qt.ItemFlag.ItemIsEditable)
+    assert not w.save_sheet_btn.isEnabled() and not w.add_column_btn.isEnabled()
+    with pytest.raises(ValueError, match="sample sheet"):
+        w.set_sample("a", "genotype", "N2")
+    with pytest.raises(ValueError, match="sample sheet"):
+        w.add_sample_column("lane")
+    written: list = []
+    monkeypatch.setattr(_project, "sheet_module", lambda: _stand_in_sheet(written))
+    w.reload()
+    settle(w, qtbot)
+    w.set_sample("a", "genotype", "N2")
+    monkeypatch.setattr(_project, "sheet_module", lambda: None)  # another germquant now: no writer
+    w.reload()
+    settle(w, qtbot)
+    assert w.samples.dirty and w.state.sheet_problem
+    fake.script = [{"event": "image_done", "image_id": "a"}]
+    w.run_all()
+    qtbot.waitUntil(lambda: not w.running, timeout=10_000)
+    settle(w, qtbot)
+    assert w.last_result["state"] == "done" and not written and fake.called("project_run")
+    assert "sample edits were not written" in w.run_label.text() and w.samples.dirty
+
+
+def test_a_new_project_opens_when_this_computers_settings_cannot_be_recorded(qtbot, tmp_path):
+    w, fake = _dock(qtbot)
+    fake.refuse["project_edit"] = "the project is locked by LABPC pid 4242"
+    root = tmp_path / "study"
+    w.new_project(root, "test_pack@0.1.0", recipe="basic", images=[tmp_path / "a.ome.tif"])
+    settle(w, qtbot)
+    assert fake.called("project_new") and fake.called("project_edit") and w.root == root
+    assert "not recorded" in w.status_label.text() and w.status_label.styleSheet() == PW.css(PW.AMBER)
+    assert w.unsaved                                             # Save records them
+
+
+def test_a_time_series_result_is_named_as_such(qtbot, tmp_path):
+    w, fake = _dock(qtbot)
+    root = _make_project(tmp_path, ids=("movie",))
+    (root / "results" / "movie").mkdir(parents=True)
+    (root / "results" / "movie" / "movie__series.json").write_text("{}", encoding="ascii")
+    fake.statuses = {"movie": {"status": "done"}}
+    w.open_project(root)
+    settle(w, qtbot)
+    assert w.open_results("movie")
+    settle(w, qtbot)
+    assert "time series" in w.status_label.text() and "Time-lapse" in w.status_label.text()
+
+
+def test_a_relative_project_folder_is_kept_absolute(qtbot, tmp_path, monkeypatch):
+    w, fake = _dock(qtbot)
+    _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    here = Path(os.path.abspath("study"))
+    w.open_project("study")
+    settle(w, qtbot)
+    assert w.root == here and w.root.is_absolute() and _settings.recent_projects()[0] == str(here)
+    w.close_project()
+    w.new_project("fresh", "test_pack@0.1.0", recipe="basic")
+    settle(w, qtbot)
+    assert fake.called("project_new")[0]["root"] == Path(os.path.abspath("fresh")) == w.root
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -596,6 +837,12 @@ def test_run_all_writes_the_same_files_as_project_run(qtbot, project_env, runner
     assert start["event"] == "run_start" and start["run_id"] == res["run_id"]
     assert start["via"] == ("gui-subprocess" if runner == "subprocess" else "gui-inprocess")
     assert not (project_env.root / "runs").exists() and not user_runs_dir().exists()
+    # Collect tables: the engine's record in words
+    w.collect()
+    settle(w, qtbot)
+    assert w.last_error is None, w.last_error
+    assert (gui / "results" / "batch_summary.csv").is_file() and "batch_summary.csv" in w.status_label.text()
+    assert "collected 1 image(s)" in w.status_label.text() and "{" not in w.status_label.text()
 
 
 def test_codeless_project_from_the_test_pack(make_napari_viewer, qtbot, served_model_pack, project_env):
@@ -628,7 +875,8 @@ def test_codeless_project_from_the_test_pack(make_napari_viewer, qtbot, served_m
     image_id = w.rows[0].image_id
     assert w.manifest["pack"]["id"] == served_model_pack.id and Path(example).is_file()
     assert _run_all(w, qtbot)["state"] == "done"
-    w.open_results(image_id)
+    assert w.open_results(image_id)
+    settle(w, qtbot)
     kinds = {type(layer).__name__ for layer in viewer.layers}
     assert {"Labels", "Points"} <= kinds
     before = w.status["config_hash"]
@@ -649,3 +897,29 @@ def test_codeless_project_from_the_test_pack(make_napari_viewer, qtbot, served_m
     assert _run_all(w, qtbot)["state"] == "done" and _board(w) == [(image_id, "done")]
     assert cli.main(["project", "run", str(copy)]) == 0
     _same_results(root / "results" / image_id, copy / "results" / image_id, image_id)
+
+
+def test_a_sheet_row_saved_in_the_dock_makes_only_its_image_stale(qtbot, project_env):
+    """plugin_specs 4.1: Save writes samples.csv, and the images whose row changed then show stale (sample row),
+    the others stay done (D21: row_sha256 per image). Through the in-process runner, on a project the dock made."""
+    need_features("projects", "sample_sheet")
+    w = _engine_dock(qtbot, "inprocess")
+    second = project_env.images / "second_field.ome.tif"
+    shutil.copyfile(project_env.image, second)
+    root = project_env.new_dir()
+    w.new_project(root, "test_pack@0.1.0", recipe="basic", images=[project_env.image, second])
+    settle(w, qtbot)
+    assert w.last_error is None, w.last_error
+    a, b = (r.image_id for r in w.rows)
+    for iid in (a, b):
+        w.set_sample(iid, "genotype", "N2")
+    assert w.save(sheet=True)
+    settle(w, qtbot)
+    assert w.last_error is None, w.last_error
+    assert read_manifest(root)["samples"] == "samples.csv" and not w.unsaved
+    assert _run_all(w, qtbot)["state"] == "done" and _board(w) == [(a, "done"), (b, "done")]
+    w.set_sample(b, "genotype", "CB4856")
+    assert w.save(sheet=True)
+    settle(w, qtbot)
+    assert w.last_error is None, w.last_error
+    assert _board(w) == [(a, "done"), (b, "stale")] and w.rows[1].reason_code == "sample_row"

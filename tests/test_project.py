@@ -7,8 +7,10 @@ The model tests need no engine feature: they read project folders written as the
 projects (conftest.need_features)."""
 from __future__ import annotations
 
+import os
 import shutil
 import sys
+from pathlib import Path
 
 import pytest
 from _p6_project import (
@@ -98,6 +100,26 @@ def test_the_board_follows_the_status_record_and_then_the_run_log(tmp_path):
     assert rows0[0].objects == 4                              # the results on disk are counted all the same
 
 
+def test_the_board_reads_an_images_tables_again_only_when_they_change(tmp_path, monkeypatch):
+    """The objects and spots of a results folder are read once, then again only for a table whose modification time
+    or size changed (a run rewrote it): a refresh of a project on the NAS does not read every spots table again."""
+    folder = write_results(tmp_path / "results" / "a", "a", n_nuclei=4, n_spots=9)
+    reads = []
+    for name in ("_count_lines", "_summary_objects"):
+        real = getattr(P, name)
+        monkeypatch.setattr(P, name, lambda path, real=real: reads.append(Path(path).name) or real(path))
+    assert P.summary_counts(folder, "a") == (4, 9)
+    assert sorted(reads) == ["a__image_summary.csv", "a__spots.csv"]
+    reads.clear()
+    assert P.summary_counts(folder, "a") == (4, 9) and reads == []
+    spots = folder / "a__spots.csv"
+    spots.write_bytes(spots.read_bytes() + b"10,1,0.4,3.0,1.0\n")
+    st = os.stat(spots)
+    os.utime(spots, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+    assert P.summary_counts(folder, "a") == (4, 10) and reads == ["a__spots.csv"]
+    assert P.summary_counts(tmp_path / "results" / "b", "b") == (None, None)       # no results: nothing cached
+
+
 def test_the_header_text_names_sizes_channels_and_a_single_plane():
     plane = {"sizes": {"C": 2, "Z": 1, "Y": 40, "X": 48}, "channel_names": ["DAPI", "Cy3 RAD-51"], "n_images": 1,
              "spacing": [1.0, 1.0, 1.0], "spacing_ok": False, "spacing_yx_um": [0.1, 0.1], "single_plane": True}
@@ -130,6 +152,11 @@ def test_the_badge_lock_and_settings_say_what_the_project_records(tmp_path):
     assert "LABPC" in text and "4242" in text and "older than 12 h" in text
     assert "a command is writing" in P.lock_text({**held, "stale": False})
     assert P.lock_text({"held": False}) is None and P.lock_text(None) is None
+    # a lock file the engine cannot read (lock_report: held, no host or pid): removed by hand, never by the dock
+    unreadable = {"held": True, "host": None, "pid": None, "since": None, "stale": True}
+    text = P.lock_text(unreadable, root=root)
+    assert "cannot be read" in text and str(root / "germquant_project.lock") in text and "None" not in text
+    assert P.lock_holder(unreadable) is None and P.lock_holder(held) == ("LABPC", 4242)
     # Save writes only what differs from the manifest (the run settings and the stage switches of design 7.2)
     py, py2 = sys.executable, str(tmp_path / "other" / "python.exe")
     write_manifest(root, images=m["images"], run={"device": "cpu", "runner": "subprocess", "xy_stride": 1,
