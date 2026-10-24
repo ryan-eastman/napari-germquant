@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from _p6_runner import run_spec, standin_engine
@@ -907,10 +908,12 @@ def test_cancel_ends_a_hung_project_run_and_the_board_says_interrupted(tmp_path)
     assert board["counts"] == {"done": 1, "failed": 0, "skipped": 0}
 
 
-def test_project_run_exit_codes_map_to_the_dock_states(tmp_path):
+def test_project_run_exit_codes_map_to_the_dock_states(tmp_path, monkeypatch):
     """0: every image done or skipped; 1: some images failed (a result, not an error of the call); 2: refused
     before any image, with the reason and fix the engine printed. A crash (exit 1 without run_end) and any other
-    code are errors, with the run's log attached."""
+    code are errors, with the run's log attached. In process the same: a refusal before the run started (the
+    engine's ValueError or OSError, as the command's exit 2) is the refused state, an error after it a RunnerError
+    with the run attached."""
     assert [state_for_exit(c) for c in (0, 1, 2, 3, -1)] == ["done", "failed", "refused", None, None]
     # the exit code is the contract: 0 stays done without a readable log; a run_end that says interrupted wins
     rid, log = "20261023T120000Z_0123abcd", tmp_path / "runs" / "x.jsonl"
@@ -947,6 +950,66 @@ def test_project_run_exit_codes_map_to_the_dock_states(tmp_path):
         _standin_runner(tmp_path, "e5", FAKE_ENGINE_EXIT="2").import_labels(
             tmp_path / "seg.npy", "cellpose-npy", tmp_path / "img.ome.tif", tmp_path / "pairs")
     assert e.value.exit_code == 2 and '"module": "germquant"' in e.value.output
+
+    # in process (api.run_project)
+    why = "model digest mismatch for cpsam_v2@0f1cc3f7; fix: germquant pack fetch-models"
+    monkeypatch.setattr(api, "open_project", lambda root: SimpleNamespace(root=Path(root)), raising=False)
+    monkeypatch.setattr(api, "run_project", _raises(ValueError(why)), raising=False)
+    inproc = InProcessRunner()
+    res = inproc.project_run(project, run_id="20261023T120000Z_0123abce")
+    assert (res["state"], res["exit_code"], res["events"], res["message"]) == ("refused", 2, [], f"REFUSED: {why}")
+    assert res["log"] == str(project / "runs" / "20261023T120000Z_0123abce.jsonl")
+    monkeypatch.setattr(api, "open_project", _raises(ValueError(f"{project} is not a germquant project")))
+    res = inproc.project_run(project)
+    assert res["state"] == "refused" and res["message"].endswith("is not a germquant project")
+
+    def started_then_lost(proj, *a, run_id=None, **k):
+        log = RunLog(Path(proj.root) / "runs", run_id)
+        log.path.parent.mkdir(parents=True, exist_ok=True)
+        log.event("run_start", via=k.get("via"), images=[{"image_id": "a"}])
+        raise OSError("the share went away")
+
+    monkeypatch.setattr(api, "open_project", lambda root: SimpleNamespace(root=Path(root)))
+    monkeypatch.setattr(api, "run_project", started_then_lost)
+    with pytest.raises(RunnerError, match="run_project failed: OSError: the share went away") as e:
+        inproc.project_run(project, run_id="20261023T120000Z_0123abcf")
+    assert not isinstance(e.value, EngineRefused) and e.value.run_id == "20261023T120000Z_0123abcf"
+    assert [x["event"] for x in e.value.events] == ["run_start"] and e.value.run_log.endswith("_0123abcf.jsonl")
+
+
+def _raises(exc):
+    def f(*a, **k):
+        raise exc
+    return f
+
+
+def test_an_in_process_run_that_finished_keeps_its_result_when_cancel_comes_late(tmp_path, monkeypatch):
+    """Cancel pressed as an in-process run ends: a run whose log has its run_end, not interrupted, finished every
+    image and returns its result; a run the engine stopped between images (run_end interrupted) is RunCancelled,
+    as the subprocess runner says."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    stop = {"now": False, "interrupted": False}
+
+    def run_project(proj, *a, run_id=None, should_stop=None, **k):
+        log = RunLog(Path(proj.root) / "runs", run_id)
+        log.path.parent.mkdir(parents=True, exist_ok=True)
+        log.event("run_start", images=[{"image_id": "a"}])
+        log.event("image_done", image_id="a", status="done")
+        stop["now"] = True                                       # Cancel, pressed as the last image ends
+        log.event("run_end", counts={"done": 1, "failed": 0, "skipped": 0}, interrupted=stop["interrupted"])
+        return {"run_id": run_id, "log": str(log.path), "counts": {"done": 1, "failed": 0, "skipped": 0},
+                "exit_code": 0}
+
+    monkeypatch.setattr(api, "open_project", lambda root: SimpleNamespace(root=Path(root)), raising=False)
+    monkeypatch.setattr(api, "run_project", run_project, raising=False)
+    r = InProcessRunner()
+    res = r.project_run(project, should_stop=lambda: stop["now"])
+    assert (res["state"], res["counts"]["done"]) == ("done", 1)
+    stop.update(now=False, interrupted=True)
+    with pytest.raises(RunCancelled) as e:
+        r.project_run(project, should_stop=lambda: stop["now"])
+    assert [x["event"] for x in e.value.events] == ["run_start", "image_done", "run_end"]
 
 
 def test_an_engine_without_the_projects_feature_gives_one_message(tmp_path, monkeypatch):

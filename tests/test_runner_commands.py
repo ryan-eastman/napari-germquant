@@ -2,7 +2,9 @@
 plan): one method per command, each building the command line the engine documents (stand-in engines from
 tests/_p6_runner.py answer with what they were given), the torch-free entries used where they exist, the
 plugin version stamped on every project write, ``project=`` on the pack calls, the device list of the runtime
-probe, and the in-process runner calling the same commands through germquant.api."""
+probe, the refusal forms of the Train B commands, and the in-process runner: the same commands through
+germquant.api, but its project writes through the torch-free command of this environment (and, on an engine
+with projects, both runners writing the same project files)."""
 from __future__ import annotations
 
 import inspect
@@ -14,13 +16,14 @@ from pathlib import Path
 
 import pytest
 from _p6_runner import echo, standin_engine
-from conftest import TEST_PACK, copy_pack, engine_device
+from conftest import TEST_PACK, copy_pack, engine_device, need_features
 
 from napari_germquant import _engine
 from napari_germquant._runner import (
     VIA_INPROCESS,
     EngineRefused,
     EngineRunner,
+    FeatureMissing,
     InProcessRunner,
     RunCancelled,
     RunLog,
@@ -33,7 +36,6 @@ from napari_germquant._runner import (
     set_value_text,
 )
 from germquant import api
-from germquant.stages import BY_NAME
 
 MIN = _engine.MIN_ENGINE
 RID = "20261023T120000Z_0123abcd"
@@ -280,9 +282,10 @@ class _FakeProject:
 
 
 def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
-    """The same commands in this napari environment: germquant.api's project functions, with the project passed
-    explicitly (I11), the plugin version on every write, and project runs through api.run_project with
-    via=gui-inprocess, the run id, a progress callback that tails the engine's log, and should_stop."""
+    """The commands that are no project write, in this napari environment: germquant.api's project functions,
+    with the project passed explicitly (I11), and project runs through api.run_project with via=gui-inprocess,
+    the run id, a progress callback that tails the engine's log, and should_stop. (The six project writes run
+    the command of this environment: test_in_process_project_writes_run_the_command_of_this_environment.)"""
     calls: list[tuple] = []
 
     def fake(name, ret=None):
@@ -305,13 +308,7 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
         return {"run_id": run_id, "log": str(log.path), "counts": {"done": 1, "failed": 0, "skipped": 0},
                 "exit_code": 0}
 
-    for name, ret in {"open_project": _FakeProject, "new_project": lambda root, *a, **k: _FakeProject(root),
-                      "add_images": {"added": ["x"], "refused": []}, "write_recipe": "abc123abc123",
-                      "revert_recipe": "02bb83cf74f9", "save_project": None,
-                      "preview_roles": {"yaml": "roles: {}\n", "bindings": {}, "problems": []},
-                      "use_model": "def456def456", "list_rounds": ["r01"],
-                      "new_round": lambda p, name=None, **k: Path(p.root) / "training" / (name or "r02"),
-                      "break_lock": True, "project_status": {"format": 1, "images": []},
+    for name, ret in {"open_project": _FakeProject, "project_status": {"format": 1, "images": []},
                       "collect_project": {"tables": []}, "export_commands": "germquant project run X\n",
                       "import_labels": {"pairs": 2}, "tune_spots": {"run_dir": "tuning/t1", "best": {}, "ranked": []},
                       "apply_tuning": "fedcba987654",
@@ -323,43 +320,16 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
     fake_post.write_post_stages_file = lambda path, entries, **k: writes.append((Path(path), entries)) or Path(path)
     monkeypatch.setitem(sys.modules, "germquant.post_stages", fake_post)
 
-    r, v = InProcessRunner(), plugin_version()
+    r = InProcessRunner()
     assert {"projects", "import_labels", "tune_spots", "post_stages"} <= r.features()
     P = project_env.new_dir()
-    doc = r.project_new(P, "test_pack@0.1.0", recipe="basic", images=["a.tif"], name="N")
-    assert calls[-1] == ("new_project", (P, "test_pack@0.1.0", "basic", ["a.tif"]), {"name": "N",
-                                                                                      "plugin_version": v})
-    assert doc["root"] == str(P) and doc["manifest"] == {"name": "fake", "format": 1}
-    assert r.project_add(P, ["b.tif"]) == {"added": ["x"], "refused": []}
-    assert calls[-1][0] == "add_images" and calls[-1][1][1] == ["b.tif"] and calls[-1][2] == {"plugin_version": v}
-    assert isinstance(calls[-1][1][0], _FakeProject) and calls[-1][1][0].root == Path(P)
-    res = r.project_edit(P, edits={"spots.log.min_snr": 2.5}, unset=["a.b"], roles={"foci": "Rad52-GFP"},
-                         device="cpu", xy_stride=2, disable=["spots"])
-    # the recipe write first, then the run settings on the project as it is after that write
-    assert [c[0] for c in calls[-4:]] == ["open_project", "write_recipe", "open_project", "save_project"]
-    assert calls[-3][2] == {"edits": {"spots.log.min_snr": 2.5}, "unset": ("a.b",), "roles": {"foci": "Rad52-GFP"},
-                            "origin": "form", "plugin_version": v}
-    assert calls[-1][2] == {"plugin_version": v, "device": "cpu", "xy_stride": 2,
-                            "overrides": {BY_NAME["spots"].config_key: False}}     # what --no-spots sets
-    assert res == {"config_hash": "abc123abc123", "dry_run": False}
-    n = len(calls)
-    preview = r.project_edit(P, roles={"foci": "Rad52-GFP"}, edits={"a.b": 1}, dry_run=True)
-    assert preview == {"config_hash": None, "dry_run": True,
-                       "preview": {"yaml": "roles: {}\n", "bindings": {}, "problems": []}}
-    assert [c[0] for c in calls[n:]] == ["open_project", "preview_roles"]            # a dry run writes nothing
-    assert r.project_edit(P, revert=True)["config_hash"] == "02bb83cf74f9"
-    assert r.project_use_model(P, "training/r01/models/m/m")["config_hash"] == "def456def456"
-    assert r.project_rounds(P) == {"rounds": ["r01"], "created": None, "path": None}
-    assert r.project_rounds(P, new="r09") == {"rounds": ["r01"], "created": "r09",
-                                              "path": str(Path(P) / "training" / "r09")}
-    with pytest.raises(ValueError, match="a revert cannot be combined"):
-        r.project_edit(P, revert=True, edits={"spots.log.min_snr": 2.0})
-    assert r.project_unlock(P, host="h", pid=7)["removed"] is True
-    assert calls[-1][2] == {"host": "h", "pid": 7}
     assert r.project_status(P) == {"format": 1, "images": []}
+    assert calls[-2][0] == "open_project" and calls[-2][1] == (P,)
+    assert isinstance(calls[-1][1][0], _FakeProject) and calls[-1][1][0].root == Path(P)
     assert r.project_collect(P) == {"tables": []}
     out = r.project_export_commands(P, shell="ps1", out=project_env.root / "cmds.ps1")
     assert out["text"] == "germquant project run X\n" and (project_env.root / "cmds.ps1").read_text() == out["text"]
+    assert [f.name for f in project_env.root.iterdir() if f.name.endswith(".part")] == []    # written atomically
     seen: list[dict] = []
     res = r.project_run(P, images=["a"], resume=False, device="cpu", shard="1/2", run_id=RID, progress=seen.extend)
     rp = next(c for c in reversed(calls) if c[0] == "run_project")
@@ -381,6 +351,11 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
     monkeypatch.setattr(api, "import_labels", fake("import_labels", _raise(ValueError("a test-split image"))))
     with pytest.raises(EngineRefused, match="a test-split image"):
         r.import_labels("seg.npz", "cellacdc-npz", "img.tif", "pairs")
+    # so does a folder that is no project (open_project's ProjectError, a ValueError), as the commands' exit 2
+    monkeypatch.setattr(api, "open_project", fake("open_project", _raise(ValueError(f"no project at {P}"))))
+    for call in (r.project_status, r.project_collect, r.project_export_commands):
+        with pytest.raises(EngineRefused, match="REFUSED: no project at"):
+            call(P)
 
 
 def _raise(exc):
@@ -575,34 +550,106 @@ def test_each_engine_refusal_form_reads_as_a_refusal_with_its_reason(tmp_path):
     assert t.tune_spots(P) == scored_nothing
 
 
-def test_an_in_process_edit_means_what_the_command_means(project_env, monkeypatch):
-    """--role adds to the project's role edits (an empty channel drops one), --no-<stage> adds to its switched-off
-    stages, --unset of a stage key turns that stage back on, and none clears a run setting: the in-process edit
-    hands the API the same result the command line computes."""
-    from germquant.stages import BY_NAME
+def test_in_process_project_writes_run_the_command_of_this_environment(tmp_path, monkeypatch):
+    """The six project writes of the in-process runner (new, add, edit, use-model, rounds, unlock) run the
+    torch-free ``-m germquant.project`` of this environment's own Python (here a stand-in engine first on its
+    PYTHONPATH): the command line the subprocess runner sends, the command's own record back, its refusals as
+    the subprocess runner raises them, and no version check (the child is this germquant). So an edit is the
+    command's one planned write, never API writes in a row that a refusal could stop half way (review S1), and
+    new and add answer with the command's record (S3). This environment's feature gate still decides first."""
+    own = plugin_engine_info()
+    version = MIN if engine_too_old(str(own["germquant"])) else str(own["germquant"])
+    eng = standin_engine(tmp_path / "eng", version=version, git_sha=str(own["git_sha"]),
+                         features=list(_engine.FEATURES))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(p for p in (str(eng), os.environ.get("PYTHONPATH")) if p))
+    monkeypatch.setattr(api, "open_project", lambda root: None, raising=False)    # this environment's projects gate
+    started: list[list[str]] = []
+    run_proc = SubprocessRunner._run_proc
 
-    one, two = [s for s in BY_NAME.values() if s.cli_switchable][:2]
-    calls: list[tuple] = []
+    def spy(self, argv, **kw):
+        started.append(list(argv))
+        return run_proc(self, argv, **kw)
 
-    class Recorded(_FakeProject):
-        def __init__(self, root):
-            super().__init__(root)
-            self.manifest = {"recipe": {"roles": {"dna": "DAPI", "foci": "old"},
-                                        "overrides": {one.config_key: False}}}
+    monkeypatch.setattr(SubprocessRunner, "_run_proc", spy)
+    inproc, sub = InProcessRunner(), SubprocessRunner(sys.executable)
+    sub.version()
+    P = str(tmp_path / "proj")
+    calls = {
+        "new": lambda r: r.project_new(P, "test_pack@0.1.0", recipe="basic", images=tmp_path / "a.ome.tif",
+                                       name="N"),
+        "add": lambda r: r.project_add(P, [tmp_path / "b.ome.tif", str(tmp_path / "folder")]),
+        "edit": lambda r: r.project_edit(P, edits={"spots.log.min_snr": 2.5}, unset=["segmentation.x"],
+                                         roles={"foci": GAMMA + "H2AX", "dna": ""}, device="none", xy_stride=2,
+                                         z_range=(5, 2), runner="subprocess", interpreters={"basic": "none"},
+                                         disable=["spots"], dry_run=True),
+        "use-model": lambda r: r.project_use_model(P, "training/r01/models/m/m"),
+        "rounds": lambda r: r.project_rounds(P, new="r02"),
+        "unlock": lambda r: r.project_unlock(P, host="LAB-PC", pid=42),
+    }
+    for name, call in calls.items():
+        n = len(started)
+        theirs = call(sub)
+        sent = started[n:]
+        ours = call(inproc)
+        assert started[n + len(sent):] == sent and len(sent) == 1, name
+        assert sent[0][:4] == [sys.executable, "-m", "germquant.project", name], name
+        assert ours == theirs, name
+    # a refusal: the same EngineRefused, with the engine's reason
+    monkeypatch.setenv("FAKE_ENGINE_EXIT", "2")
+    monkeypatch.setenv("FAKE_ENGINE_STDERR", "REFUSED: z range [5, 2] must be two planes Z0 Z1 with 0 <= Z0 < Z1")
+    said = []
+    for r in (sub, inproc):
+        with pytest.raises(EngineRefused) as e:
+            r.project_edit(P, edits={"spots.log.min_snr": 2.5}, z_range=(5, 2))
+        said.append(str(e.value))
+    assert said[0] == said[1] and said[0].endswith("\nREFUSED: z range [5, 2] must be two planes Z0 Z1 with 0 <= Z0 < Z1")
+    # without projects in this environment, nothing starts
+    monkeypatch.delattr(api, "open_project")
+    n = len(started)
+    with pytest.raises(FeatureMissing, match="this napari environment"):
+        inproc.project_edit(P, edits={"spots.log.min_snr": 2.5})
+    assert len(started) == n
 
-    monkeypatch.setattr(api, "open_project", Recorded, raising=False)
-    for name, ret in (("write_recipe", "aaaaaaaaaaaa"), ("save_project", None), ("preview_roles", {})):
-        monkeypatch.setattr(api, name, lambda *a, _n=name, _r=ret, **k: calls.append((_n, a, k)) or _r,
-                            raising=False)
-    r, P = InProcessRunner(), project_env.new_dir()
-    res = r.project_edit(P, roles={"foci": "Rad52-GFP", "dna": ""}, unset=[one.config_key, "spots.log.min_snr"],
-                         disable=[two.name], device="none", z_range="none", runner="none",
-                         interpreters={"basic": "none"})
-    (_, _, wr), (_, _, sp) = calls
-    assert wr["roles"] == {"foci": "Rad52-GFP"} and wr["unset"] == ("spots.log.min_snr",)
-    assert sp["overrides"] == {two.config_key: False}                  # one is back on, two is off
-    assert (sp["device"], sp["runner"], sp["z_range"], sp["interpreters"]) == ("", "", (), {"basic": None})
-    assert res["config_hash"] == "aaaaaaaaaaaa"
-    calls.clear()
-    r.project_edit(P, roles={"foci": "x"}, dry_run=True)
-    assert calls == [("preview_roles", (calls[0][1][0], {"dna": "DAPI", "foci": "x"}), {})]
+
+def _project_state(root: Path) -> tuple:
+    """What a project edit can change: recipe.yaml and channel_map.yaml (their bytes, or None), the manifest
+    without what names this one project (its name, id and stamps), and the config_hash the engine computes."""
+    import yaml
+
+    files = tuple((root / n).read_bytes() if (root / n).is_file() else None
+                  for n in ("recipe.yaml", "channel_map.yaml"))
+    manifest = yaml.safe_load((root / "germquant_project.yaml").read_bytes().decode("ascii"))
+    return files, {k: v for k, v in manifest.items() if k not in ("name", "id", "created", "saved")}, \
+        api.open_project(root).config_hash
+
+
+def test_a_project_edit_through_both_runners_writes_the_same_files(project_env):
+    """The same project commands through the subprocess runner and the in-process runner, on projects the engine
+    makes from the test pack: new and add answer with the same record; a dry run writes nothing and gives the
+    config_hash the edit then gives; the edit writes the same recipe.yaml, manifest and config_hash; and an edit
+    the engine refuses (a recipe edit together with a z range it refuses) leaves both projects exactly as they
+    were (review S1, S3)."""
+    need_features("projects")
+    runners = {"subprocess": SubprocessRunner(sys.executable), "inprocess": InProcessRunner()}
+    roots = {k: project_env.new_dir(k) for k in runners}
+    image_id = api.image_stem(project_env.image)
+    new = {k: r.project_new(roots[k], "test_pack@0.1.0", images=project_env.image) for k, r in runners.items()}
+    assert sorted(new["subprocess"]) == sorted(new["inprocess"])
+    assert all(doc["added"] == [image_id] and doc["refused"] == [] for doc in new.values()), new
+    again = {k: r.project_add(roots[k], project_env.image) for k, r in runners.items()}       # a duplicate id
+    assert sorted(again["subprocess"]) == sorted(again["inprocess"])
+    assert [len(doc["refused"]) for doc in again.values()] == [1, 1]
+    start = {k: _project_state(roots[k]) for k in runners}
+    assert start["subprocess"] == start["inprocess"]
+    edit = {"edits": {"spots.log.min_snr": 2.5}, "xy_stride": 2}
+    dry = {k: r.project_edit(roots[k], dry_run=True, **edit) for k, r in runners.items()}
+    assert {k: _project_state(roots[k]) for k in runners} == start                    # a dry run writes nothing
+    done = {k: r.project_edit(roots[k], **edit) for k, r in runners.items()}
+    after = {k: _project_state(roots[k]) for k in runners}
+    assert after["subprocess"] == after["inprocess"] != start["subprocess"]
+    for k in runners:
+        assert dry[k]["config_hash"] == done[k]["config_hash"] == after[k][2] != start[k][2], k
+    for k, r in runners.items():
+        with pytest.raises(EngineRefused, match="z range"):
+            r.project_edit(roots[k], edits={"spots.log.min_snr": 4.0}, z_range=(5, 2))
+    assert {k: _project_state(roots[k]) for k in runners} == after                    # none of it was written

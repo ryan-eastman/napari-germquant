@@ -47,7 +47,11 @@ for the streamed lines. Through the subprocess runner:
   and a REFUSED line, which is EngineRefused too.
 
 The in-process runner calls the same commands through germquant.api (and germquant.segment.training for the
-training commands), passing the project explicitly (napari's thread workers start with no pack context).
+training commands), passing the project explicitly (napari's thread workers start with no pack context). The
+six project writes (new, add, edit, use-model, rounds, unlock) and ``pack derive`` are the exception: they run
+the torch-free entry of this napari environment's own Python as a child process, the same germquant, so each
+write is the command's own (an edit is one planned write under the project lock, with the command's refusals
+and record), not a second implementation of it here.
 
 The engine version string cannot tell a Train B engine (it stays 0.2.0.dev0), so the runners gate on the
 ``features`` list of ``python -m germquant.packs --version --json`` (an engine from before the list has packs and
@@ -909,14 +913,6 @@ def _command_name(argv: list[str]) -> str:
     return " ".join(str(a) for a in argv[3:5])
 
 
-def _cleared(value):
-    """The command line's word none, which clears a run setting, as the API's clearing value "" (None stays
-    None: not given)."""
-    if isinstance(value, str) and value.strip().lower() == "none":
-        return ""
-    return value
-
-
 def _refusal_types() -> tuple:
     """The errors the project command line turns into a refusal (exit 2)."""
     types_: list = [ValueError, OSError]
@@ -938,26 +934,11 @@ def _join_list(value) -> str:
     return value if isinstance(value, str) else ",".join(str(v) for v in value)
 
 
-def _stage_overrides(disable) -> dict[str, bool]:
-    """The config keys ``--no-<stage>`` sets to False (what RunPlan.overrides and apply_cli_switches set)."""
-    from germquant.stages import BY_NAME
-
-    return {BY_NAME[str(n)].config_key: False for n in disable or ()}
-
-
-def _project_doc(project) -> dict:
-    """A germquant.project Project as a record: root, name, manifest, images, pack and warnings."""
-    manifest = getattr(project, "manifest", None) or {}
-    return _jsonable({"root": str(getattr(project, "root", "")), "name": manifest.get("name"),
-                      "manifest": manifest, "images": getattr(project, "images", None) or [],
-                      "pack": getattr(project, "pack", None) or {},
-                      "warnings": getattr(project, "warnings", None) or [],
-                      "config_hash": getattr(project, "config_hash", None)})
-
-
 class InProcessRunner(EngineRunner):
     """This napari environment: germquant.packs for listing, checks and fetching, ``RunPlan.run``
-    (germquant.api.run) for runs. Chosen only explicitly. A call that has started cannot be stopped."""
+    (germquant.api.run) for runs. Chosen only explicitly. A call that has started cannot be stopped, except
+    the project writes and pack derive, which run this environment's torch-free entries as a child process
+    (``_child``) and end it on Cancel."""
 
     kind = "inprocess"
     via = VIA_INPROCESS
@@ -1089,7 +1070,20 @@ class InProcessRunner(EngineRunner):
         return fn
 
     def _open(self, root):
-        return self._api("open_project")(root)
+        """api.open_project(root); a folder that is no project (or cannot be read) is EngineRefused, as the
+        commands refuse it with exit 2."""
+        return self._api_call(self._api("open_project"), root)
+
+    def _child(self) -> SubprocessRunner:
+        """This napari environment's own Python as an engine process: the same germquant, through its torch-free
+        entries (``-m germquant.project``, ``-m germquant.packs``). The project writes and pack derive go there,
+        so each is the command's own code: an edit is planned whole and written once under the project lock,
+        with the command's refusals and record (section 9 names no single call for an edit, and a second
+        implementation of the command's merge here could drift from it). Its version document is this
+        germquant's, with the features this runner has (the API names decide), so no version check runs."""
+        child = SubprocessRunner(sys.executable)
+        child._version = {**plugin_engine_info(), "features": sorted(self.features())}
+        return child
 
     def _api_call(self, func, *args, refusals=None, **kwargs):
         """``func(*args, **kwargs)``; a refusal becomes EngineRefused, any other error a RunnerError naming the
@@ -1110,111 +1104,51 @@ class InProcessRunner(EngineRunner):
         _not_stopped(should_stop)
         self.require(*features)
 
+    # -- the six project writes: the torch-free command of this environment, in a child process (``_child``)
     def project_new(self, root, pack, *, recipe=None, images=(), name=None, plugin_version=None,
                     should_stop=None) -> dict:
         self._start(should_stop, "projects")
-        project = self._api_call(self._api("new_project"), root, pack, recipe, list(images or ()), name=name,
-                                 plugin_version=plugin_version or _plugin_version())
-        return _with_root(_project_doc(project), root)
+        return self._child().project_new(root, pack, recipe=recipe, images=images, name=name,
+                                         plugin_version=plugin_version, should_stop=should_stop)
 
     def project_add(self, root, paths, *, plugin_version=None, should_stop=None) -> dict:
         self._start(should_stop, "projects")
-        res = self._api_call(self._api("add_images"), self._open(root), list(paths),
-                             plugin_version=plugin_version or _plugin_version())
-        return _jsonable(res)
+        return self._child().project_add(root, paths, plugin_version=plugin_version, should_stop=should_stop)
 
     def project_edit(self, root, *, edits=None, unset=(), roles=None, revert=False, device=None, xy_stride=None,
                      z_range=None, runner=None, interpreters=None, samples=None, disable=(), dry_run=False,
                      plugin_version=None, should_stop=None) -> dict:
-        """The edit through the API, with the command's meaning: ``roles`` add to the role edits the project has
-        (an empty channel drops that role's edit), ``disable`` adds to its switched-off stages, an ``unset`` key
-        that is a stage switch turns that stage back on, and the word none clears device, runner, samples,
-        z_range and an interpreter. Then revert_recipe, or write_recipe for the keys and roles (origin form), and
-        save_project for the run settings, the sample sheet's name and the stage switches, each on the project as
-        the write before it left it. A dry run writes nothing and previews the roles (preview_roles); the
-        config_hash an edit would give comes from the engine's ``project edit --dry-run``, which only the
-        subprocess runner runs, so it is None here."""
+        """``project edit`` itself (``_child``): the command plans the whole change (recipe keys, roles, the run
+        settings, the stage switches), checks all of it, then writes it once under the project lock, so a
+        refusal leaves the project as it was; a dry run gives the preview and the config_hash an edit would
+        give."""
         self._start(should_stop, "projects", *(("sample_sheet",) if samples else ()))
-        _check_edit(revert, edits, unset, roles)
-        _disabled_flags(disable)                       # refuses a stage without a switch
-        v = plugin_version or _plugin_version()
-        call, fn = self._api_call, self._api
-        project = self._open(root)
-        recorded = dict((getattr(project, "manifest", None) or {}).get("recipe") or {})
-        merged_roles = None
-        if roles:
-            merged_roles = dict(recorded.get("roles") or {})
-            for role, channel in roles.items():
-                if channel in (None, ""):
-                    merged_roles.pop(role, None)
-                else:
-                    merged_roles[role] = channel
-        overrides = dict(recorded.get("overrides") or {})
-        switched = bool(disable)
-        overrides.update(_stage_overrides(disable))
-        recipe_unset = []
-        for key in unset or ():
-            if key in overrides:
-                overrides.pop(key)
-                switched = True
-            else:
-                recipe_unset.append(key)
-        out: dict = {"config_hash": None, "dry_run": bool(dry_run)}
-        if dry_run:
-            out["preview"] = (_jsonable(call(fn("preview_roles"), project, merged_roles))
-                              if merged_roles is not None else None)
-            return out
-        wrote = False
-        if revert:
-            out["config_hash"] = call(fn("revert_recipe"), project, plugin_version=v)
-            wrote = True
-        if edits or recipe_unset or merged_roles is not None:
-            if wrote:
-                project = self._open(root)
-            out["config_hash"] = call(fn("write_recipe"), project, edits=dict(edits) if edits else None,
-                                      unset=tuple(recipe_unset), roles=merged_roles, origin="form",
-                                      plugin_version=v)
-            wrote = True
-        save = {"device": _cleared(device), "runner": _cleared(runner), "samples": _cleared(samples),
-                "interpreters": ({k: (None if _cleared(p) == "" else p) for k, p in interpreters.items()}
-                                 if interpreters else None),
-                "xy_stride": int(xy_stride) if xy_stride is not None else None,
-                "z_range": (() if _cleared(z_range) == "" else tuple(int(z) for z in z_range))
-                if z_range is not None else None,
-                "overrides": overrides if switched else None}
-        save = {k: val for k, val in save.items() if val is not None}
-        if save:
-            call(fn("save_project"), self._open(root) if wrote else project, plugin_version=v, **save)
-        return _jsonable(out)
+        return self._child().project_edit(root, edits=edits, unset=unset, roles=roles, revert=revert,
+                                          device=device, xy_stride=xy_stride, z_range=z_range, runner=runner,
+                                          interpreters=interpreters, samples=samples, disable=disable,
+                                          dry_run=dry_run, plugin_version=plugin_version, should_stop=should_stop)
 
     def project_use_model(self, root, model, *, card=None, plugin_version=None, should_stop=None) -> dict:
         self._start(should_stop, "projects")
-        h = self._api_call(self._api("use_model"), self._open(root), str(model),
-                           card=str(card) if card else None, plugin_version=plugin_version or _plugin_version())
-        return {"config_hash": h}
+        return self._child().project_use_model(root, model, card=card, plugin_version=plugin_version,
+                                               should_stop=should_stop)
 
     def project_rounds(self, root, *, new=None, plugin_version=None, should_stop=None) -> dict:
         self._start(should_stop, "projects")
-        _check_round(new)
-        project = self._open(root)
-        created = None
-        if new:
-            created = self._api_call(self._api("new_round"), project, new if isinstance(new, str) else None,
-                                     plugin_version=plugin_version or _plugin_version())
-        return {"rounds": _jsonable(self._api_call(self._api("list_rounds"), project)),
-                "created": Path(created).name if created is not None else None,
-                "path": str(created) if created is not None else None}
+        return self._child().project_rounds(root, new=new, plugin_version=plugin_version, should_stop=should_stop)
 
     def project_unlock(self, root, *, host, pid, should_stop=None) -> dict:
         self._start(should_stop, "projects")
-        removed = self._api_call(self._api("break_lock"), self._open(root), host=str(host), pid=int(pid))
-        return {"removed": bool(removed)}
+        return self._child().project_unlock(root, host=host, pid=pid, should_stop=should_stop)
 
     def project_run(self, root, *, images=None, resume=True, device=None, shard=None, run_id=None, say=None,
                     progress=None, should_stop=None) -> dict:
         """api.run_project with via gui-inprocess and the run id; its progress callback (whatever it passes)
-        reads the engine's log, so ``progress`` gets the same events as through the subprocess runner. The run
-        stops between images when ``should_stop`` answers True (RunCancelled once it has)."""
+        reads the engine's log, so ``progress`` gets the same events as through the subprocess runner. As the
+        command answers: a refusal before the run started (no run_start in its log: a folder that is no project,
+        a model digest mismatch, a series it cannot run) is state refused, as exit 2; any other error is a
+        RunnerError with the run, its log and its events attached. The run stops between images when
+        ``should_stop`` answers True, then RunCancelled, unless the run had finished every image."""
         self._start(should_stop, "projects")
         run_id = check_run_id(run_id or new_run_id())
         tail = LogTail(project_log_path(root, run_id))
@@ -1227,15 +1161,31 @@ class InProcessRunner(EngineRunner):
                 if progress is not None:
                     progress(new)
 
-        res = self._api_call(self._api("run_project"), self._open(root), images=list(images) if images else None,
-                             resume=bool(resume), device=device or self.device, shard=shard, progress=tick,
-                             via=self.via, run_id=run_id, should_stop=should_stop, refusals=())
+        def with_run(err: RunnerError) -> RunnerError:
+            err.run_id, err.run_log, err.events = run_id, str(tail.path), events
+            return err
+
+        run_project, open_project = self._api("run_project"), self._api("open_project")
+        try:
+            res = run_project(open_project(root), images=list(images) if images else None, resume=bool(resume),
+                              device=device or self.device, shard=shard, progress=tick, via=self.via,
+                              run_id=run_id, should_stop=should_stop)
+        except RunnerError:
+            raise
+        except _refusal_types() as e:
+            tick()
+            if not any(ev.get("event") == "run_start" for ev in events):
+                return project_run_result(run_id, tail.path, events, 2, [f"REFUSED: {e}"])
+            raise with_run(RunnerError(f"run_project failed: {type(e).__name__}: {e}")) from e
+        except Exception as e:  # noqa: BLE001 - one message for the dock, the cause chained
+            tick()
+            raise with_run(RunnerError(f"run_project failed: {type(e).__name__}: {e}")) from e
         tick()
         res = res if isinstance(res, dict) else {}
         if should_stop is not None and should_stop():
-            e = RunCancelled("cancelled by the user: the in-process run stopped between images")
-            e.run_id, e.run_log, e.events = run_id, str(tail.path), events
-            raise e
+            board = run_outcome(events, alive=False)
+            if not board["finished"] or board["interrupted"]:      # a run that finished keeps its result
+                raise with_run(RunCancelled("cancelled by the user: the in-process run stopped between images"))
         message = [str(res["message"])] if res.get("message") else []
         return project_run_result(run_id, res.get("log") or tail.path, events, int(res.get("exit_code", 0)),
                                   message)
@@ -1340,12 +1290,10 @@ class InProcessRunner(EngineRunner):
             return _jsonable(self._api_call(fn, pairs, out, **kw))
 
     def pack_derive(self, from_ref, recipe, model, card, out, *, new_id=None, should_stop=None) -> dict:
-        """The API names no derive function, so this runs the torch-free ``-m germquant.packs derive`` as a child
-        of this napari environment's own Python: the same germquant and packs, in a process of its own."""
+        """The API names no derive function, so this runs the torch-free ``-m germquant.packs derive`` of this
+        environment (``_child``): the same germquant and packs, in a process of its own."""
         self._start(should_stop, "pack_derive")
-        child = SubprocessRunner(sys.executable)
-        child._version = dict(plugin_engine_info())    # the same germquant: its features are this one's
-        return child.pack_derive(from_ref, recipe, model, card, out, new_id=new_id, should_stop=should_stop)
+        return self._child().pack_derive(from_ref, recipe, model, card, out, new_id=new_id, should_stop=should_stop)
 
     def tune_spots(self, project, *, points=None, grid=None, max_runs=None, out=None, say=None,
                    should_stop=None) -> dict:
