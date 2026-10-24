@@ -19,7 +19,7 @@ from conftest import need_features
 from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QSpinBox
 
 from napari_germquant import _settings
-from napari_germquant._params import MISSING, RESET, Tunable, form_change, validated_badge
+from napari_germquant._params import MISSING, RESET, Tunable, form_change, recipe_edits, validated_badge
 from napari_germquant._recipe_widget import RecipeTab
 from napari_germquant._runner import EngineRefused, InProcessRunner
 
@@ -188,6 +188,7 @@ def test_reset_returns_to_the_pack_hash(project_env, qtbot):
     _settle(tab, qtbot)
     assert tab.apply_roles()
     _settle(tab, qtbot)
+    assert tab.others_label.text() == ""                           # the role editor's own io.channel_map
     tab.set_value(MIN_SNR, 4.0)
     assert tab.apply_form()
     _settle(tab, qtbot)
@@ -439,6 +440,23 @@ def test_the_form_rules_follow_the_engines():
         u.check(1)
     assert _t({"key": "k", "type": "float"}, pack=MISSING).pack_text() == "pack value unknown"
     assert _t({"key": "k", "label": "Lbl", "type": "float", "unit": "um3"}).title == "Lbl"
+
+
+def test_recipe_edits_leave_out_the_role_editors_own_map(tmp_path):
+    """recipe.yaml's keys are the project's edits, the extends line left out, and io.channel_map left out when it
+    names the role editor's own channel_map.yaml (the manifest records role choices), as the engine's read_edits
+    does; a map the roles did not write is a hand edit, shown as one."""
+    (tmp_path / "recipe.yaml").write_bytes(b"extends: pack:test_pack@0.1.0/basic\nio:\n  channel_map: "
+                                           b"channel_map.yaml\nspots:\n  log:\n    min_snr: 3.5\n")
+    rec = {"file": "recipe.yaml", "roles": {"dna": "H2B"}}
+    assert recipe_edits(tmp_path, {"recipe": rec}) == ({"spots.log.min_snr": 3.5}, None)
+    assert recipe_edits(tmp_path, {"recipe": {**rec, "roles": {}}}) == (
+        {"io.channel_map": "channel_map.yaml", "spots.log.min_snr": 3.5}, None)
+    (tmp_path / "recipe.yaml").write_bytes(b"extends: pack:test_pack@0.1.0/basic\nio:\n  channel_map: mine.yaml\n")
+    assert recipe_edits(tmp_path, {"recipe": rec}) == ({"io.channel_map": "mine.yaml"}, None)
+    assert recipe_edits(tmp_path, {"recipe": {"file": None}}) == ({}, None)
+    edits, problem = recipe_edits(tmp_path, {"recipe": {"file": "gone.yaml"}})
+    assert edits == {} and "the manifest names it but it is missing" in problem
 
 
 def test_form_change_and_the_badge():

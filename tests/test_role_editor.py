@@ -137,6 +137,7 @@ def test_role_edit_writes_ascii_maps_and_runs_headless(project_env, qtbot):
     assert tab.role_choice("dna") == "H2B-mCherry" and tab.role_choice("foci") == "Rad52-GFP"
     assert tab.preview_states() == {image_id: {"dna": "name", "foci": "name"}}
     assert not tab.apply_roles_btn.isEnabled()                     # applied: nothing left to apply
+    assert tab.others_label.text() == ""                           # its own io.channel_map is no hand edit
 
     # the dock's run (its in-process route, gui-inprocess: no second torch start in CI) against a headless
     # `germquant project run` of a copy
