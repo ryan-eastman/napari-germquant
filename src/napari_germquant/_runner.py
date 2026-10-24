@@ -732,12 +732,12 @@ class EngineRunner:
         raise NotImplementedError
 
     def project_rounds(self, root, *, new=None, plugin_version: str | None = None, should_stop=None) -> dict:
-        """``project rounds``: ``rounds`` (names) and ``created`` (the new round's folder, with ``new`` True or a
-        name)."""
+        """``project rounds``: ``rounds`` (names), and with ``new`` (True for the next of r01, r02 and so on, or a
+        name) ``created`` (the new round's name) and ``path`` (its folder)."""
         raise NotImplementedError
 
     def project_unlock(self, root, *, host: str, pid: int, should_stop=None) -> dict:
-        """``project unlock``: ``removed`` (whether the lock of that host and pid was removed)."""
+        """``project unlock``: ``removed`` (whether a lock of that host and pid was there and is gone)."""
         raise NotImplementedError
 
     def project_run(self, root, *, images=None, resume: bool = True, device: str | None = None,
@@ -825,6 +825,23 @@ def _check_round(new) -> None:
         raise ValueError(f"not a round name: {new!r} (letters, digits, dash and underscore, at most 40)")
 
 
+def _refusal_reason(lines: list[str]) -> str:
+    """The reason a refused command gave: its "REFUSED: ..." lines, else the ``error`` of a JSON record."""
+    refused = [ln.strip() for ln in lines if ln.strip().startswith("REFUSED:")]
+    if refused:
+        return "\n".join(dict.fromkeys(refused))
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("{") and '"error"' in s:
+            try:
+                doc = json.loads(s)
+            except ValueError:
+                continue
+            if isinstance(doc, dict) and doc.get("error"):
+                return f"REFUSED: {doc['error']}"
+    return ""
+
+
 def _command_name(argv: list[str]) -> str:
     """The command an argument list runs, for a message: the module and its command words ("germquant project
     status", "germquant.project new"), or the first two arguments after a wrapper's code."""
@@ -834,6 +851,31 @@ def _command_name(argv: list[str]) -> str:
         keep = 3 if words[:1] == ["germquant"] and words[1:2] in (["project"], ["pack"]) else 2
         return " ".join(words[:keep])
     return " ".join(str(a) for a in argv[3:5])
+
+
+def _cleared(value):
+    """The command line's word none, which clears a run setting, as the API's clearing value "" (None stays
+    None: not given)."""
+    if isinstance(value, str) and value.strip().lower() == "none":
+        return ""
+    return value
+
+
+def _refusal_types() -> tuple:
+    """The errors the project command line turns into a refusal (exit 2)."""
+    types_: list = [ValueError, OSError]
+    try:
+        from germquant.packs import PackInstallError
+
+        types_.append(PackInstallError)
+    except ImportError:
+        pass
+    return tuple(types_)
+
+
+def _check_edit(revert, edits, unset, roles) -> None:
+    if revert and (edits or unset or roles):
+        raise ValueError("a revert cannot be combined with edits, unset keys or roles: it drops every recipe edit")
 
 
 def _join_list(value) -> str:
@@ -853,7 +895,8 @@ def _project_doc(project) -> dict:
     return _jsonable({"root": str(getattr(project, "root", "")), "name": manifest.get("name"),
                       "manifest": manifest, "images": getattr(project, "images", None) or [],
                       "pack": getattr(project, "pack", None) or {},
-                      "warnings": getattr(project, "warnings", None) or []})
+                      "warnings": getattr(project, "warnings", None) or [],
+                      "config_hash": getattr(project, "config_hash", None)})
 
 
 class InProcessRunner(EngineRunner):
@@ -992,9 +1035,12 @@ class InProcessRunner(EngineRunner):
     def _open(self, root):
         return self._api("open_project")(root)
 
-    def _api_call(self, func, *args, refusals=(ValueError,), **kwargs):
-        """``func(*args, **kwargs)``; a refusal (``refusals``: what the engine's command line turns into exit 2)
-        becomes EngineRefused, any other error a RunnerError naming the call."""
+    def _api_call(self, func, *args, refusals=None, **kwargs):
+        """``func(*args, **kwargs)``; a refusal becomes EngineRefused, any other error a RunnerError naming the
+        call. ``refusals``: what the engine's command line turns into exit 2 (by default as the project commands
+        do: ValueError, which ProjectError is, OSError and PackInstallError); ``()`` for none."""
+        if refusals is None:
+            refusals = _refusal_types()
         try:
             return func(*args, **kwargs)
         except RunnerError:
@@ -1024,36 +1070,62 @@ class InProcessRunner(EngineRunner):
     def project_edit(self, root, *, edits=None, unset=(), roles=None, revert=False, device=None, xy_stride=None,
                      z_range=None, runner=None, interpreters=None, samples=None, disable=(), dry_run=False,
                      plugin_version=None, should_stop=None) -> dict:
-        """The edit through the API: revert_recipe, then write_recipe for the keys and roles (origin form), then
-        save_project for the run settings, the sample sheet's name and the switched-off stages, each on the
-        project as the write before it left it. A dry run writes nothing and previews the roles (preview_roles);
-        the config_hash an edit would give comes from the engine's ``project edit --dry-run``, which only the
+        """The edit through the API, with the command's meaning: ``roles`` add to the role edits the project has
+        (an empty channel drops that role's edit), ``disable`` adds to its switched-off stages, an ``unset`` key
+        that is a stage switch turns that stage back on, and the word none clears device, runner, samples,
+        z_range and an interpreter. Then revert_recipe, or write_recipe for the keys and roles (origin form), and
+        save_project for the run settings, the sample sheet's name and the stage switches, each on the project as
+        the write before it left it. A dry run writes nothing and previews the roles (preview_roles); the
+        config_hash an edit would give comes from the engine's ``project edit --dry-run``, which only the
         subprocess runner runs, so it is None here."""
         self._start(should_stop, "projects", *(("sample_sheet",) if samples else ()))
-        flags = _disabled_flags(disable)
+        _check_edit(revert, edits, unset, roles)
+        _disabled_flags(disable)                       # refuses a stage without a switch
         v = plugin_version or _plugin_version()
         call, fn = self._api_call, self._api
         project = self._open(root)
+        recorded = dict((getattr(project, "manifest", None) or {}).get("recipe") or {})
+        merged_roles = None
+        if roles:
+            merged_roles = dict(recorded.get("roles") or {})
+            for role, channel in roles.items():
+                if channel in (None, ""):
+                    merged_roles.pop(role, None)
+                else:
+                    merged_roles[role] = channel
+        overrides = dict(recorded.get("overrides") or {})
+        switched = bool(disable)
+        overrides.update(_stage_overrides(disable))
+        recipe_unset = []
+        for key in unset or ():
+            if key in overrides:
+                overrides.pop(key)
+                switched = True
+            else:
+                recipe_unset.append(key)
         out: dict = {"config_hash": None, "dry_run": bool(dry_run)}
         if dry_run:
-            out["preview"] = _jsonable(call(fn("preview_roles"), project, dict(roles))) if roles else None
+            out["preview"] = (_jsonable(call(fn("preview_roles"), project, merged_roles))
+                              if merged_roles is not None else None)
             return out
         wrote = False
         if revert:
             out["config_hash"] = call(fn("revert_recipe"), project, plugin_version=v)
             wrote = True
-        if edits or unset or roles:
+        if edits or recipe_unset or merged_roles is not None:
             if wrote:
                 project = self._open(root)
             out["config_hash"] = call(fn("write_recipe"), project, edits=dict(edits) if edits else None,
-                                      unset=tuple(unset or ()), roles=dict(roles) if roles else None,
-                                      origin="form", plugin_version=v)
+                                      unset=tuple(recipe_unset), roles=merged_roles, origin="form",
+                                      plugin_version=v)
             wrote = True
-        save = {"device": device, "interpreters": dict(interpreters) if interpreters else None, "runner": runner,
+        save = {"device": _cleared(device), "runner": _cleared(runner), "samples": _cleared(samples),
+                "interpreters": ({k: (None if _cleared(p) == "" else p) for k, p in interpreters.items()}
+                                 if interpreters else None),
                 "xy_stride": int(xy_stride) if xy_stride is not None else None,
-                "z_range": tuple(z_range) if z_range is not None else None,
-                "samples": str(samples) if samples is not None else None,
-                "overrides": _stage_overrides(disable) if flags else None}
+                "z_range": (() if _cleared(z_range) == "" else tuple(int(z) for z in z_range))
+                if z_range is not None else None,
+                "overrides": overrides if switched else None}
         save = {k: val for k, val in save.items() if val is not None}
         if save:
             call(fn("save_project"), self._open(root) if wrote else project, plugin_version=v, **save)
@@ -1074,7 +1146,8 @@ class InProcessRunner(EngineRunner):
             created = self._api_call(self._api("new_round"), project, new if isinstance(new, str) else None,
                                      plugin_version=plugin_version or _plugin_version())
         return {"rounds": _jsonable(self._api_call(self._api("list_rounds"), project)),
-                "created": str(created) if created is not None else None}
+                "created": Path(created).name if created is not None else None,
+                "path": str(created) if created is not None else None}
 
     def project_unlock(self, root, *, host, pid, should_stop=None) -> dict:
         self._start(should_stop, "projects")
@@ -1568,8 +1641,14 @@ class SubprocessRunner(EngineRunner):
         code not in ``ok``: RunnerError."""
         rc, out, err = self._run_proc(argv, say=say, say_streams=("err",), should_stop=should_stop,
                                       extra_env=extra_env)
-        self._check_exit(argv, rc, out + err, ok=ok)
-        return _parse_json("\n".join(out))
+        if rc in ok:
+            try:
+                return _parse_json("\n".join(out))
+            except RunnerError:
+                if rc == 0:
+                    raise
+        self._check_exit(argv, rc, out + err)         # a code in ok without a record is an error after all
+        raise RunnerError(f"`{_command_name(argv)}` exited with code {rc} and no record")
 
     def _entry_missing(self, text: str) -> None:
         """A clear message when a torch-free Train B entry is not there (an engine part way through the train):
@@ -1595,7 +1674,8 @@ class SubprocessRunner(EngineRunner):
         self._module_missing(text)
         what = _command_name(argv)
         if rc == 2:
-            raise EngineRefused(f"`{what}` was refused by the engine (exit 2):\n{_tail(text, 2500)}", output=text)
+            reason = _refusal_reason(lines) or _tail(text, 2500)
+            raise EngineRefused(f"`{what}` was refused by the engine (exit 2):\n{reason}", output=text)
         raise RunnerError(f"`{what}` failed (exit {rc}) in {self.python}:\n{_tail(text, 2500)}")
 
     def _lines_result(self, argv, rc, lines) -> dict:
@@ -1614,7 +1694,8 @@ class SubprocessRunner(EngineRunner):
         if name:
             args += ["--name", name]
         args += ["--plugin-version", plugin_version or _plugin_version(), "--json"]
-        return _with_root(self._command_json(self.project_argv(*args), should_stop=should_stop), root)
+        # exit 1 with its record: some --images were refused, each named (the others were added)
+        return _with_root(self._command_json(self.project_argv(*args), should_stop=should_stop, ok=(0, 1)), root)
 
     def project_add(self, root, paths, *, plugin_version=None, should_stop=None) -> dict:
         self._start(should_stop, "projects")
@@ -1626,6 +1707,7 @@ class SubprocessRunner(EngineRunner):
                      z_range=None, runner=None, interpreters=None, samples=None, disable=(), dry_run=False,
                      plugin_version=None, should_stop=None) -> dict:
         self._start(should_stop, "projects", *(("sample_sheet",) if samples else ()))
+        _check_edit(revert, edits, unset, roles)
         args: list = ["edit", root]
         for key, value in (edits or {}).items():
             args += ["--set", f"{key}={set_value_text(value)}"]
@@ -1639,7 +1721,9 @@ class SubprocessRunner(EngineRunner):
             args += ["--device", device]
         if xy_stride is not None:
             args += ["--xy-stride", int(xy_stride)]
-        if z_range is not None:
+        if isinstance(z_range, str):
+            args += ["--z-range", z_range]             # the word none clears the range
+        elif z_range is not None:
             z0, z1 = z_range
             args += ["--z-range", int(z0), int(z1)]
         if runner:
@@ -1677,7 +1761,8 @@ class SubprocessRunner(EngineRunner):
         rc, lines = self._command_lines(argv, should_stop=should_stop)
         if rc not in (0, 1, 2):
             self._check_exit(argv, rc, lines)
-        return {"removed": rc == 0, "exit_code": rc, "lines": lines}
+        removed = rc == 0 and not any("not locked" in line for line in lines)
+        return {"removed": removed, "exit_code": rc, "lines": lines}
 
     # -- the full command line
     def project_run(self, root, *, images=None, resume=True, device=None, shard=None, run_id=None, say=None,

@@ -328,8 +328,11 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
     assert [c[0] for c in calls[n:]] == ["open_project", "preview_roles"]            # a dry run writes nothing
     assert r.project_edit(P, revert=True)["config_hash"] == "02bb83cf74f9"
     assert r.project_use_model(P, "training/r01/models/m/m")["config_hash"] == "def456def456"
-    assert r.project_rounds(P) == {"rounds": ["r01"], "created": None}
-    assert r.project_rounds(P, new="r09")["created"] == str(Path(P) / "training" / "r09")
+    assert r.project_rounds(P) == {"rounds": ["r01"], "created": None, "path": None}
+    assert r.project_rounds(P, new="r09") == {"rounds": ["r01"], "created": "r09",
+                                              "path": str(Path(P) / "training" / "r09")}
+    with pytest.raises(ValueError, match="a revert cannot be combined"):
+        r.project_edit(P, revert=True, edits={"spots.log.min_snr": 2.0})
     assert r.project_unlock(P, host="h", pid=7)["removed"] is True
     assert calls[-1][2] == {"host": "h", "pid": 7}
     assert r.project_status(P) == {"format": 1, "images": []}
@@ -433,3 +436,78 @@ def test_a_missing_entry_is_named_and_add_keeps_its_record_on_exit_1(tmp_path):
     assert r1.project_add(tmp_path / "p", ["a.tif"])["argv"][:2] == ["add", str(tmp_path / "p")]
     with pytest.raises(RunnerError, match=r"`germquant project status` failed \(exit 1\)"):
         r1.project_status(tmp_path / "p")
+
+
+def test_the_engines_answers_to_refusals_partial_adds_and_a_lock_that_is_not_there(tmp_path):
+    """As the project command line answers: exit 2 is a refusal whose reason is the engine's REFUSED line (or the
+    error of its JSON record); new and add exit 1 with their record when some files were refused; unlock exits 0
+    when there was no lock, and that is no removal. A revert with edits is refused before anything starts."""
+    own = plugin_engine_info()
+    version = MIN if engine_too_old(str(own["germquant"])) else str(own["germquant"])
+    root = standin_engine(tmp_path / "eng", version=version, git_sha=str(own["git_sha"]),
+                          features=list(_engine.FEATURES))
+    P = str(tmp_path / "proj")
+
+    def runner(**env) -> SubprocessRunner:
+        return SubprocessRunner(sys.executable, env={"PYTHONPATH": str(root), **env})
+
+    refused = runner(FAKE_ENGINE_EXIT="2", FAKE_ENGINE_STDERR="REFUSED: the project is locked by LAB-PC pid 42",
+                     FAKE_ENGINE_STDOUT='{"error": "the project is locked by LAB-PC pid 42", "kind": "ProjectError"}')
+    with pytest.raises(EngineRefused) as e:
+        refused.project_edit(P, edits={"spots.log.min_snr": 2.0})
+    assert str(e.value) == ("`germquant.project edit` was refused by the engine (exit 2):\n"
+                            "REFUSED: the project is locked by LAB-PC pid 42")
+    json_only = runner(FAKE_ENGINE_EXIT="2", FAKE_ENGINE_STDOUT='{"error": "no project at X", "kind": "ProjectError"}')
+    with pytest.raises(EngineRefused, match="REFUSED: no project at X$"):
+        json_only.project_use_model(P, "training/r01/models/m/m")
+    partial = runner(FAKE_ENGINE_EXIT="1", FAKE_ENGINE_STDOUT='{"root": "R", "added": ["a"], "refused": '
+                                                             '[{"path": "b.czi", "reason": "multi-scene"}]}')
+    assert partial.project_new(P, "test_pack@0.1.0", images=["a.tif", "b.czi"])["refused"][0]["reason"] == \
+        "multi-scene"
+    assert partial.project_add(P, ["b.czi"])["added"] == ["a"]
+    with pytest.raises(RunnerError, match="exit 1"):
+        partial.project_edit(P, edits={"a.b": 1})                       # exit 1 is no answer of edit
+    gone = runner(FAKE_ENGINE_STDOUT="the project is not locked")
+    assert gone.project_unlock(P, host="h", pid=1)["removed"] is False
+    assert runner(FAKE_ENGINE_STDOUT="removed the lock of h pid 1").project_unlock(P, host="h", pid=1)["removed"]
+    n = len(gone.history)
+    with pytest.raises(ValueError, match="a revert cannot be combined"):
+        gone.project_edit(P, revert=True, roles={"foci": "x"})
+    assert len(gone.history) == n                                       # nothing ran
+    plain = runner()
+    plain.project_edit(P, z_range="none", device="none")
+    assert plain.history[-1][3:] == ["edit", P, "--device", "none", "--z-range", "none", "--plugin-version",
+                                     plugin_version(), "--json"]
+
+
+def test_an_in_process_edit_means_what_the_command_means(project_env, monkeypatch):
+    """--role adds to the project's role edits (an empty channel drops one), --no-<stage> adds to its switched-off
+    stages, --unset of a stage key turns that stage back on, and none clears a run setting: the in-process edit
+    hands the API the same result the command line computes."""
+    from germquant.stages import BY_NAME
+
+    one, two = [s for s in BY_NAME.values() if s.cli_switchable][:2]
+    calls: list[tuple] = []
+
+    class Recorded(_FakeProject):
+        def __init__(self, root):
+            super().__init__(root)
+            self.manifest = {"recipe": {"roles": {"dna": "DAPI", "foci": "old"},
+                                        "overrides": {one.config_key: False}}}
+
+    monkeypatch.setattr(api, "open_project", Recorded, raising=False)
+    for name, ret in (("write_recipe", "aaaaaaaaaaaa"), ("save_project", None), ("preview_roles", {})):
+        monkeypatch.setattr(api, name, lambda *a, _n=name, _r=ret, **k: calls.append((_n, a, k)) or _r,
+                            raising=False)
+    r, P = InProcessRunner(), project_env.new_dir()
+    res = r.project_edit(P, roles={"foci": "Rad52-GFP", "dna": ""}, unset=[one.config_key, "spots.log.min_snr"],
+                         disable=[two.name], device="none", z_range="none", runner="none",
+                         interpreters={"basic": "none"})
+    (_, _, wr), (_, _, sp) = calls
+    assert wr["roles"] == {"foci": "Rad52-GFP"} and wr["unset"] == ("spots.log.min_snr",)
+    assert sp["overrides"] == {two.config_key: False}                  # one is back on, two is off
+    assert (sp["device"], sp["runner"], sp["z_range"], sp["interpreters"]) == ("", "", (), {"basic": None})
+    assert res["config_hash"] == "aaaaaaaaaaaa"
+    calls.clear()
+    r.project_edit(P, roles={"foci": "x"}, dry_run=True)
+    assert calls == [("preview_roles", (calls[0][1][0], {"dna": "DAPI", "foci": "x"}), {})]

@@ -4,9 +4,10 @@ package whose four command entries answer as the Train B engine's will (``python
 runner's argument lists, run-log tailing, exit codes, Cancel and the features gate are tested before the engine
 has them, and without loading torch.
 
-Every entry but the two below prints one JSON line, ``{"module", "argv", "device_env"}``, and exits with
-$FAKE_ENGINE_EXIT (default 0). ``python -m germquant.packs --version --json`` prints the version document, with
-the ``features`` list only when one was given (an engine from before the list has none).
+Every entry but the two below prints one JSON line, ``{"module", "argv", "device_env"}`` (or $FAKE_ENGINE_STDOUT
+instead), first $FAKE_ENGINE_STDERR on stderr when it is set, and exits with $FAKE_ENGINE_EXIT (default 0).
+``python -m germquant.packs --version --json`` prints the version document, with the ``features`` list only when
+one was given (an engine from before the list has none).
 ``python -m germquant project run DIR --run-id ID --via V ...`` plays the scenario in $FAKE_PROJECT_RUN (JSON):
 it writes DIR/runs/ID.jsonl as the engine does (one fsynced ASCII line per event) and then exits, hangs or
 crashes:
@@ -128,8 +129,10 @@ def main(module):
         sys.exit(0)
     if module == "germquant" and args[:2] == ["project", "run"]:
         project_run(args[2:])
-    print(json.dumps({{"module": module, "argv": args, "device_env": os.environ.get("GERMQUANT_DEVICE")}}),
-          flush=True)
+    if os.environ.get("FAKE_ENGINE_STDERR"):
+        print(os.environ["FAKE_ENGINE_STDERR"], file=sys.stderr, flush=True)
+    record = {{"module": module, "argv": args, "device_env": os.environ.get("GERMQUANT_DEVICE")}}
+    print(os.environ.get("FAKE_ENGINE_STDOUT") or json.dumps(record), flush=True)
     sys.exit(int(os.environ.get("FAKE_ENGINE_EXIT", "0")))
 '''
 
