@@ -411,3 +411,25 @@ def test_the_in_process_runner_exports_and_trains_through_the_engine_functions(t
     monkeypatch.setattr(T, "train_nuclei", old_train)
     with pytest.raises(RunnerError, match="takes no kind"):
         r.train_nuclei("pairs", tmp_path / "m", kind="nucleus")
+
+
+def test_a_missing_entry_is_named_and_add_keeps_its_record_on_exit_1(tmp_path):
+    """An engine part way through the train (projects listed, no germquant.project entry yet) gets a message
+    naming the entry, not P4's "no germquant installed"; ``project add`` returns its record when it exits 1
+    (some paths refused, the others added), while another command's exit 1 is an error."""
+    own = plugin_engine_info()
+    version = MIN if engine_too_old(str(own["germquant"])) else str(own["germquant"])
+    feats = list(_engine.FEATURES)
+    early = standin_engine(tmp_path / "early", version=version, git_sha=str(own["git_sha"]), features=feats,
+                           entries=("packs",))
+    r = SubprocessRunner(sys.executable, env={"PYTHONPATH": str(early)})
+    with pytest.raises(RunnerError, match="has no germquant.project entry") as e:
+        r.project_new(tmp_path / "p", "test_pack@0.1.0")
+    assert "no germquant installed" not in str(e.value)
+    with pytest.raises(RunnerError, match="has no germquant.post_stages entry"):
+        r.list_post_stages()
+    one = standin_engine(tmp_path / "one", version=version, git_sha=str(own["git_sha"]), features=feats)
+    r1 = SubprocessRunner(sys.executable, env={"PYTHONPATH": str(one), "FAKE_ENGINE_EXIT": "1"})
+    assert r1.project_add(tmp_path / "p", ["a.tif"])["argv"][:2] == ["add", str(tmp_path / "p")]
+    with pytest.raises(RunnerError, match=r"`germquant project status` failed \(exit 1\)"):
+        r1.project_status(tmp_path / "p")

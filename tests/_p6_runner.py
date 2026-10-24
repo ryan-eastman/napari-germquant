@@ -137,9 +137,11 @@ ENTRY = "from germquant._standin import main\nmain({module!r})\n"
 
 
 def standin_engine(root: Path, *, version: str, git_sha: str = "feedfacecafebeef",
-                   features: list[str] | tuple[str, ...] | None = None) -> Path:
+                   features: list[str] | tuple[str, ...] | None = None,
+                   entries: tuple[str, ...] = ("packs", "project", "post_stages")) -> Path:
     """Write the stand-in germquant package under ``root`` and return ``root`` (put it first on PYTHONPATH).
-    ``features`` None: a version document without the list, as every engine before Train B prints it."""
+    ``features`` None: a version document without the list, as every engine before Train B prints it.
+    ``entries``: the torch-free entries it has (an engine part way through the train lacks some)."""
     pkg = root / "germquant"
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text(f"__version__ = {version!r}\n", encoding="ascii")
@@ -147,7 +149,7 @@ def standin_engine(root: Path, *, version: str, git_sha: str = "feedfacecafebeef
     (pkg / "_standin.py").write_text(STANDIN.format(version=version, git_sha=git_sha, features=feats),
                                      encoding="ascii")
     (pkg / "__main__.py").write_text(ENTRY.format(module="germquant"), encoding="ascii")
-    for sub in ("packs", "project", "post_stages"):
+    for sub in entries:
         (pkg / sub).mkdir()
         (pkg / sub / "__init__.py").write_text("", encoding="ascii")
         (pkg / sub / "__main__.py").write_text(ENTRY.format(module=f"germquant.{sub}"), encoding="ascii")

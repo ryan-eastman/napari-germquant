@@ -1561,14 +1561,24 @@ class SubprocessRunner(EngineRunner):
         if features:
             self.require(*features, should_stop=should_stop)
 
-    def _command_json(self, argv: list[str], *, say=None, should_stop=None, extra_env: dict | None = None):
+    def _command_json(self, argv: list[str], *, say=None, should_stop=None, extra_env: dict | None = None,
+                      ok=(0,)):
         """Run a ``--json`` command without a time limit (it is cancelled instead): its JSON document. Its
         stderr lines (the engine's log) go to ``say``. Exit 2: EngineRefused with what it printed; any other
-        failure: RunnerError."""
+        code not in ``ok``: RunnerError."""
         rc, out, err = self._run_proc(argv, say=say, say_streams=("err",), should_stop=should_stop,
                                       extra_env=extra_env)
-        self._check_exit(argv, rc, out + err)
+        self._check_exit(argv, rc, out + err, ok=ok)
         return _parse_json("\n".join(out))
+
+    def _entry_missing(self, text: str) -> None:
+        """A clear message when a torch-free Train B entry is not there (an engine part way through the train):
+        Python's "No module named germquant.project" would otherwise read as no germquant at all."""
+        for module in (PROJECT_MODULE, POST_STAGES_MODULE):
+            if f"No module named {module}" in text or f"No module named '{module}'" in text:
+                raise RunnerError(f"The engine at {self.python} has no {module} entry: its germquant predates that "
+                                  f"part of {_engine.TRAIN_B_ENGINE}. Update that engine checkout (git pull) and "
+                                  f"reinstall it into its environment, or choose another engine.")
 
     def _command_lines(self, argv: list[str], *, say=None, should_stop=None, extra_env: dict | None = None,
                        tick=None) -> tuple[int, list[str]]:
@@ -1581,6 +1591,7 @@ class SubprocessRunner(EngineRunner):
         if rc in ok:
             return
         text = "\n".join(lines)
+        self._entry_missing(text)
         self._module_missing(text)
         what = _command_name(argv)
         if rc == 2:
@@ -1608,7 +1619,8 @@ class SubprocessRunner(EngineRunner):
     def project_add(self, root, paths, *, plugin_version=None, should_stop=None) -> dict:
         self._start(should_stop, "projects")
         args = ["add", root, *paths, "--plugin-version", plugin_version or _plugin_version(), "--json"]
-        return self._command_json(self.project_argv(*args), should_stop=should_stop)
+        # exit 1 with its record: some paths were refused, and the record says which (the others were added)
+        return self._command_json(self.project_argv(*args), should_stop=should_stop, ok=(0, 1))
 
     def project_edit(self, root, *, edits=None, unset=(), roles=None, revert=False, device=None, xy_stride=None,
                      z_range=None, runner=None, interpreters=None, samples=None, disable=(), dry_run=False,
