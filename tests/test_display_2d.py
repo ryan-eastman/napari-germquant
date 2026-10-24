@@ -10,6 +10,7 @@ import json
 import warnings
 
 import numpy as np
+import pandas as pd
 import pytest
 from _p6_2d import (
     DX,
@@ -163,10 +164,6 @@ def test_points_size_of_a_batch_comes_from_the_batch_root(tmp_path):
     assert rs.run_config() is None
     (root / "day1" / "run_manifest.json").unlink()
     assert rs.run_config() == config
-    # an image folder's own manifest (a single-image or project run) is the run's config
-    own = {"spots": {"spot_radius_um": 0.45}}
-    write_manifest(rs.folder, config_hash="h1", config=own)
-    assert rs.run_config() == own and _sizes(rs)[f"{STACK_ID} spots"] == pytest.approx(0.9)
     # a planar folder inside a batch: its points size from the root, its scale from its tables
     plane = write_planar_results(root / "day2" / PLANAR_ID, manifest=False, config_hash="h1")
     by = _by_kind(load_results_layers(plane))
@@ -175,6 +172,28 @@ def test_points_size_of_a_batch_comes_from_the_batch_root(tmp_path):
     # an unreadable manifest is no config
     (root / "run_manifest.json").write_text("{not json", encoding="utf-8")
     assert plane.run_config() is None
+
+
+def test_points_size_from_the_folders_own_manifest(tmp_path):
+    root = tmp_path / "out"
+    rs = write_stack_results(root / STACK_ID, config_hash="h1")
+    own = {"spots": {"spot_radius_um": 0.45}}
+    # a single-image or project run writes its manifest into the image's folder
+    write_manifest(rs.folder, config_hash="h1", config=own)
+    assert rs.run_config() == own and _sizes(rs) == {f"{STACK_ID} spots": pytest.approx(0.9)}
+    # an earlier run's manifest left in a folder that a batch wrote later is passed over for the batch root's
+    write_manifest(rs.folder, config_hash="h0", config=own)
+    assert rs.run_config() is None
+    batch = {"spots": {"spot_radius_um": 0.2}}
+    write_manifest(root, config_hash="h1", config=batch)
+    assert rs.run_config() == batch and _sizes(rs) == {f"{STACK_ID} spots": pytest.approx(0.4)}
+    # an image whose config_hash is not recorded (no done marker, no config_hash column): its own manifest
+    (rs.folder / f"{STACK_ID}__done.json").unlink()
+    summary = rs.folder / f"{STACK_ID}__image_summary.csv"
+    pd.read_csv(summary).drop(columns=["config_hash"]).to_csv(summary, index=False)
+    assert rs.config_hash() is None and rs.run_config() == own
+    (rs.folder / "run_manifest.json").unlink()
+    assert rs.run_config() is None                         # and no search above without a hash to match
 
 
 def test_reader_scales_a_single_plane(tmp_path, monkeypatch):

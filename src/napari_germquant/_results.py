@@ -127,30 +127,34 @@ class ResultsSet:
         return value.strip() if isinstance(value, str) and value.strip() else None
 
     def run_config(self) -> dict | None:
-        """The config the run used (the "config" of a run_manifest.json). A single-image or project run writes
-        the manifest into the image's folder; ``germquant batch`` writes one manifest, into the batch root, so
-        for an image folder without one the nearest run_manifest.json above it (up to MANIFEST_SEARCH_LEVELS
-        folders) is used when its config_hash equals this image's, and the search stops at that manifest
-        either way (a later batch into the same root rewrites it). None when nothing matches."""
-        man = self.manifest()
-        if man is None:
-            want = self.config_hash()
-            folder = self.folder
-            for _ in range(MANIFEST_SEARCH_LEVELS):
-                if want is None or folder.parent == folder:
-                    break
-                folder = folder.parent
-                p = folder / "run_manifest.json"
-                try:
-                    present = p.is_file()
-                except OSError:                   # a folder above that cannot be read: stop looking
-                    break
-                if present:
-                    doc = _read_manifest(p)
-                    man = doc if doc is not None and doc.get("config_hash") == want else None
-                    break
-        cfg = (man or {}).get("config")
-        return cfg if isinstance(cfg, dict) else None
+        """The config the run used (the "config" of a run_manifest.json), matched to this image by its
+        config_hash (``config_hash``). A single-image or project run writes the manifest into the image's
+        folder. ``germquant batch`` writes one manifest, into the batch root, and none per image, so the
+        nearest run_manifest.json above the folder (up to MANIFEST_SEARCH_LEVELS folders up) is the run's when
+        its config_hash is this image's; the search stops at that manifest either way (a later batch into
+        the same root rewrites it). The folder's own manifest is also used when the image's hash is not
+        recorded, and is passed over when another run wrote it (a batch that later wrote this folder leaves
+        an earlier single run's manifest behind). None when nothing matches."""
+        want = self.config_hash()
+        own = self.manifest()
+        if own is not None and (want is None or own.get("config_hash") == want):
+            cfg = own.get("config")
+            return cfg if isinstance(cfg, dict) else None
+        folder = self.folder
+        for _ in range(MANIFEST_SEARCH_LEVELS):
+            if want is None or folder.parent == folder:
+                return None
+            folder = folder.parent
+            p = folder / "run_manifest.json"
+            try:
+                present = p.is_file()
+            except OSError:                       # a folder above that cannot be read: stop looking
+                return None
+            if present:
+                doc = _read_manifest(p)
+                cfg = doc.get("config") if doc is not None and doc.get("config_hash") == want else None
+                return cfg if isinstance(cfg, dict) else None
+        return None
 
     def _record(self, key: str) -> dict | None:
         for doc in (self.stage_record(), self.manifest()):
