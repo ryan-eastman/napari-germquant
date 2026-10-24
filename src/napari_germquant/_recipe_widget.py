@@ -74,6 +74,8 @@ STATE_TIPS = {
 }
 RUNNING_TEXT = "a run of this project is in progress: recipe edits wait until it ends"
 WRITING_TEXT = "a write is in progress: the next edit waits until it is done"
+# the engine's dry run says changed: false (a channel the pack map's role already names, alone, is no edit)
+NO_ROLE_CHANGE_TEXT = "no role change: the pack map already names these channels, so the project's map stays as it is"
 INT_LIMIT = 2 ** 31 - 1
 FLOAT_LIMIT = 1.0e12
 
@@ -754,11 +756,15 @@ class RecipeTab(QWidget):
         warnings = [str(w) for w in rec.get("warnings") or []]
         base = [f"warning: {w}" for w in v.warnings]
         self.warnings_label.setText("\n".join(base + [f"warning: {w}" for w in warnings if f"warning: {w}" not in base]))
-        if self._roles_changed():
+        if not self._roles_changed():
+            self.roles_hash_label.setText("no role change")
+        elif rec.get("refused"):
+            self.roles_hash_label.setText("with these roles: no config_hash (the engine refused the preview)")
+        elif rec.get("changed") is False:
+            self.roles_hash_label.setText(NO_ROLE_CHANGE_TEXT)
+        else:
             self.roles_hash_label.setText(f"with these roles: config_hash {rec.get('config_hash')} (now "
                                           f"{v.config_hash})")
-        else:
-            self.roles_hash_label.setText("no role change")
 
     def apply_roles(self) -> bool:
         """Write the role choices through the engine (``project edit --role ...``). False, with the reason in the
@@ -796,6 +802,8 @@ class RecipeTab(QWidget):
             return "the role preview is not back yet"
         if rec.get("refused"):
             return f"the engine refused the role preview, so this edit has a problem: {rec['refused']}"
+        if rec.get("changed") is False:
+            return NO_ROLE_CHANGE_TEXT
         if self.role_problems:
             return "the role edit has a problem left (see the preview): fix it before Apply"
         return ""

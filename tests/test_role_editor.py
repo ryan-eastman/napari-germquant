@@ -356,6 +356,38 @@ def test_the_role_editor_sends_every_role_and_shows_the_engines_preview(qtbot, t
     assert not tab.apply_roles_btn.isEnabled()
 
 
+def test_a_choice_the_pack_map_already_names_is_no_role_change(qtbot, tmp_path):
+    """A role choice that the pack map's role already names, alone, is no edit by the engine's rule (its dry run
+    says changed: false, with the same config_hash): the tab says so and keeps Apply off, instead of a write that
+    rewrites only the manifest (review N2)."""
+    from napari_germquant._params import Role
+    from napari_germquant._recipe_widget import NO_ROLE_CHANGE_TEXT
+
+    def answer(kw):
+        roles = kw.get("roles") or {}
+        real = {k: v for k, v in roles.items() if v and not (k == "foci" and v == "foci")}   # the engine's rule
+        if kw.get("dry_run"):
+            return preview_record(_bind(), config_hash="bbbbbbbbbbbb" if real else PACK_HASH, changed=bool(real))
+        return {**preview_record(_bind(), config_hash="bbbbbbbbbbbb"), "dry_run": False,
+                "written": ["channel_map.yaml", "recipe.yaml", "germquant_project.yaml"]}
+
+    fake = FakeRunner(answer)
+    roles = [Role("dna", "DNA", True, ("DAPI", "Hoechst", "DNA"), 0, None), Role("foci", "foci", False, ("foci",), 1,
+                                                                                None)]
+    tab = _tab(qtbot, tmp_path, session=FakeSession(fake),
+               reader=lambda root, reference=None: fake_view(tmp_path, roles=roles))
+    tab.choose_channel("foci", "foci")
+    _settle(tab, qtbot)
+    assert tab.role_choices() == {"dna": "", "foci": "foci"} and tab.roles_hash == PACK_HASH
+    assert tab.roles_hash_label.text() == NO_ROLE_CHANGE_TEXT and not tab.apply_roles_btn.isEnabled()
+    assert not tab.apply_roles() and "no role change" in tab.status_label.text()
+    assert all(c.get("dry_run") for c in fake.calls)
+    tab.choose_channel("dna", "DAPI")                              # narrowing dna's names is an edit
+    _settle(tab, qtbot)
+    assert "with these roles: config_hash bbbbbbbbbbbb" in tab.roles_hash_label.text()
+    assert tab.apply_roles_btn.isEnabled()
+
+
 def test_revert_roles_sends_one_unset_and_previews_again(qtbot, tmp_path):
     """Revert roles with role edits saved is one `project edit --unset io.channel_map` (no --role: a role
     write is refused while the pack map leaves a problem, review S2); the preview is then asked for again. With
