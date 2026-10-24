@@ -355,6 +355,46 @@ def test_the_dock_follows_the_project_dock(qtbot, tproj, fake):
     assert w.root == other
 
 
+def test_a_reading_that_returns_after_close_leaves_the_project_closed(make_napari_viewer, qtbot, tproj, fake,
+                                                                      monkeypatch):
+    """A reading of the project, or an image being opened, that is still in the file worker when the project is
+    closed (here, or by the Project dock) changes nothing when it returns: the project stays closed and no layer
+    is added."""
+    standard_project(tproj)
+    gate = threading.Event()
+    real_read, real_layers = _tuning.read_project, _tuning.image_layers
+
+    def held(fn):
+        def run(*a, **k):
+            assert gate.wait(30)
+            return fn(*a, **k)
+        return run
+
+    viewer = make_napari_viewer()
+    w = _dock(qtbot, viewer, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    monkeypatch.setattr(_tuning, "read_project", held(real_read))
+    w.refresh()
+    qtbot.waitUntil(lambda: w.io_worker.busy, timeout=WAIT)
+    w.close_project()
+    gate.set()
+    _settle(qtbot, w)
+    assert w.root is None and w.image_list.count() == 0
+    # an image that opens while its project is closed adds nothing
+    monkeypatch.setattr(_tuning, "read_project", real_read)
+    gate.clear()
+    _opened(qtbot, w, tproj)
+    monkeypatch.setattr(_tuning, "image_layers", held(real_layers))
+    n = len(viewer.layers)
+    assert w.select_image("img_b") and w.open_image()
+    qtbot.waitUntil(lambda: w.io_worker.busy, timeout=WAIT)
+    w.close_project()
+    gate.set()
+    _settle(qtbot, w)
+    assert len(viewer.layers) == n and "closed meanwhile" in w.last_message and w.root is None
+
+
 def test_earlier_tuning_runs_are_listed_newest_first_and_can_be_applied(qtbot, tproj, fake):
     standard_project(tproj)
     old = write_tuning_run(tproj, "20261020T090000Z_0000aaaa", rows=ranked_rows((2.0, 3.0, 1.5)),
