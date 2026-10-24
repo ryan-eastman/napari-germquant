@@ -5,7 +5,8 @@ runner's argument lists, run-log tailing, exit codes, Cancel and the features ga
 has them, and without loading torch.
 
 Every entry but the two below prints one JSON line, ``{"module", "argv", "device_env"}`` (or $FAKE_ENGINE_STDOUT
-instead), first $FAKE_ENGINE_STDERR on stderr when it is set, and exits with $FAKE_ENGINE_EXIT (default 0).
+instead), first $FAKE_ENGINE_STDERR on stderr when it is set, and exits with $FAKE_ENGINE_EXIT (default 0);
+``project export-commands ... --out FILE`` writes that line into FILE instead and prints "wrote FILE".
 ``python -m germquant.packs --version --json`` prints the version document, with the ``features`` list only when
 one was given (an engine from before the list has none).
 ``python -m germquant project run DIR --run-id ID --via V ...`` plays the scenario in $FAKE_PROJECT_RUN (JSON):
@@ -132,7 +133,12 @@ def main(module):
     if os.environ.get("FAKE_ENGINE_STDERR"):
         print(os.environ["FAKE_ENGINE_STDERR"], file=sys.stderr, flush=True)
     record = {{"module": module, "argv": args, "device_env": os.environ.get("GERMQUANT_DEVICE")}}
-    print(os.environ.get("FAKE_ENGINE_STDOUT") or json.dumps(record), flush=True)
+    out = _opt(args, "--out") if module == "germquant" and args[:2] == ["project", "export-commands"] else None
+    if out and not os.environ.get("FAKE_ENGINE_STDOUT"):
+        Path(out).write_bytes((json.dumps(record) + "\\n").encode("ascii"))
+        print("wrote " + out, flush=True)
+    else:
+        print(os.environ.get("FAKE_ENGINE_STDOUT") or json.dumps(record), flush=True)
     sys.exit(int(os.environ.get("FAKE_ENGINE_EXIT", "0")))
 '''
 

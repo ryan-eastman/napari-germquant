@@ -672,14 +672,16 @@ class EngineRunner:
         """The version check's answer when it has run (never starts one: the GUI thread reads this)."""
         return None
 
-    def list_packs(self, should_stop=None) -> dict:
+    def list_packs(self, should_stop=None, project=None) -> dict:
+        """The pack listing; with ``project`` (a project folder) its packs/ is searched first (I1)."""
         raise NotImplementedError
 
     def check(self, pack: str, recipe: str | None = None, image: str | Path | None = None,
-              should_stop=None) -> dict:
+              should_stop=None, project=None) -> dict:
         raise NotImplementedError
 
-    def fetch_models(self, pack: str, recipe: str | None = None, say=None, should_stop=None) -> dict:
+    def fetch_models(self, pack: str, recipe: str | None = None, say=None, should_stop=None,
+                     project=None) -> dict:
         raise NotImplementedError
 
     def fetch_example(self, pack: str, example: str | None = None, out: str | Path | None = None,
@@ -711,11 +713,13 @@ class EngineRunner:
     # ---- the commands of tranche 5 Train B (the subclasses implement them) ----
     def project_new(self, root, pack: str, *, recipe: str | None = None, images=(), name: str | None = None,
                     plugin_version: str | None = None, should_stop=None) -> dict:
-        """``project new``: the new project's record (``root`` always present)."""
+        """``project new``: the command's record, the project's summary plus ``added`` and ``refused`` (``root``
+        always present). ``images``: one path, folder or glob, or a list of them."""
         raise NotImplementedError
 
     def project_add(self, root, paths, *, plugin_version: str | None = None, should_stop=None) -> dict:
-        """``project add``: ``{"added": [image_id], "refused": [{"path", "reason"}]}``."""
+        """``project add``: ``{"added": [image_id], "refused": [{"path", "reason"}], "images", "headers"}``.
+        ``paths``: one path, folder or glob, or a list of them."""
         raise NotImplementedError
 
     def project_edit(self, root, *, edits: dict | None = None, unset=(), roles: dict | None = None,
@@ -777,12 +781,15 @@ class EngineRunner:
                      split_by: str | None = None, val_frac: float | None = None, seed: int | None = None,
                      device: str | None = None, system: str | None = None, kind: str | None = None,
                      dataset: str | None = None, say=None, should_stop=None) -> dict:
-        """``train-nuclei``: ``exit_code``, ``lines``, ``model_path`` and ``card_path``. ``device``: cpu is
-        ``--cpu``; cuda or mps go through GERMQUANT_DEVICE (the engine falls back when it is missing)."""
+        """``train-nuclei``: ``exit_code``, ``lines``, ``model_path`` and ``card_path``. ``device`` (None: the
+        runner's device): cpu is ``--cpu``; cuda or mps go through GERMQUANT_DEVICE (the engine falls back when
+        it is missing); auto leaves the choice to the engine."""
         raise NotImplementedError
 
     def train_curve(self, pairs, out, *, sizes, repeats: int, seed: int, base: str, keep_models: str | None = None,
-                    say=None, should_stop=None) -> dict:
+                    device: str | None = None, say=None, should_stop=None) -> dict:
+        """``train-curve``: its JSON record. ``device`` (None: the runner's device) goes through
+        GERMQUANT_DEVICE for every model of the curve (cpu included: the command has no --cpu)."""
         raise NotImplementedError
 
     def pack_derive(self, from_ref: str, recipe: str, model, card, out, *, new_id: str | None = None,
@@ -859,6 +866,36 @@ def _refusal_reason(lines: list[str], stdout: str | None = None) -> str:
         if isinstance(problems, list) and problems:
             return "\n".join(f"REFUSED: {p}" for p in problems)
     return ""
+
+
+def _path_list(paths) -> list:
+    """``paths`` as a list: one path (a str or os.PathLike) is a list of one, never a string split into letters."""
+    if paths is None:
+        return []
+    if isinstance(paths, (str, os.PathLike)):
+        return [paths]
+    return list(paths)
+
+
+def _write_atomic(path, data: bytes) -> Path:
+    """Write ``data`` to ``path`` through a temporary file next to it and os.replace, both through
+    germquant.fsutil.long_path (past the 260-character limit on Windows): a reader never sees half a file, and
+    no handle is open during the replace."""
+    from germquant.fsutil import long_path
+
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.part")
+    try:
+        with open(long_path(tmp), "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(long_path(tmp), long_path(path))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(long_path(tmp))
+        raise
+    return path
 
 
 def _command_name(argv: list[str]) -> str:
@@ -1215,7 +1252,7 @@ class InProcessRunner(EngineRunner):
         self._start(should_stop, "projects")
         text = self._api_call(self._api("export_commands"), self._open(root), shell=shell, shards=shards)
         if out is not None:
-            Path(out).write_bytes(str(text).encode("utf-8"))
+            _write_atomic(out, str(text).encode("utf-8"))
         return {"text": str(text), "out": str(out) if out is not None else None}
 
     def import_labels(self, src, fmt, image, pairs, *, allow_pickle=False, frame=None, should_stop=None) -> dict:
@@ -1252,14 +1289,16 @@ class InProcessRunner(EngineRunner):
     def train_nuclei(self, pairs, out, *, base="cpsam", name=None, epochs=None, split_by=None, val_frac=None,
                      seed=None, device=None, system=None, kind=None, dataset=None, say=None,
                      should_stop=None) -> dict:
-        """segment.training.train_nuclei as ``train-nuclei`` calls it (cuda or mps through GERMQUANT_DEVICE for
-        the call, cpu as cpu=True). The card fields (system, kind, dataset) go only when set, under the names the
-        function takes (kind is the card's object_kind); an engine without them says so."""
+        """segment.training.train_nuclei as ``train-nuclei`` calls it (``device``, else the runner's: cuda or mps
+        through GERMQUANT_DEVICE for the call, cpu as cpu=True). The card fields (system, kind, dataset) go only
+        when set, under the names the function takes (kind is the card's object_kind); an engine without them
+        says so."""
         _not_stopped(should_stop)
         import inspect
 
         from germquant.segment import training as T
 
+        device = device or self.device
         kw: dict = {"base": base, "name": name, "cpu": device == "cpu"}
         for key, val in (("epochs", epochs), ("seed", seed)):
             if val is not None:
@@ -1282,8 +1321,10 @@ class InProcessRunner(EngineRunner):
         return {"exit_code": 0, "lines": [], "model_path": res.get("model_path"),
                 "card_path": res.get("card_path"), "result": res}
 
-    def train_curve(self, pairs, out, *, sizes, repeats, seed, base, keep_models=None, say=None,
+    def train_curve(self, pairs, out, *, sizes, repeats, seed, base, keep_models=None, device=None, say=None,
                     should_stop=None) -> dict:
+        """segment.training.train_curve, every model of the curve on ``device`` (else the runner's) through
+        GERMQUANT_DEVICE for the call."""
         _not_stopped(should_stop)
         self.require("train_curve")
         from germquant.segment import training as T
@@ -1295,7 +1336,8 @@ class InProcessRunner(EngineRunner):
               "seed": int(seed), "base": base}
         if keep_models is not None:
             kw["keep_models"] = keep_models
-        return _jsonable(self._api_call(fn, pairs, out, **kw))
+        with device_env(device or self.device):
+            return _jsonable(self._api_call(fn, pairs, out, **kw))
 
     def pack_derive(self, from_ref, recipe, model, card, out, *, new_id=None, should_stop=None) -> dict:
         """The API names no derive function, so this runs the torch-free ``-m germquant.packs derive`` as a child
@@ -1715,6 +1757,7 @@ class SubprocessRunner(EngineRunner):
         args = ["new", root, "--pack", pack]
         if recipe:
             args += ["--recipe", recipe]
+        images = _path_list(images)
         if images:
             args += ["--images", *images]
         if name:
@@ -1725,7 +1768,7 @@ class SubprocessRunner(EngineRunner):
 
     def project_add(self, root, paths, *, plugin_version=None, should_stop=None) -> dict:
         self._start(should_stop, "projects")
-        args = ["add", root, *paths, "--plugin-version", plugin_version or _plugin_version(), "--json"]
+        args = ["add", root, *_path_list(paths), "--plugin-version", plugin_version or _plugin_version(), "--json"]
         # exit 1 with its record: some paths were refused, and the record says which (the others were added)
         return self._command_json(self.project_argv(*args), should_stop=should_stop, ok=(0, 1))
 
@@ -1843,9 +1886,17 @@ class SubprocessRunner(EngineRunner):
             args += ["--out", out]
         argv = self.engine_argv(*args)
         rc, out_lines, err = self._run_proc(argv, should_stop=should_stop)
-        self._check_exit(argv, rc, out_lines + err)
-        return {"text": "\n".join(out_lines) + ("\n" if out_lines else ""), "out": str(out) if out is not None
-                else None}
+        self._check_exit(argv, rc, out_lines + err, stdout="\n".join(out_lines))
+        text = "\n".join(out_lines) + ("\n" if out_lines else "")
+        if out is not None:                           # the commands are what the engine wrote, not what it said
+            from germquant.fsutil import long_path
+
+            try:
+                with open(long_path(out), "rb") as fh:
+                    text = fh.read().decode("utf-8-sig", errors="replace")
+            except OSError:
+                pass                                  # no file after all: what the engine printed
+        return {"text": text, "out": str(out) if out is not None else None}
 
     def import_labels(self, src, fmt, image, pairs, *, allow_pickle=False, frame=None, should_stop=None) -> dict:
         self._start(should_stop, "import_labels")
@@ -1882,6 +1933,7 @@ class SubprocessRunner(EngineRunner):
                      seed=None, device=None, system=None, kind=None, dataset=None, say=None,
                      should_stop=None) -> dict:
         self._start(should_stop)
+        device = device or self.device
         args: list = ["train-nuclei", "--pairs", pairs, "--out", out, "--base", base]
         if name:
             args += ["--name", name]
@@ -1910,14 +1962,17 @@ class SubprocessRunner(EngineRunner):
         res.setdefault("card_path", None)
         return res
 
-    def train_curve(self, pairs, out, *, sizes, repeats, seed, base, keep_models=None, say=None,
+    def train_curve(self, pairs, out, *, sizes, repeats, seed, base, keep_models=None, device=None, say=None,
                     should_stop=None) -> dict:
         self._start(should_stop, "train_curve")
         args: list = ["train-curve", "--pairs", pairs, "--out", out, "--sizes", _join_list(sizes), "--repeats",
                       int(repeats), "--seed", int(seed), "--base", base]
         if keep_models is not None:
             args += ["--keep-models", keep_models]
-        return self._command_json(self.engine_argv(*args, "--json"), say=say, should_stop=should_stop)
+        device = device or self.device
+        env = {} if device in (None, "", "auto") else {DEVICE_ENV: device}
+        return self._command_json(self.engine_argv(*args, "--json"), say=say, should_stop=should_stop,
+                                  extra_env=env)
 
     def tune_spots(self, project, *, points=None, grid=None, max_runs=None, out=None, say=None,
                    should_stop=None) -> dict:

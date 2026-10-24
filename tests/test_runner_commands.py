@@ -5,6 +5,7 @@ plugin version stamped on every project write, ``project=`` on the pack calls, t
 probe, and the in-process runner calling the same commands through germquant.api."""
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
@@ -19,6 +20,7 @@ from napari_germquant import _engine
 from napari_germquant._runner import (
     VIA_INPROCESS,
     EngineRefused,
+    EngineRunner,
     InProcessRunner,
     RunCancelled,
     RunLog,
@@ -66,6 +68,11 @@ def test_one_method_per_command_builds_the_documented_command_line(standin, tmp_
     r.project_add(P, ["c.ome.tif", tmp_path / "folder"])
     assert last("germquant.project") == ["add", P, "c.ome.tif", str(tmp_path / "folder"), "--plugin-version", v,
                                          "--json"]
+    r.project_add(P, "C:/data/d.ome.tif")                    # one path, not a string split into letters
+    assert last("germquant.project") == ["add", P, "C:/data/d.ome.tif", "--plugin-version", v, "--json"]
+    r.project_new(P, "test_pack@0.1.0", images=tmp_path / "e.nd2")
+    assert last("germquant.project") == ["new", P, "--pack", "test_pack@0.1.0", "--images", str(tmp_path / "e.nd2"),
+                                         "--plugin-version", v, "--json"]
     doc = r.project_edit(P, edits={"spots.log.min_snr": 2.5, "segmentation.nuclei.method": "classical",
                                  "qc.flag": True, "spots.text": "1.0"}, unset=["spots.log.diameter_um"],
                          roles={"foci": GAMMA + "H2AX", "dna": "H2B mCherry"}, revert=False, device="cuda",
@@ -104,7 +111,10 @@ def test_one_method_per_command_builds_the_documented_command_line(standin, tmp_
     out = r.project_export_commands(P, shell="ps1", shards=3, out=tmp_path / "cmds.ps1")
     assert last("germquant") == ["project", "export-commands", P, "--shell", "ps1", "--shards", "3", "--out",
                                  str(tmp_path / "cmds.ps1")]
+    # with --out the commands are the file the engine wrote, not the line it printed ("wrote FILE")
     assert out["out"] == str(tmp_path / "cmds.ps1") and echo(out["text"].splitlines())["module"] == "germquant"
+    assert out["text"] == (tmp_path / "cmds.ps1").read_bytes().decode("ascii") and "wrote" not in out["text"]
+    assert echo(r.project_export_commands(P)["text"].splitlines())["argv"][-2:] == ["--shell", "sh"]
     r.device = "cpu"
     res = r.project_run(P, images=["a", "b"], resume=False, shard="2/3", run_id=RID)
     assert last("germquant") == ["project", "run", P, "--images", "a", "b", "--no-resume", "--device", "cpu",
@@ -139,11 +149,20 @@ def test_one_method_per_command_builds_the_documented_command_line(standin, tmp_
     assert last("germquant") == ["train-nuclei", "--pairs", "pairs", "--out", "models/m2", "--base", "cpsam",
                                  "--cpu"]
     assert echo(res["lines"])["device_env"] is None
-    r.train_curve("pairs", "curve", sizes=[1, 2, 4, "all"], repeats=3, seed=7, base="tinynet@f5055f8a",
-                  keep_models="best")
+    res = r.train_curve("pairs", "curve", sizes=[1, 2, 4, "all"], repeats=3, seed=7, base="tinynet@f5055f8a",
+                        keep_models="best")
     assert last("germquant") == ["train-curve", "--pairs", "pairs", "--out", "curve", "--sizes", "1,2,4,all",
                                  "--repeats", "3", "--seed", "7", "--base", "tinynet@f5055f8a", "--keep-models",
                                  "best", "--json"]
+    assert res["device_env"] is None                          # auto: the engine chooses
+    # every model of a curve trains on the device asked for, else the runner's, through GERMQUANT_DEVICE
+    assert r.train_curve("pairs", "curve", sizes="all", repeats=1, seed=0, base="none",
+                         device="cuda")["device_env"] == "cuda"
+    r.device = "cpu"
+    assert r.train_curve("pairs", "curve", sizes="all", repeats=1, seed=0, base="none")["device_env"] == "cpu"
+    res = r.train_nuclei("pairs", "models/m3")                 # train-nuclei follows the runner's device too
+    assert last("germquant")[-1] == "--cpu" and echo(res["lines"])["device_env"] is None
+    r.device = "auto"
     r.tune_spots(P, points="annotations", grid="grid.yaml", max_runs=20, out="tuning/t1")
     assert last("germquant") == ["tune-spots", "--project", P, "--points", "annotations", "--grid", "grid.yaml",
                                  "--max-runs", "20", "--out", "tuning/t1", "--json"]
@@ -183,6 +202,8 @@ def test_one_method_per_command_builds_the_documented_command_line(standin, tmp_
     assert json.loads(doc["argv"][3]) == entries
     assert r.history[0][3:] == ["--version", "--json"] and sum(a[3:] == ["--version", "--json"]
                                                                for a in r.history) == 1   # one version check
+    for name in ("list_packs", "check", "fetch_models"):      # the interface names project= as both runners take it
+        assert "project" in inspect.signature(getattr(EngineRunner, name)).parameters, name
 
 
 def test_set_values_are_written_so_the_engine_reads_them_back_with_their_type():
@@ -414,6 +435,24 @@ def test_the_in_process_runner_exports_and_trains_through_the_engine_functions(t
     monkeypatch.setattr(T, "train_nuclei", old_train)
     with pytest.raises(RunnerError, match="takes no kind"):
         r.train_nuclei("pairs", tmp_path / "m", kind="nucleus")
+
+    # a learning curve trains every model on the device asked for, else the runner's (GERMQUANT_DEVICE for the
+    # call); train_nuclei follows the runner's device too
+    def curve(pairs, out, **kw):
+        seen["curve"] = (kw, os.environ.get("GERMQUANT_DEVICE"))
+        return {"models": []}
+
+    monkeypatch.setattr(T, "train_curve", curve, raising=False)
+    monkeypatch.setattr(T, "train_nuclei", train)
+    monkeypatch.setattr(InProcessRunner, "features", lambda self, should_stop=None: frozenset(_engine.FEATURES))
+    assert r.train_curve("pairs", "curve", sizes=[1, "all"], repeats=2, seed=3, base="none",
+                         device="cuda") == {"models": []}
+    assert seen["curve"] == ({"sizes": [1, "all"], "repeats": 2, "seed": 3, "base": "none"}, "cuda")
+    r.device = "cpu"
+    r.train_curve("pairs", "curve", sizes="all", repeats=1, seed=0, base="none")
+    assert seen["curve"][1] == "cpu" and "GERMQUANT_DEVICE" not in os.environ
+    r.train_nuclei("pairs", tmp_path / "m")
+    assert seen["train"]["cpu"] is True and seen["train"]["device_env"] is None
 
 
 def test_a_missing_entry_is_named_and_add_keeps_its_record_on_exit_1(tmp_path):
