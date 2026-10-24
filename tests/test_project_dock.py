@@ -402,6 +402,12 @@ def test_the_project_hub_tells_the_other_docks(qtbot, tmp_path):
         w.open_project(root)
     settle(w, qtbot)
     assert hub.root == root and hub.state.manifest["name"] == "study"
+    # another dock that wrote the project asks the Project dock to read it again
+    write_manifest(root, name="renamed elsewhere", images=read_manifest(root)["images"], run=read_manifest(root)["run"])
+    with qtbot.waitSignal(hub.changed, timeout=10_000):
+        hub.request_reload()
+    settle(w, qtbot)
+    assert w.name_label.text() == "renamed elsewhere" and len(fake.called("project_status")) == 2
     fake.gate = threading.Event()
     with qtbot.waitSignal(hub.running_changed, timeout=10_000):
         w.run_all()

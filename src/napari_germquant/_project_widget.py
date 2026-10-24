@@ -189,12 +189,17 @@ class ProjectState:
 class ProjectHub(QObject):
     """Which project the viewer's Project dock has open (``root``, ``state``) and whether a run of it goes
     (``running``). ``opened`` (the folder) and ``closed`` fire as the dock opens and closes projects, ``changed`` at
-    every new reading of it, ``running_changed`` when a run starts or ends."""
+    every new reading of it, ``running_changed`` when a run starts or ends. Another dock that wrote the project
+    (Training's Use in project, Spot tuning's Apply) calls ``request_reload()``: the Project dock reads it again."""
 
     opened = Signal(str)
     closed = Signal()
     changed = Signal()
     running_changed = Signal(bool)
+    reload_requested = Signal()
+
+    def request_reload(self) -> None:
+        self._emit(self.reload_requested)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -482,6 +487,7 @@ class ProjectWidget(QWidget):
             self.session.changed.connect(self._on_session_changed)
         except (RuntimeError, AttributeError):
             pass
+        self.hub.reload_requested.connect(self.reload)
         self._show_project()
         self._check_engine()
 
