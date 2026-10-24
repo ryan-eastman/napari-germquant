@@ -801,8 +801,9 @@ class RecipeTab(QWidget):
         return ""
 
     def revert_roles(self) -> bool:
-        """Back to the pack's channel map: every role edit dropped (written through the engine), or, with none
-        saved, the unapplied choices dropped."""
+        """Back to the pack's channel map: every role edit dropped, written through the engine as ``project edit
+        --unset io.channel_map`` (no role preview, so a problem the pack map itself leaves on an image does not
+        refuse it; the form's edits stay), or, with none saved, the unapplied choices dropped."""
         blocked = self._blocked()
         if blocked:
             self._status(blocked, AMBER)
@@ -819,7 +820,7 @@ class RecipeTab(QWidget):
                 self._syncing = False
             self._after_role_change()
             return True
-        self._queue_write("roles", {"roles": _params.role_choices(self._view.roles, {})}, "reverting the role edits")
+        self._queue_write("roles", {"unset": [_params.CHANNEL_MAP_KEY]}, "reverting the role edits")
         return True
 
     # ------------------------------------------------------------------ the parameter form

@@ -52,6 +52,9 @@ ORIGIN_TEXT = {
 RECIPE_NAME = "recipe.yaml"
 CHANNEL_MAP_NAME = "channel_map.yaml"
 MANIFEST_NAME = "germquant_project.yaml"
+# the recipe key that names the role editor's channel_map.yaml; `project edit --unset io.channel_map` drops every
+# role edit (docs/PROJECTS.md), with no role preview, so no role problem refuses it
+CHANNEL_MAP_KEY = "io.channel_map"
 # the preview cell states, worst first: a collision and a required role unbound block Apply (red); the index
 # fallback is amber (the run flags it); an optional role unbound and a name match are plain
 STATES = ("collision", "missing", "index", "unbound", "name")
@@ -321,8 +324,8 @@ def recipe_edits(root: Path, manifest: dict) -> tuple[dict, str | None]:
         return {}, f"{p}: not a mapping"
     doc.pop("extends", None)
     flat = _flatten(doc)
-    if rec.get("roles") and flat.get("io.channel_map") == CHANNEL_MAP_NAME:
-        flat.pop("io.channel_map")
+    if rec.get("roles") and flat.get(CHANNEL_MAP_KEY) == CHANNEL_MAP_NAME:
+        flat.pop(CHANNEL_MAP_KEY)
     return flat, None
 
 

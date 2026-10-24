@@ -215,6 +215,48 @@ def test_collision_and_unbound_block_apply(project_env, qtbot, tmp_path, monkeyp
     assert recipe_files(root2) == {"recipe.yaml": None, "channel_map.yaml": None}
 
 
+def test_revert_roles_when_the_pack_map_leaves_a_problem(project_env, qtbot, tmp_path, monkeypatch):
+    """Revert roles goes back to the pack map also when that map leaves a required role unbound on an image,
+    which is when a role edit is needed (review S2): it drops the role edits (`project edit --unset
+    io.channel_map`), which no role problem refuses, and keeps the form's edits."""
+    need_features("projects")
+    from germquant import packs
+
+    _settings.set_engine_choice(sys.executable)
+    runner = SubprocessRunner(sys.executable)
+    monkeypatch.setenv("GERMQUANT_PACKS", str(nofallback_pack(tmp_path / "packs")))
+    packs.refresh()
+    other = renamed_example(project_env.images, RENAMED, name="other.ome.tif")
+    root = project_env.new_dir()
+    runner.project_new(root, "nofallback_pack@0.1.0", images=[other])
+    pack_hash = engine_edit(root, "--dry-run")["config_hash"]
+    tab = _tab(qtbot, root)
+    assert tab.preview_states() == {"other": {"dna": "missing", "foci": "index"}}
+    tab.choose_channel("dna", "H2B-mCherry")
+    _settle(tab, qtbot)
+    assert tab.apply_roles()
+    _settle(tab, qtbot)
+    assert tab.last_error is None and recipe_files(root)["channel_map.yaml"] is not None
+    tab.set_value("spots.log.min_snr", 3.5)
+    assert tab.apply_form()
+    _settle(tab, qtbot)
+    runner.project_add(root, [project_env.image])                  # the saved map leaves dna unbound on this one
+    tab.reload()
+    _settle(tab, qtbot)
+    assert any("required role dna binds no channel" in p for p in tab.role_problems)
+    assert tab.revert_roles_btn.isEnabled() and tab.revert_roles()
+    _settle(tab, qtbot)
+    assert tab.last_error is None, tab.status_label.text()
+    assert "REFUSED" not in tab.status_label.text() and "removed channel_map.yaml" in tab.status_label.text()
+    files = recipe_files(root)
+    assert files["channel_map.yaml"] is None
+    assert yaml.safe_load(files["recipe.yaml"]) == {"extends": "pack:nofallback_pack@0.1.0/basic",
+                                                    "spots": {"log": {"min_snr": 3.5}}}
+    assert tab.role_choice("dna") is None and tab.config_hash == engine_edit(root, "--dry-run")["config_hash"]
+    assert tab.config_hash != pack_hash                            # the form's edit stays
+    assert tab.preview_states()["other"]["dna"] == "missing"       # the pack map's own problem, shown again
+
+
 def test_non_ascii_channel_name_round_trips(project_env, qtbot):
     """A channel named with a Greek gamma (gammaH2AX): the combo offers it, the edit binds foci to it by name,
     channel_map.yaml holds it as a YAML escape (ASCII) that reads back as the same name, the reopened tab shows
@@ -311,6 +353,39 @@ def test_the_role_editor_sends_every_role_and_shows_the_engines_preview(qtbot, t
     assert tab.config_hash == "bbbbbbbbbbbb" and tab.role_choice("foci") == "foci"
     assert "wrote channel_map.yaml, recipe.yaml" in tab.status_label.text()
     assert not tab.apply_roles_btn.isEnabled()
+
+
+def test_revert_roles_sends_one_unset_and_previews_again(qtbot, tmp_path):
+    """Revert roles with role edits saved is one `project edit --unset io.channel_map` (no --role: a role
+    write is refused while the pack map leaves a problem, review S2); the preview is then asked for again. With
+    no edit saved it only drops the unapplied choices, and writes nothing."""
+    def answer(kw):
+        if kw.get("dry_run"):
+            changed = any((kw.get("roles") or {}).values())
+            return preview_record(_bind(), config_hash="bbbbbbbbbbbb" if changed else PACK_HASH, changed=changed)
+        return {**preview_record(_bind(), config_hash=PACK_HASH), "preview": None, "dry_run": False,
+                "written": ["germquant_project.yaml"], "removed": ["recipe.yaml", "channel_map.yaml"]}
+
+    fake = FakeRunner(answer)
+    edited = fake_view(tmp_path, config_hash="bbbbbbbbbbbb", digest="d1")
+    edited.roles[1] = edited.roles[1].with_edit("foci")
+    views = [edited]
+    tab = _tab(qtbot, tmp_path, session=FakeSession(fake), reader=lambda root, reference=None: views[-1])
+    assert tab.role_choice("foci") == "foci" and tab.revert_roles_btn.isEnabled()
+    views.append(fake_view(tmp_path, digest="d2"))
+    n = len(fake.calls)
+    assert tab.revert_roles()
+    _settle(tab, qtbot)
+    assert fake.calls[n] == {"root": str(tmp_path), "unset": ["io.channel_map"]}
+    assert fake.calls[n + 1:] == [{"root": str(tmp_path), "roles": {"dna": "", "foci": ""}, "dry_run": True}]
+    assert tab.role_choice("foci") is None and tab.config_hash == PACK_HASH
+    assert "removed recipe.yaml, channel_map.yaml" in tab.status_label.text()
+    tab.choose_channel("dna", "DAPI")                              # nothing saved: the choice is dropped here
+    _settle(tab, qtbot)
+    n = len(fake.calls)
+    assert tab.revert_roles() and tab.role_choice("dna") is None
+    _settle(tab, qtbot)
+    assert all(c.get("dry_run") for c in fake.calls[n:])
 
 
 def test_amber_and_unreadable_headers_and_a_required_role_unbound(qtbot, tmp_path):
