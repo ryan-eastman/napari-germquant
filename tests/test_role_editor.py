@@ -473,7 +473,8 @@ def test_amber_and_unreadable_headers_and_a_required_role_unbound(qtbot, tmp_pat
 
 def test_a_run_in_progress_and_a_refused_write_leave_the_project_as_it_was(qtbot, tmp_path):
     """While the host says a run of the project goes, the role editor and the form take no edit; a write the
-    engine refuses shows its reason, emits nothing and keeps the choices."""
+    engine refuses shows its reason, emits nothing and keeps the choices, and the project is read again (a write
+    that stops part way has changed files, review N10)."""
     def answer(kw):
         if not kw.get("dry_run"):
             return EngineRefused("`germquant.project edit` was refused by the engine (exit 2):\nREFUSED: the project "
@@ -481,8 +482,14 @@ def test_a_run_in_progress_and_a_refused_write_leave_the_project_as_it_was(qtbot
         return preview_record(_bind(), config_hash="bbbbbbbbbbbb" if any((kw.get("roles") or {}).values())
                               else "02bb83cf74f9", changed=any((kw.get("roles") or {}).values()))
 
+    reads = []
+
+    def reader(root, reference=None):
+        reads.append(str(root))
+        return fake_view(tmp_path)
+
     fake = FakeRunner(answer)
-    tab = _tab(qtbot, tmp_path, session=FakeSession(fake), reader=lambda root, reference=None: fake_view(tmp_path))
+    tab = _tab(qtbot, tmp_path, session=FakeSession(fake), reader=reader)
     tab.set_running(True)
     assert not tab.role_combos["dna"].isEnabled() and not tab.apply_roles_btn.isEnabled()
     assert "a run of this project is in progress" in tab.status_label.text()
@@ -494,7 +501,9 @@ def test_a_run_in_progress_and_a_refused_write_leave_the_project_as_it_was(qtbot
     _settle(tab, qtbot)
     applied = []
     tab.applied.connect(applied.append)
+    n = len(reads)
     assert tab.apply_roles()
     _settle(tab, qtbot)
     assert applied == [] and "the project is locked" in tab.status_label.text()
     assert tab.role_choice("dna") == "DAPI" and tab.apply_roles_btn.isEnabled()    # the choice is kept
+    assert len(reads) == n + 1                                     # the project read again after the refusal

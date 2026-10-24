@@ -1223,6 +1223,10 @@ class RecipeTab(QWidget):
             self._status(f"the reference image could not be read: {text}", AMBER)
         else:
             self._status(text, RED)
+            if kind == "write" and self._root is not None and self._want_load is None:
+                # a write that stopped part way changed files (PLAN 9.4 #6), a refused one none: read the project
+                # again, keeping the choices and values not applied, so no preview is keyed to an old digest
+                self._request_load(keep=True)
         self._update_enabled()
 
     def _on_finished(self) -> None:
