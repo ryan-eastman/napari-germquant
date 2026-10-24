@@ -158,10 +158,10 @@ def test_points_size_of_a_batch_comes_from_the_batch_root(tmp_path):
     write_manifest(root, config_hash="h2", config=config)
     assert rs.run_config() is None
     assert list(_sizes(rs).values()) == [pytest.approx(0.6)] * 2
-    # the nearest manifest decides: one closer to the image with another hash stops the walk
+    # a nearer manifest of another config (another batch's root, below this one) is passed over
     write_manifest(root, config_hash="h1", config=config)
     write_manifest(root / "day1", config_hash="h3", config={"spots": {"spot_radius_um": 0.1}})
-    assert rs.run_config() is None
+    assert rs.run_config() == config
     (root / "day1" / "run_manifest.json").unlink()
     assert rs.run_config() == config
     # a planar folder inside a batch: its points size from the root, its scale from its tables
@@ -187,13 +187,36 @@ def test_points_size_from_the_folders_own_manifest(tmp_path):
     batch = {"spots": {"spot_radius_um": 0.2}}
     write_manifest(root, config_hash="h1", config=batch)
     assert rs.run_config() == batch and _sizes(rs) == {f"{STACK_ID} spots": pytest.approx(0.4)}
+    # an own manifest of the image's hash without a config mapping is no answer either
+    write_manifest(rs.folder, config_hash="h1", config=None)
+    assert rs.run_config() == batch
     # an image whose config_hash is not recorded (no done marker, no config_hash column): its own manifest
+    write_manifest(rs.folder, config_hash="h0", config=own)
     (rs.folder / f"{STACK_ID}__done.json").unlink()
     summary = rs.folder / f"{STACK_ID}__image_summary.csv"
     pd.read_csv(summary).drop(columns=["config_hash"]).to_csv(summary, index=False)
     assert rs.config_hash() is None and rs.run_config() == own
     (rs.folder / "run_manifest.json").unlink()
     assert rs.run_config() is None                         # and no search above without a hash to match
+
+
+def test_a_done_marker_that_is_not_an_object_still_loads(tmp_path, monkeypatch):
+    # valid JSON that is not an object is no done marker: the image's config_hash comes from its tables and
+    # every layer loads, the source image at stride 1 too (the Results dock said "could not load" before)
+    root = tmp_path / "batch"
+    rs = write_stack_results(root / STACK_ID, config_hash="h1")
+    write_manifest(root, config_hash="h1", config={"spots": {"spot_radius_um": 0.2}})
+    src = write_cyx_image(tmp_path / "cells_001.ome.tif", np.zeros((2, *PLANE), np.uint16), ["DNA", "foci"])
+    summary = rs.file("image_summary.csv")
+    pd.read_csv(summary).assign(file_path=str(src)).to_csv(summary, index=False)
+    stack = plane_stack(np.zeros((2, 3, *PLANE), np.uint16), SP3, spacing_ok=True)
+    monkeypatch.setattr(_reader.api, "read_image", lambda p, xy_stride=1: stack if xy_stride == 1 else None)
+    for text in ("[1, 2]", "7", '"done"'):
+        (rs.folder / f"{STACK_ID}__done.json").write_text(text, encoding="utf-8")
+        assert rs.config_hash() == "h1"
+        layers = load_results_layers(rs, include_source=True)
+        assert [kind for *_, kind in layers] == ["image", "image", "labels", "image", "points"], text
+        assert layers[-1][1]["size"] == pytest.approx(0.4)
 
 
 def test_reader_scales_a_single_plane(tmp_path, monkeypatch):

@@ -116,8 +116,10 @@ class ResultsSet:
 
     def config_hash(self) -> str | None:
         """The config_hash of this image's run: its done marker's, else its image_summary table's (read as
-        text, so a hash of digits only keeps its leading zeros)."""
-        value = (self.done_marker() or {}).get("config_hash")
+        text, so a hash of digits only keeps its leading zeros). A done marker that is not a JSON object is
+        no marker: it never stops the layers from loading."""
+        marker = self.done_marker()
+        value = marker.get("config_hash") if isinstance(marker, dict) else None
         if not (isinstance(value, str) and value.strip()) and self.has("image_summary.csv"):
             try:
                 df = pd.read_csv(self.file("image_summary.csv"), dtype=str, nrows=1)
@@ -131,16 +133,19 @@ class ResultsSet:
         """The config the run used (the "config" of a run_manifest.json), matched to this image by its
         config_hash (``config_hash``). A single-image or project run writes the manifest into the image's
         folder. ``germquant batch`` writes one manifest, into the batch root, and none per image, so the
-        nearest run_manifest.json above the folder (up to MANIFEST_SEARCH_LEVELS folders up) is the run's when
-        its config_hash is this image's; the search stops at that manifest either way (a later batch into
-        the same root rewrites it). The folder's own manifest is also used when the image's hash is not
+        search goes on up (at most MANIFEST_SEARCH_LEVELS folders above the image's) to the nearest
+        run_manifest.json whose config_hash is this image's. A manifest of another config is passed over: a
+        later batch into the same root rewrites the root's, and a batch into a folder below another batch's
+        root writes its own there. Only a matching hash makes a manifest the run's, and every manifest with
+        that hash holds the same config. The folder's own manifest is also used when the image's hash is not
         recorded, and is passed over when another run wrote it (a batch that later wrote this folder leaves
         an earlier single run's manifest behind). None when nothing matches."""
         want = self.config_hash()
         own = self.manifest()
         if own is not None and (want is None or own.get("config_hash") == want):
             cfg = own.get("config")
-            return cfg if isinstance(cfg, dict) else None
+            if isinstance(cfg, dict):
+                return cfg
         folder = self.folder
         for _ in range(MANIFEST_SEARCH_LEVELS):
             if want is None or folder.parent == folder:
@@ -154,7 +159,8 @@ class ResultsSet:
             if present:
                 doc = _read_manifest(p)
                 cfg = doc.get("config") if doc is not None and doc.get("config_hash") == want else None
-                return cfg if isinstance(cfg, dict) else None
+                if isinstance(cfg, dict):
+                    return cfg
         return None
 
     def _record(self, key: str) -> dict | None:
