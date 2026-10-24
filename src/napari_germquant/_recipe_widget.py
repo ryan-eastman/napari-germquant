@@ -73,6 +73,7 @@ STATE_TIPS = {
     "name": "bound by the channel's name",
 }
 RUNNING_TEXT = "a run of this project is in progress: recipe edits wait until it ends"
+WRITING_TEXT = "a write is in progress: the next edit waits until it is done"
 INT_LIMIT = 2 ** 31 - 1
 FLOAT_LIMIT = 1.0e12
 
@@ -532,7 +533,7 @@ class RecipeTab(QWidget):
             self.form_grid.addWidget(reset, i, 4)
             self.form_rows[t.key] = row
             pending = self._pending.get(t.key, MISSING)
-            self._show_value(row, t.pack_value if pending is RESET else (t.value if pending is MISSING else pending))
+            self._restore_widget(row)
             row.shown = self._widget_value(row) if pending is MISSING else self._widget_value_for(row, t.value)
             note.setText(self._note(row))
         self.others_label.setText(
@@ -588,6 +589,13 @@ class RecipeTab(QWidget):
         w = QLineEdit()
         w.editingFinished.connect(lambda key=t.key: self._on_widget(key))
         return w
+
+    def _restore_widget(self, row: FormRow) -> None:
+        """Show in the row's widget what the form holds for it: the pending value, the pack's for a pending
+        reset, else the project's value."""
+        t = row.tunable
+        pending = self._pending.get(t.key, MISSING)
+        self._show_value(row, t.pack_value if pending is RESET else (t.value if pending is MISSING else pending))
 
     def _show_value(self, row: FormRow, value) -> None:
         """Put ``value`` into the row's widget without taking it for a change."""
@@ -764,21 +772,23 @@ class RecipeTab(QWidget):
         return True
 
     def _blocked(self) -> str:
-        """Why no edit can be made now (no project read, no usable engine, a run in progress), or ""."""
+        """Why no edit can be made now (no project read, no usable engine, a run in progress, a write queued or
+        running), or "". A write's answer replaces the pending values and the role choices with what was written,
+        so an edit taken while it runs would be lost: none is taken then."""
         if self._view is None or self.last_error is not None:
             return "no project is read"
         if self.engine_error:
             return f"read only: {self.engine_error}"
         if self._running:
             return RUNNING_TEXT
+        if self._writes or self._job == "write":
+            return WRITING_TEXT
         return ""
 
     def _roles_refusal(self) -> str:
         blocked = self._blocked()
         if blocked:
             return blocked
-        if self._writes or self._job == "write":
-            return "a write is in progress"
         if not self._roles_changed():
             return "no role change to apply"
         rec = self._current_role_record()
@@ -809,9 +819,6 @@ class RecipeTab(QWidget):
                 self._syncing = False
             self._after_role_change()
             return True
-        if self._writes or self._job == "write":
-            self._status("a write is in progress", AMBER)
-            return False
         self._queue_write("roles", {"roles": _params.role_choices(self._view.roles, {})}, "reverting the role edits")
         return True
 
@@ -820,7 +827,12 @@ class RecipeTab(QWidget):
         if self._syncing:
             return
         row = self.form_rows.get(key)
-        if row is None or self._blocked():    # the widgets are off then
+        if row is None:
+            return
+        blocked = self._blocked()
+        if blocked:                           # the widgets are off then; a change made all the same is put back
+            self._restore_widget(row)
+            self._status(blocked, AMBER)
             return
         value = self._widget_value(row)
         if _params._same(value, row.shown):
@@ -930,9 +942,6 @@ class RecipeTab(QWidget):
         if blocked:
             self._status(blocked, AMBER)
             return False
-        if self._writes or self._job == "write":
-            self._status("a write is in progress", AMBER)
-            return False
         edits, unset = self._form_change()
         if not (edits or unset):
             self._status("no parameter change to apply", AMBER)
@@ -956,9 +965,6 @@ class RecipeTab(QWidget):
         if blocked:
             self._status(blocked, AMBER)
             return False
-        if self._writes or self._job == "write":
-            self._status("a write is in progress", AMBER)
-            return False
         if confirm:
             answer = QMessageBox.question(self, "Back to the pack recipe",
                                           "Drop every recipe edit, role edit and project model of this project? "
@@ -971,8 +977,7 @@ class RecipeTab(QWidget):
     # ------------------------------------------------------------------ enabling
     def _update_enabled(self) -> None:
         ok = self._view is not None and self.last_error is None
-        editable = ok and not self._blocked()
-        writing = bool(self._writes) or self._job == "write"
+        editable = ok and not self._blocked()          # off while a run or a write goes (_blocked)
         for combo in self.role_combos.values():
             combo.setEnabled(editable)
         self.reference_combo.setEnabled(ok)
@@ -981,15 +986,12 @@ class RecipeTab(QWidget):
                 row.widget.setEnabled(editable)
             t = row.tunable
             row.reset_btn.setEnabled(editable and t.editable and (t.edited or t.key in self._pending))
-        self.apply_roles_btn.setEnabled(editable and not writing and not self._roles_refusal())
-        self.revert_roles_btn.setEnabled(editable and not writing and ok
-                                         and (any(r.edit for r in self._view.roles) or self._roles_changed()))
+        self.apply_roles_btn.setEnabled(editable and not self._roles_refusal())
+        self.revert_roles_btn.setEnabled(editable and (any(r.edit for r in self._view.roles) or self._roles_changed()))
         edits, unset = self._form_change() if ok else ({}, [])
         cur = self._current_form_record()
-        self.apply_form_btn.setEnabled(editable and not writing and bool(edits or unset)
-                                       and (cur is None or isinstance(cur, dict)))
-        self.revert_all_btn.setEnabled(editable and not writing and ok and (
-            self._view.edited or any(r.edit for r in self._view.roles)))
+        self.apply_form_btn.setEnabled(editable and bool(edits or unset) and (cur is None or isinstance(cur, dict)))
+        self.revert_all_btn.setEnabled(editable and (self._view.edited or any(r.edit for r in self._view.roles)))
 
     # ------------------------------------------------------------------ the engine calls (one at a time)
     def _request_load(self, *, keep: bool) -> None:

@@ -10,6 +10,7 @@ widget tests and the rule tests further down run against any engine."""
 from __future__ import annotations
 
 import math
+import threading
 
 import pytest
 import yaml
@@ -298,6 +299,69 @@ def test_form_edits_and_resets_become_one_project_edit(qtbot, tmp_path):
     assert "wrote recipe.yaml" in tab.status_label.text()
     assert len([c for c in fake.calls if "roles" in c]) == role_runs                # carried over
     assert tab.preview_states() == {"img1": {"dna": "name", "foci": "index"}} and tab.roles_hash == "dddddddddddd"
+
+
+def test_no_edit_is_taken_while_a_write_runs(qtbot, tmp_path):
+    """While a write is queued or running, every edit control is off and every edit is refused with the reason
+    (review S1): the write's answer resets the pending values and the role choices, so an edit taken then would
+    be lost without a word. The form's and the role editor's own widgets are put back as well."""
+    binds = {"img1": {"dna": {"channel": "DAPI", "how": "name"}, "foci": {"channel": "foci", "how": "name"}}}
+
+    def answer(kw):
+        roles = kw.get("roles")
+        if roles is not None:
+            changed = any(roles.values())
+            rec = preview_record(binds, changed=changed, config_hash="bbbbbbbbbbbb" if changed else PACK_HASH)
+            return rec if kw.get("dry_run") else {**rec, "dry_run": False,
+                                                  "written": ["channel_map.yaml", "recipe.yaml",
+                                                              "germquant_project.yaml"]}
+        if kw.get("dry_run"):
+            return {**preview_record({}, config_hash="eeeeeeeeeeee"), "preview": None}
+        return {**preview_record({}, config_hash="dddddddddddd"), "preview": None, "dry_run": False,
+                "written": ["recipe.yaml", "germquant_project.yaml"]}
+
+    def writes():
+        return [c for c in fake.calls if not c.get("dry_run")]
+
+    tab, fake, _views = _form_tab(qtbot, tmp_path, answer)
+    tab.set_value("a.float", 2.5)
+    _settle(tab, qtbot)
+    fake.gate = threading.Event()                                       # hold the write
+    assert tab.apply_form()
+    qtbot.waitUntil(lambda: len(writes()) == 1, timeout=30_000)
+    int_box = tab.form_rows["a.int"].widget
+    assert not int_box.isEnabled() and not tab.role_combos["foci"].isEnabled()
+    assert not tab.form_rows["a.int"].reset_btn.isEnabled() and not tab.apply_form_btn.isEnabled()
+    tab.set_value("a.int", 5)
+    assert tab.pending() == {"a.float": 2.5} and "a write is in progress" in tab.status_label.text()
+    int_box.setValue(6)                                                 # the widget's own signal: put back
+    assert tab.pending() == {"a.float": 2.5} and int_box.value() == 4
+    tab.choose_channel("foci", "DAPI")
+    assert tab.role_choice("foci") is None and not tab.revert_all(confirm=False)
+    fake.gate.set()
+    fake.gate = None
+    _settle(tab, qtbot)
+    assert writes() == [{"root": str(tmp_path), "edits": {"a.float": 2.5}}]
+    assert tab.form_rows["a.int"].widget.isEnabled() and tab.role_combos["foci"].isEnabled()   # rebuilt
+    assert tab.pending() == {}
+
+    tab.choose_channel("dna", "DAPI")                                   # the same for a role write
+    _settle(tab, qtbot)
+    fake.gate = threading.Event()
+    assert tab.apply_roles()
+    qtbot.waitUntil(lambda: len(writes()) == 2, timeout=30_000)
+    combo = tab.role_combos["foci"]
+    assert not combo.isEnabled() and not tab.apply_roles_btn.isEnabled()
+    tab.choose_channel("foci", "DAPI")
+    combo.setCurrentIndex(1)                                            # the combo's own signal: put back
+    assert tab.role_choice("foci") is None and combo.currentData() is None
+    tab.set_value("a.int", 5)
+    assert tab.pending() == {} and "a write is in progress" in tab.status_label.text()
+    fake.gate.set()
+    fake.gate = None
+    _settle(tab, qtbot)
+    assert writes()[-1] == {"root": str(tmp_path), "roles": {"dna": "DAPI", "foci": ""}}
+    assert tab.role_combos["foci"].isEnabled() and tab.form_rows["a.int"].widget.isEnabled()
 
 
 def test_values_the_widgets_cannot_show_are_named(qtbot, tmp_path):
