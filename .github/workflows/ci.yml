@@ -4,9 +4,9 @@
 #
 # The engine: checked out from its public repository at ENGINE_COMMIT and installed editable with the readers
 # extra, so the built-in packs are found in that checkout. While a tranche's train is open the pin is the head
-# of the engine's integration branch (feat/tranche5, 0521abf for train A); it moves to the engine's main commit
-# after the engine pull request merges, and only then does the plugin pull request merge. If the engine
-# repository ever becomes private, the engine checkout needs a read token (open question O22).
+# of the engine's integration branch (feat/tranche5, 0521abf for train A; feat/t5-train-b for train B); it moves
+# to the engine's main commit after the engine pull request merges, and only then does the plugin pull request
+# merge. If the engine repository ever becomes private, the engine checkout needs a read token (open question O22).
 #
 # The test pack: tests/fixtures/packs/test_pack is a copy of the engine's tests/fixtures/packs/test_pack, so the
 # tests need no sibling checkout. A step compares the copy's SHA256SUMS with the engine checkout's and verifies
@@ -50,8 +50,10 @@ env:
   # -1, not an empty string (Windows drops empty variables): torch sees no CUDA device
   CUDA_VISIBLE_DEVICES: "-1"
   ENGINE_REPOSITORY: ryan-eastman/C_elegans_germline_masking_and_spot_counting
-  # train A of tranche 5, merged: the engine's main at b90ebdf ("Merge pull request #12", tranche-5 train A)
-  ENGINE_COMMIT: b90ebdf6859f6b0e3211a3c2970854adfdca41b8
+  # train B of tranche 5, open: the pushed head of the engine's integration branch feat/t5-train-b, as a full sha,
+  # moved after every engine merge (Train B plan, section 5.4). Now 361b082, merge #1 (P2b, single-plane images).
+  # Before it, main's pin b90ebdf ("Merge pull request #12", tranche-5 train A, merged).
+  ENGINE_COMMIT: 361b082e05469beec0f3ada849fb4ddd5aeaceaa
 
 jobs:
   test:
