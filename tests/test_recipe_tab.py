@@ -134,6 +134,7 @@ def test_without_an_engine_the_tab_shows_the_recipe_read_only(qtbot, tmp_path):
     assert tab.engine_error == NOT_CHOSEN and NOT_CHOSEN in tab.status_label.text()
     assert list(tab.form_rows) == ["a.float"] and not tab.form_rows["a.float"].widget.isEnabled()
     assert not tab.role_combos["dna"].isEnabled() and not tab.apply_roles_btn.isEnabled()
+    assert tab.roles_hash_label.text() == "no role preview: there is no engine to ask"
     tab.set_value("a.float", 2.0)
     assert tab.pending() == {} and "read only" in tab.status_label.text()
     assert not tab.apply_form() and not tab.revert_all(confirm=False)

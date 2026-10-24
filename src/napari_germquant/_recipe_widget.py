@@ -717,7 +717,11 @@ class RecipeTab(QWidget):
         if v is None or rec is None:
             self.preview_table.setRowCount(0)
             self.problems_label.setText("")
-            self.roles_hash_label.setText("checking the role preview ..." if v is not None and v.roles else "")
+            if v is not None and v.roles:
+                self.roles_hash_label.setText("no role preview: there is no engine to ask" if self.engine_error
+                                              else "checking the role preview ...")
+            else:
+                self.roles_hash_label.setText("")
             return
         states = _params.preview_states(rec, roles)
         bindings = (rec.get("preview") or {}).get("bindings") or {}
