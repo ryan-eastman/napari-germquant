@@ -287,12 +287,14 @@ class _ProbeTab(ProjectTab):
 
 
 def test_recipe_and_sample_edits_are_off_while_a_run_goes(qtbot, tmp_path, monkeypatch):
-    monkeypatch.setattr(PW, "EXTRA_TABS", [("Probe", f"{__name__}:_ProbeTab")])
+    monkeypatch.setattr(PW, "EXTRA_TABS", [("Probe", f"{__name__}:_ProbeTab"),
+                                           ("Broken", "napari_germquant._no_such_module:Tab")])
     w, fake = _dock(qtbot)
     titles = [w.tabs.tabText(i) for i in range(w.tabs.count())]
-    assert titles == ["Images", "Samples", "Run", "Probe"]
+    assert titles == ["Images", "Samples", "Run", "Probe", "Broken"]
     tab = w.tab("Probe")
     assert isinstance(tab, _ProbeTab) and tab.dock is w
+    assert "could not be built" in w.tab("Broken").text() and "Broken" not in w.extra_tabs   # the dock still works
     root = _make_project(tmp_path)
     w.open_project(root)
     settle(w, qtbot)

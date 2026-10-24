@@ -566,7 +566,14 @@ class ProjectWidget(QWidget):
         self.tabs.addTab(self._samples_tab(), "Samples")
         self.tabs.addTab(self._run_tab(), "Run")
         for title, spec in EXTRA_TABS:
-            tab = _tab_class(spec)(self)
+            try:
+                tab = _tab_class(spec)(self)
+            except Exception as e:  # noqa: BLE001 - a tab that cannot be built says why; the dock still works
+                broken = QLabel(f"The {title} tab could not be built ({spec}): {type(e).__name__}: {e}")
+                broken.setWordWrap(True)
+                broken.setStyleSheet(css(RED))
+                self.tabs.addTab(broken, title)
+                continue
             self.extra_tabs[title] = tab
             self.tabs.addTab(tab, title)
         split.addWidget(self.tabs)
