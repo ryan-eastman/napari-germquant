@@ -2,7 +2,8 @@
 sections 7.3 and 8.5; P6 acceptance 4 and 5; tranche 5 Train B plan, decision D39).
 
 The role editor offers one combo per role of the pack recipe's channel map, listing the channels of a reference
-image (the image selected on the Images tab, or the first one) after the pack map's own binding. Below it a
+image (the project's first image, or the one chosen in the tab's own list or by ``set_reference_image``) after
+the pack map's own binding. Below it a
 preview shows, for every image of the project, how each role binds with the choices made: by name, by the index
 fallback (amber: the run flags it), unbound (red for a required role) or two roles on one channel (red). The
 preview is the engine's dry run, ``project edit DIR --role ROLE=CHANNEL ... --dry-run --json``, so it comes from
@@ -23,8 +24,10 @@ dry run and write to the engine runner of the viewer's engine session (``_engine
 one call at a time, the newest request of each kind first; the GUI thread never waits. While the host says a run
 of the project is in progress (``set_running``) the tab takes no edit.
 
-The host: the Project dock adds the tab with one line, ``RecipeTab.for_dock(dock)`` (``connect_host`` names the
-signals it listens to); the tab also works alone (its own reference image combo, ``set_project``).
+The host: the Project dock (unit P6-PROJECT) shows the tab through one line of its EXTRA_TABS,
+``("Recipe", "napari_germquant._recipe_widget:RecipeProjectTab")``. RecipeProjectTab follows the dock's tab
+protocol (``project_changed(state)``, ``running_changed(running)``) and asks the dock to read the project again
+after each write. The tab also works alone (``set_project``, ``set_running``, ``set_reference_image``).
 """
 from __future__ import annotations
 
@@ -168,32 +171,7 @@ class RecipeTab(QWidget):
         self._show_engine()
         self._update_enabled()
 
-    # ------------------------------------------------------------------ the host's side
-    @classmethod
-    def for_dock(cls, dock) -> "RecipeTab":
-        """The tab for a host dock (the Project dock's one line): its viewer and engine session when it has
-        them, wired with ``connect_host``."""
-        tab = cls(getattr(dock, "viewer", None), session=getattr(dock, "session", None))
-        tab.connect_host(dock)
-        return tab
-
-    def connect_host(self, host) -> list[str]:
-        """Listen to what a host offers: ``project_changed(root)``, ``image_selected(image_id)`` and
-        ``run_state_changed(running)`` signals; and call its ``recipe_applied(record)`` after every write.
-        Returns the names connected."""
-        made = []
-        for name, slot in (("project_changed", self.set_project), ("image_selected", self.set_reference_image),
-                           ("run_state_changed", self.set_running)):
-            sig = getattr(host, name, None)
-            if sig is not None and hasattr(sig, "connect"):
-                sig.connect(slot)
-                made.append(name)
-        cb = getattr(host, "recipe_applied", None)
-        if callable(cb):
-            self.applied.connect(cb)
-            made.append("recipe_applied")
-        return made
-
+    # ------------------------------------------------------------------ what a host calls
     @property
     def root(self) -> Path | None:
         return self._root

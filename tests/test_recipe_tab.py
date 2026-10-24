@@ -1,7 +1,8 @@
-"""The Recipe tab as a part of the Project dock (tranche 5 Train B, unit P6-RECIPE): the host's one line
-(``RecipeTab.for_dock``) and the signals it listens to, the order of its engine calls when the project shown
-changes under them, and the read-only states (no engine chosen, an engine without projects, this environment's
-germquant without projects). A fake engine and a hand-made view: these run against any engine."""
+"""The Recipe tab as a part of the Project dock (tranche 5 Train B, unit P6-RECIPE): the reference image, the
+dock's tab protocol (RecipeProjectTab, the class the dock's EXTRA_TABS line names), the order of its engine calls
+when the project shown changes under them, and the read-only states (no engine chosen, an engine without
+projects, this environment's germquant without projects). A fake engine and a hand-made view: these run against
+any engine."""
 from __future__ import annotations
 
 import sys
@@ -11,7 +12,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from _p6_recipe import FakeRunner, FakeSession, fake_view, preview_record
-from qtpy.QtCore import QObject, Signal
 from qtpy.QtWidgets import QWidget
 
 from napari_germquant import _engine, _params
@@ -28,33 +28,23 @@ def _bindings(image="img1") -> dict:
     return {image: {"dna": {"channel": "DAPI", "how": "name"}, "foci": {"channel": "foci", "how": "name"}}}
 
 
-class _Host(QObject):
-    """A Project dock as far as the tab sees it."""
-
-    project_changed = Signal(object)
-    image_selected = Signal(str)
-    run_state_changed = Signal(bool)
-
-    def __init__(self, session):
-        super().__init__()
-        self.viewer = None
-        self.session = session
-        self.records: list[dict] = []
-
-    def recipe_applied(self, record: dict) -> None:
-        self.records.append(record)
+def _items(combo) -> list[str]:
+    return [combo.itemText(i) for i in range(combo.count())]
 
 
-def test_the_project_dock_adds_the_tab_with_one_line(qtbot, tmp_path):
+def test_the_reference_image_fills_the_role_lists(qtbot, tmp_path):
+    """The role combos list the channels of the reference image: the project's first image, or the one chosen in
+    the tab's own list or by a host (set_reference_image). A choice made on one image stays chosen on another,
+    named as no channel of it, and Apply writes it."""
     def answer(kw):
+        changed = any((kw.get("roles") or {}).values())
         if kw.get("dry_run"):
-            return preview_record(_bindings(), config_hash="bbbbbbbbbbbb" if any((kw.get("roles") or {}).values())
-                                  else "02bb83cf74f9", changed=any((kw.get("roles") or {}).values()))
+            return preview_record(_bindings(), config_hash="bbbbbbbbbbbb" if changed else "02bb83cf74f9",
+                                  changed=changed)
         return {**preview_record(_bindings(), config_hash="bbbbbbbbbbbb"), "dry_run": False,
                 "written": ["channel_map.yaml", "recipe.yaml", "germquant_project.yaml"]}
 
     fake = FakeRunner(answer)
-    host = _Host(FakeSession(fake))
     images = [{"id": i, "path": f"images/{i}.ome.tif", "excluded": False} for i in ("img1", "img2")]
     channels = {"img1": ["DAPI", "foci"], "img2": ["Hoechst", "spots"]}
 
@@ -62,31 +52,32 @@ def test_the_project_dock_adds_the_tab_with_one_line(qtbot, tmp_path):
         ref = reference or "img1"
         return fake_view(root, images=images, reference=ref, channels=channels[ref])
 
-    tab = RecipeTab.for_dock(host)                     # the one line (the reader is the tests' own)
-    tab._reader = reader
+    tab = RecipeTab(None, session=FakeSession(fake), reader=reader)
     qtbot.addWidget(tab)
-    assert tab.session is host.session
-    other = _Host(host.session)
-    assert tab.connect_host(other) == ["project_changed", "image_selected", "run_state_changed", "recipe_applied"]
-    host.project_changed.emit(str(tmp_path))
+    tab.set_project(tmp_path)
     _settle(tab, qtbot)
     assert tab.root == Path(tmp_path) and tab.view.reference == "img1"
-    assert [tab.reference_combo.itemText(i) for i in range(tab.reference_combo.count())] == ["img1", "img2"]
-    items = [tab.role_combos["dna"].itemText(i) for i in range(tab.role_combos["dna"].count())]
-    assert items[1:] == ["0: DAPI", "1: foci"]
-    host.image_selected.emit("img2")                   # the Images tab's selection is the reference image
+    assert _items(tab.reference_combo) == ["img1", "img2"]
+    assert _items(tab.role_combos["dna"])[1:] == ["0: DAPI", "1: foci"]
+    tab.set_reference_image("img2")                    # a host's call
     _settle(tab, qtbot)
     assert tab.view.reference == "img2" and tab.reference_combo.currentText() == "img2"
-    assert [tab.role_combos["dna"].itemText(i) for i in range(1, 3)] == ["0: Hoechst", "1: spots"]
-    host.run_state_changed.emit(True)
-    assert tab.running and not tab.role_combos["dna"].isEnabled()
-    host.run_state_changed.emit(False)
+    assert _items(tab.role_combos["dna"])[1:] == ["0: Hoechst", "1: spots"]
     tab.choose_channel("dna", "Hoechst")
     _settle(tab, qtbot)
+    tab.reference_combo.setCurrentIndex(0)             # the tab's own list
+    _settle(tab, qtbot)
+    assert tab.view.reference == "img1" and tab.role_choice("dna") == "Hoechst"
+    assert _items(tab.role_combos["dna"])[1:] == ["0: DAPI", "1: foci", "Hoechst (not a channel of img1)"]
+    assert tab.role_combos["dna"].currentData() == "Hoechst"
+    applied = []
+    tab.applied.connect(applied.append)
     assert tab.apply_roles()
     _settle(tab, qtbot)
-    assert [r["config_hash"] for r in host.records] == ["bbbbbbbbbbbb"] == [r["config_hash"] for r in other.records]
-    host.project_changed.emit(None)
+    assert [r["config_hash"] for r in applied] == ["bbbbbbbbbbbb"]
+    assert [c for c in fake.calls if not c.get("dry_run")] == [{"root": str(tmp_path),
+                                                                "roles": {"dna": "Hoechst", "foci": ""}}]
+    tab.set_project(None)
     assert tab.root is None and tab.view is None and tab.header_label.text() == "No project."
 
 
