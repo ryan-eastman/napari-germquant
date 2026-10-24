@@ -8,12 +8,15 @@ import sys
 import threading
 from pathlib import Path
 
+from types import SimpleNamespace
+
 from _p6_recipe import FakeRunner, FakeSession, fake_view, preview_record
 from qtpy.QtCore import QObject, Signal
+from qtpy.QtWidgets import QWidget
 
 from napari_germquant import _engine, _params
 from napari_germquant._engine_session import NOT_CHOSEN, EngineSession
-from napari_germquant._recipe_widget import RecipeTab
+from napari_germquant._recipe_widget import RecipeProjectTab, RecipeTab
 from napari_germquant._runner import FeatureMissing
 
 
@@ -168,3 +171,64 @@ def test_a_germquant_without_projects_here_gets_one_message(qtbot, tmp_path, mon
     _settle(tab, qtbot)
     assert tab.view is None and tab.last_error == text and text in tab.status_label.text()
     assert not tab.apply_form_btn.isEnabled() and not tab.revert_all_btn.isEnabled()
+
+
+class _Dock(QWidget):
+    """The Project dock as its tab protocol shows a tab (unit P6-PROJECT's EXTRA_TABS: the class is made with the
+    dock, which tells it of every reading of the project and of runs, and reads the project again on reload)."""
+
+    def __init__(self, session):
+        super().__init__()
+        self.viewer = None
+        self.session = session
+        self.reloads = 0
+
+    def reload(self) -> None:
+        self.reloads += 1
+
+
+def test_the_tab_follows_the_project_docks_tab_protocol(qtbot, tmp_path):
+    """RecipeProjectTab, the class the Project dock's EXTRA_TABS line names: it follows the dock's readings of the
+    project (a reading with no write since its own is not read again), its runs, and after a write it asks the
+    dock to read the project again."""
+    def answer(kw):
+        changed = any((kw.get("roles") or {}).values())
+        if kw.get("dry_run"):
+            return preview_record(_bindings(), config_hash="bbbbbbbbbbbb" if changed else "02bb83cf74f9",
+                                  changed=changed)
+        return {**preview_record(_bindings(), config_hash="bbbbbbbbbbbb"), "dry_run": False,
+                "written": ["channel_map.yaml", "recipe.yaml", "germquant_project.yaml"]}
+
+    fake = FakeRunner(answer)
+    dock = _Dock(FakeSession(fake))
+    qtbot.addWidget(dock)
+    views = [fake_view(tmp_path, saved={"at": "t0"})]
+    tab = RecipeProjectTab(dock)
+    tab._reader = lambda root, reference=None: views[-1]
+    assert tab.session is dock.session and tab.dock is dock
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t0"}}))
+    _settle(tab, qtbot)
+    assert tab.root == Path(tmp_path) and len(fake.calls) == 1
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t0"}}))
+    _settle(tab, qtbot)
+    assert len(fake.calls) == 1                         # read again with no write since: nothing to do
+    tab.running_changed(True)
+    assert tab.running and not tab.role_combos["dna"].isEnabled()
+    tab.running_changed(False)
+    tab.choose_channel("dna", "DAPI")
+    _settle(tab, qtbot)
+    views.append(fake_view(tmp_path, saved={"at": "t1"}, digest="d1", config_hash="bbbbbbbbbbbb",
+                           roles=[r.with_edit("DAPI" if r.role == "dna" else None) for r in views[0].roles]))
+    assert tab.apply_roles()
+    _settle(tab, qtbot)
+    assert dock.reloads == 1 and tab.config_hash == "bbbbbbbbbbbb"
+    n = len(fake.calls)
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t1"}}))   # the dock's
+    _settle(tab, qtbot)
+    assert len(fake.calls) == n                         # what the tab wrote and read already
+    views.append(fake_view(tmp_path, saved={"at": "t2"}, digest="d2"))
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t2"}}))   # a write elsewhere
+    _settle(tab, qtbot)
+    assert len(fake.calls) == n + 1 and tab.view.saved == {"at": "t2"}
+    tab.project_changed(None)
+    assert tab.root is None and tab.view is None

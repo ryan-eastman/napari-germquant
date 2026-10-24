@@ -225,7 +225,7 @@ class RecipeView:
     """A project's recipe as the tab shows it (``read_view``). ``config_hash`` is the project's hash as this
     environment computes it on open (the engine's dry run confirms it), ``validated`` the manifest's record,
     ``digest`` the sha256 of the manifest and the two recipe files (a preview made for another digest is
-    stale)."""
+    stale), ``saved`` the manifest's saved stamp (every write changes it)."""
 
     root: Path
     name: str
@@ -245,6 +245,7 @@ class RecipeView:
     channels_error: str | None
     warnings: list
     digest: str
+    saved: dict | None = None
 
     def role(self, name: str) -> Role:
         for r in self.roles:
@@ -432,7 +433,8 @@ def read_view(root, *, reference: str | None = None) -> RecipeView:
                       edited=bool((m.get("recipe") or {}).get("file")), validated=m.get("validated"),
                       tunables=tunables, others=others, roles=roles, match_by=match_by, images=images,
                       reference=chosen["id"] if chosen else None, channels=channels, channels_error=channels_error,
-                      warnings=warnings, digest=digest)
+                      warnings=warnings, digest=digest,
+                      saved=dict(m["saved"]) if isinstance(m.get("saved"), dict) else None)
 
 
 # ---------------------------------------------------------------------------------------------------

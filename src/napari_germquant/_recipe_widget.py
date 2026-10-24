@@ -1232,3 +1232,39 @@ class RecipeTab(QWidget):
         self._job = None
         self._update_enabled()
         self._pump()
+
+
+class RecipeProjectTab(RecipeTab):
+    """The Recipe tab as a tab of the Project dock, in the dock's own tab protocol (unit P6-PROJECT: a class named
+    in its EXTRA_TABS, made with the dock): ``project_changed(state)`` at every new reading of the open project
+    (None when it closes) and ``running_changed(running)`` when a run starts or ends. The tab takes the dock's
+    viewer and engine session; after each write it asks the dock to read the project again (``dock.reload``), so
+    the header and the status board follow the new config_hash."""
+
+    def __init__(self, dock) -> None:
+        super().__init__(getattr(dock, "viewer", None), dock, session=getattr(dock, "session", None))
+        self.dock = dock
+        self.applied.connect(self._reload_dock)
+
+    def project_changed(self, state) -> None:
+        root = getattr(state, "root", None) if state is not None else None
+        if root is None:
+            if self.root is not None:
+                self.set_project(None)
+            return
+        if self.root is None or Path(root) != self.root:
+            self.set_project(root)
+            return
+        saved = (getattr(state, "manifest", None) or {}).get("saved")
+        if self._view is not None and saved == self._view.saved:
+            return                             # read again with no write since this tab's own reading
+        if self._want_load is None:
+            self._request_load(keep=True)      # another write (the dock's, a tuning Apply): the recipe again
+
+    def running_changed(self, running: bool) -> None:
+        self.set_running(running)
+
+    def _reload_dock(self, _record: dict) -> None:
+        reload = getattr(self.dock, "reload", None)
+        if callable(reload):
+            reload()

@@ -157,7 +157,7 @@ def preview_record(bindings: dict, problems=(), *, config_hash="aaaaaaaaaaaa", c
 
 
 def fake_view(root: Path, *, tunables=(), others=(), roles=None, channels=("DAPI", "foci"), images=None,
-              reference=None, config_hash="02bb83cf74f9", validated=None, warnings=(), digest="d0"):
+              reference=None, config_hash="02bb83cf74f9", validated=None, warnings=(), digest="d0", saved=None):
     """A RecipeView of a project on the test pack's basic recipe, built by hand."""
     from napari_germquant._params import RecipeView, Role, Tunable
 
@@ -174,4 +174,4 @@ def fake_view(root: Path, *, tunables=(), others=(), roles=None, channels=("DAPI
                                               "record": None},
                       tunables=tun, others=list(others), roles=list(roles), match_by="name", images=images,
                       reference=reference or (images[0]["id"] if images else None), channels=list(channels),
-                      channels_error=None, warnings=list(warnings), digest=digest)
+                      channels_error=None, warnings=list(warnings), digest=digest, saved=saved)
