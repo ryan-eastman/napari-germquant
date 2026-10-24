@@ -128,8 +128,9 @@ def layers_from_stack(stack, path: str | Path, meta: dict | None = None, *, scal
     else:
         unreadable = not stack.spacing_ok
     if unreadable:
-        warnings.warn(f"{path.name}: voxel size unreadable; layers use 1 um per voxel (every length the "
-                      f"pipeline writes for this file carries the voxel:UNREADABLE flag)", stacklevel=2)
+        warnings.warn(f"{path.name}: voxel size unreadable; layers use 1 um per voxel (a run writes this "
+                      f"file's lengths at 1 um per voxel with the voxel:UNREADABLE flag unless its recipe "
+                      f"sets io.voxel_size_um)", stacklevel=2)
     layers: list[LayerData] = []
     for i in range(stack.n_channels):
         ch_name = names[i] if i < len(names) and names[i] else f"C{i}"

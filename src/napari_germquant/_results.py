@@ -19,7 +19,7 @@ the one the pack's recipe declares.
 
 Single-plane runs (docs/DESIGN_system_packs.md 8.8): the engine's planar mode writes voxel_dz_um as NaN, so
 ``spacing`` gives (1.0, dy, dx) for such a folder; its YX label and spots images gain the missing z axis; and
-the Points size is the spot size the run's own detector used, from the run's config (``spot_marker_size_um``),
+the Points size comes from the run's config (``spot_marker_size_um``: the spot size of a spotmax or LoG run),
 found in the folder's run_manifest.json or, for a batch, in the batch root's (``ResultsSet.run_config``).
 """
 from __future__ import annotations
@@ -272,12 +272,13 @@ def _size_um(value) -> float | None:
 
 
 def spot_marker_size_um(config: dict | None, table: str = "spots") -> float:
-    """The Points size, in microns, of a spots table: the spot diameter the run's detector used, read from the
-    run's config the way the engine resolves it (plan decision D37). The log backend: spots.log.diameter_um
-    (code default 0.5); spotmax and every other backend: 2 x spots.spot_radius_um (code default 0.3). An extra
-    spot instance (``spots_<name>``) lays its own keys over the shared spots section, a mapping such as
-    ``log`` one level deep, and its own backend wins. Without a config, or for an instance the config does
-    not list, or a value that is not a positive number: DEFAULT_POINT_SIZE_UM (0.6)."""
+    """The Points size, in microns, of a spots table, read from the run's config the way the engine resolves
+    it (plan decision D37). The log backend: its spot diameter, spots.log.diameter_um (code default 0.5);
+    spotmax and every other backend: 2 x spots.spot_radius_um (code default 0.3; net3d reads neither key, so
+    it keeps the RAD-51 marker, 0.6 unless the config sets the radius). An extra spot instance
+    (``spots_<name>``) lays its own keys over the shared spots section, a mapping such as ``log`` one level
+    deep, and its own backend wins. Without a config, or for an instance the config does not list, or a
+    value that is not a positive number: DEFAULT_POINT_SIZE_UM (0.6)."""
     spots = config.get("spots") if isinstance(config, dict) else None
     if not isinstance(spots, dict):
         return DEFAULT_POINT_SIZE_UM
@@ -297,7 +298,7 @@ def spot_marker_size_um(config: dict | None, table: str = "spots") -> float:
         if not isinstance(log_section, dict):
             log_section = {}
         size = _size_um(log_section.get("diameter_um", LOG_DIAMETER_DEFAULT_UM))
-    else:
+    else:                                     # spotmax's footprint; net3d has no spot size key of its own
         radius = _size_um(section.get("spot_radius_um", SPOT_RADIUS_DEFAULT_UM))
         size = 2.0 * radius if radius is not None else None
     return size if size is not None else DEFAULT_POINT_SIZE_UM
