@@ -31,6 +31,7 @@ from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QDialogButtonBox
 
 from napari_germquant import _engine, _settings
+from napari_germquant import _runner as runner_module
 from napari_germquant._engine import Recipe, RunPlan, feature_missing_message
 from napari_germquant._engine_widgets import InterpreterDialog
 from napari_germquant._run_widget import RunWidget
@@ -816,7 +817,7 @@ def test_a_project_listing_through_the_subprocess_runner_loads_no_torch(pack_env
     assert "germquant.pipeline" not in imported
 
 
-def test_the_project_run_log_is_tailed_with_partial_lines_kept(tmp_path):
+def test_the_project_run_log_is_tailed_with_partial_lines_kept(tmp_path, monkeypatch):
     """The tailer hands over complete lines only and keeps a partial last line for the next read; a project run
     through the subprocess runner streams its log events to ``progress`` while the engine writes them."""
     log = tmp_path / "runs" / "20261023T000000Z_abcdef12.jsonl"
@@ -837,11 +838,13 @@ def test_the_project_run_log_is_tailed_with_partial_lines_kept(tmp_path):
         fh.write(b"not json\n" + (end + "\r\n").encode("ascii"))
     assert [e["event"] for e in tail.read()] == ["run_end"] and tail.bad == ["not json"]
 
-    # pauses of three log reads and more (TAIL_S), so each of the three batches below arrives on its own
+    # the log read every 0.1 s and pauses of five reads or more, so each of the three batches below arrives on its
+    # own, and a read falls between the two halves of b's line
+    monkeypatch.setattr(runner_module, "TAIL_S", 0.1)
     spec = run_spec(ids=["a", "b", "c"], steps=[
         {"event": "image_done", "image_id": "a"},
-        {"event": "image_done", "image_id": "b", "sleep": 0.5, "partial": 1.5},
-        {"event": "image_skipped", "image_id": "c", "sleep": 1.5}])
+        {"event": "image_done", "image_id": "b", "sleep": 0.5, "partial": 0.5},
+        {"event": "image_skipped", "image_id": "c", "sleep": 0.5}])
     r = _standin_runner(tmp_path, FAKE_PROJECT_RUN=spec)
     project = tmp_path / "proj"
     project.mkdir()
