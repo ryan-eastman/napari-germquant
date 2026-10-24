@@ -77,14 +77,15 @@ def check_single_timepoint(path: str | Path, meta: dict) -> None:
             f"file into one scene per image and open those.")
 
 
-def open_image(path: str | Path, xy_stride: int = 1) -> list[LayerData]:
+def open_image(path: str | Path, xy_stride: int = 1, *, scale=None) -> list[LayerData]:
     """Header check, then the pixels through ``api.read_image``; ``xy_stride`` keeps every n-th pixel in
-    y and x (and scales the layer accordingly), for a quick look at a 3 GB gonad on a laptop."""
+    y and x (and scales the layer accordingly), for a quick look at a 3 GB gonad on a laptop. ``scale``, a
+    grid of the caller's: see layers_from_stack."""
     path = Path(path)
     meta = api.read_image_metadata(path)
     check_single_timepoint(path, meta)
     stack = api.read_image(path, xy_stride=int(xy_stride))
-    return layers_from_stack(stack, path, meta)
+    return layers_from_stack(stack, path, meta, scale=scale)
 
 
 def _positive_pair(value) -> tuple[float, float] | None:
@@ -108,17 +109,25 @@ def plane_spacing_yx(stack) -> tuple[float, float] | None:
     return _positive_pair(getattr(stack, "spacing_yx", None))
 
 
-def layers_from_stack(stack, path: str | Path, meta: dict | None = None) -> list[LayerData]:
+def layers_from_stack(stack, path: str | Path, meta: dict | None = None, *, scale=None) -> list[LayerData]:
     """One Image layer per channel of a germquant Stack (C, Z, Y, X), scaled by (dz, dy, dx) microns; a
-    one-plane stack with its own pixel size (``plane_spacing_yx``) by (1.0, dy, dx)."""
+    one-plane stack with its own pixel size (``plane_spacing_yx``) by (1.0, dy, dx). ``scale`` (dz, dy, dx),
+    when given, is used instead: the Results dock passes the run's own grid, so the source overlays the
+    run's labels whatever pixel size the reader finds, and the "voxel size unreadable" warning then comes
+    only when that grid is the reader's own 1 um guess."""
     path = Path(path)
     stem = api.image_stem(path)
     names = [str(n) for n in (stack.channel_names or [])]
     spacing = tuple(float(s) for s in stack.spacing)
     plane_yx = plane_spacing_yx(stack)
-    if plane_yx is not None:
-        spacing = (PLANAR_DZ_UM, *plane_yx)
-    elif not stack.spacing_ok:
+    if scale is not None:
+        guess, spacing = spacing, tuple(float(s) for s in scale)
+        unreadable = not stack.spacing_ok and spacing == guess
+    elif plane_yx is not None:
+        spacing, unreadable = (PLANAR_DZ_UM, *plane_yx), False
+    else:
+        unreadable = not stack.spacing_ok
+    if unreadable:
         warnings.warn(f"{path.name}: voxel size unreadable; layers use 1 um per voxel (every length the "
                       f"pipeline writes for this file carries the voxel:UNREADABLE flag)", stacklevel=2)
     layers: list[LayerData] = []

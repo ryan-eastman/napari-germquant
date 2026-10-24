@@ -6,8 +6,9 @@ The files ``process_image`` writes for one image id (``<image_id>__<table>.csv``
 matching per-object table attached as the layer's features (row i describes label i, so napari's label
 status line and feature widgets read the right row); a Points layer for the spots in microns with the spots
 table as features (and one per extra spot instance, ``spots_<name>``); the spots blob image as a hidden Image
-layer; and, on request, the source image through the plugin's reader at the stride the run used. Nothing here
-writes anything.
+layer; and, on request, the source image through the plugin's reader at the stride the run used, placed on the
+run's own grid (``spacing``) so the labels and points overlay it whatever pixel size the reader finds. Nothing
+here writes anything.
 
 For a system pack run (docs/DESIGN_system_packs.md, section 8.3) the pack record that ``__stages.json`` and
 ``run_manifest.json`` carry names what one row of the nuclei table is (object_kind nucleus or cell), so the
@@ -358,8 +359,11 @@ def load_results_layers(rs: ResultsSet, *, include_source: bool = False) -> list
         if src is not None:
             from ._reader import open_image
 
-            done = rs.done_marker() or {}
-            layers += open_image(src, xy_stride=int(done.get("xy_stride", 1) or 1))
+            done = rs.done_marker()
+            stride = int((done if isinstance(done, dict) else {}).get("xy_stride", 1) or 1)
+            # on the run's own grid, so its labels and points overlay the source whatever pixel size the
+            # reader finds (1 um for a plane run without io.planar, the override with io.voxel_size_um)
+            layers += open_image(src, xy_stride=stride, scale=spacing)
     _singular, plural = object_words(rs.object_kind())
     for suffix, table, id_col, name in (
         ("nuclei_labels.tif", "nuclei", "nucleus_id", plural),      # "<id> cells" when one row is a cell

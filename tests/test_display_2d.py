@@ -237,6 +237,38 @@ def test_reader_scales_a_single_plane(tmp_path, monkeypatch):
     assert [tuple(kw["scale"]) for _, kw, _ in open_image(path)] == [(1.0, 0.11, 0.12)] * 2
 
 
+def test_source_image_overlays_the_run(tmp_path, monkeypatch):
+    # "also open the source image" puts the source on the run's own grid, whatever pixel size the reader
+    # finds: a calibrated plane run without io.planar (tables at 1 um, voxel:UNREADABLE), and a planar run
+    # whose pixel size came from io.voxel_size_um on an uncalibrated plane; the reader's "voxel size
+    # unreadable" warning comes only where the layers sit at its 1 um guess
+    src = write_cyx_image(tmp_path / "cells_001.ome.tif", np.zeros((2, *PLANE), np.uint16), ["DNA", "foci"])
+    data = np.zeros((2, 1, *PLANE), np.uint16)
+    calibrated = plane_stack(data, (1.0, 1.0, 1.0), spacing_ok=False, spacing_yx=(DY, DX))
+    bare = plane_stack(data, (1.0, 1.0, 1.0), spacing_ok=False)
+    cases = (((1.0, 1.0, 1.0), calibrated, 1),       # the run measured at 1 um, so the source sits there too
+             ((float("nan"), DY, DX), bare, 0),       # the override's grid, not the reader's guess
+             ((1.0, 1.0, 1.0), bare, 1))              # an uncalibrated plane at 1 um: as before
+    for i, (run_spacing, stack, n_warned) in enumerate(cases):
+        monkeypatch.setattr(_reader.api, "read_image", lambda p, xy_stride=1, s=stack: s)
+        rs = write_planar_results(tmp_path / f"run{i}")
+        for name in ("image_summary", "nuclei", "spots"):
+            table = rs.file(f"{name}.csv")
+            df = pd.read_csv(table)
+            df["voxel_dz_um"], df["voxel_dy_um"], df["voxel_dx_um"] = run_spacing
+            df["file_path"] = str(src)
+            df.to_csv(table, index=False)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            layers = load_results_layers(rs, include_source=True)
+        assert [kind for *_, kind in layers[:3]] == ["image", "image", "labels"]
+        assert [tuple(kw["scale"]) for _, kw, _ in layers[:3]] == [rs.spacing()] * 3, i
+        infos = [kw["metadata"]["napari_germquant"] for _, kw, _ in layers[:2]]
+        assert [info["spacing_um"] for info in infos] == [rs.spacing()] * 2
+        unreadable = [str(w.message) for w in caught if "voxel size unreadable" in str(w.message)]
+        assert len(unreadable) == n_warned, (i, unreadable)
+
+
 def test_header_line_says_single_plane():
     unreadable = "single plane, voxel size UNREADABLE (1 um assumed)"
     plane = {"sizes": {"T": 1, "C": 2, "Z": 1, "Y": 256, "X": 256}, "spacing": (1.0, 1.0, 1.0),
