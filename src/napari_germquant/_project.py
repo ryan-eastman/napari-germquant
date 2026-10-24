@@ -10,7 +10,8 @@ project file.
 
 * The status board is the engine's status record (``germquant project status --json``, which equals
   api.project_status; PLAN section 9.3): ``board_rows`` turns it into one row per image, with the objects and
-  spots of each finished image counted from its results folder. While a run goes, ``apply_events`` lays the
+  spots of each finished image counted from its results folder (a table is read again only when a run rewrote
+  it). While a run goes, ``apply_events`` lays the
   events of the run's own log over the rows (run_start marks the images it will run as waiting; image_done,
   image_failed and image_skipped land as they come); when the run ends the dock asks for a fresh status record.
 * ``header_text`` is the Images tab's header summary (sizes, the voxel line, the channel names), from the light
@@ -50,7 +51,10 @@ import yaml
 from ._reader import header_spacing_text
 
 MANIFEST_NAME = "germquant_project.yaml"
+LOCK_NAME = "germquant_project.lock"
 SAMPLES_NAME = "samples.csv"
+# the record germquant.timelapse writes next to one t<NNN>/ folder per timepoint (an image with timepoints)
+SERIES_RECORD_SUFFIX = "__series.json"
 # the design columns of a sample sheet (design 7.4), in the order the tab shows them
 DESIGN_COLUMNS = ("image_id", "genotype", "sex", "germ_cell", "treatment", "replicate", "acquisition_date")
 # an extra column's name: what a CSV header and a batch table column can both carry
@@ -296,22 +300,65 @@ def _count_lines(path: Path) -> int | None:
     return max(0, n - 1)                              # the header line
 
 
-def summary_counts(out_dir, image_id: str) -> tuple[int | None, int | None]:
-    """``(objects, spots)`` of a finished image: n_nuclei of its image_summary table and the rows of its spots
-    table, or None for what is not there. Reads files: call it in a worker for a network path."""
-    folder = Path(out_dir)
-    objects = None
+def _summary_objects(path: Path) -> int | None:
+    """n_nuclei of an image_summary table (its one row), or None."""
     try:
-        with open(_long(folder / f"{image_id}__image_summary.csv"), "rb") as fh:
+        with open(_long(path), "rb") as fh:
             text = fh.read().decode("utf-8", errors="replace")
         rows = list(csv.DictReader(io.StringIO(text, newline="")))
         if rows and rows[0].get("n_nuclei") not in (None, ""):
             value = float(rows[0]["n_nuclei"])
-            objects = int(value) if math.isfinite(value) else None
+            return int(value) if math.isfinite(value) else None
     except (OSError, ValueError):
-        objects = None
-    spots = _count_lines(folder / f"{image_id}__spots.csv")
+        pass
+    return None
+
+
+# what summary_counts read, per table file: {normcased path: ((st_mtime_ns, st_size), value)}. A run rewrites the
+# tables of the images it runs, so a refresh reads only those again (a project on the NAS would otherwise read
+# every spots table over the VPN at every refresh). At most _COUNTS_MAX files are kept.
+_COUNTS: dict[str, tuple[tuple[int, int], int | None]] = {}
+_COUNTS_LOCK = threading.Lock()
+_COUNTS_MAX = 4096
+
+
+def _cached_read(path: Path, read) -> int | None:
+    """``read(path)``, or what it gave when the file had this modification time and size; None (nothing read or
+    kept) for a file that is not there."""
+    try:
+        st = os.stat(_long(path))
+    except (OSError, ValueError):
+        return None
+    key, stamp = os.path.normcase(str(path)), (st.st_mtime_ns, st.st_size)
+    with _COUNTS_LOCK:
+        hit = _COUNTS.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    value = read(path)
+    with _COUNTS_LOCK:
+        if len(_COUNTS) >= _COUNTS_MAX:
+            _COUNTS.clear()
+        _COUNTS[key] = (stamp, value)
+    return value
+
+
+def summary_counts(out_dir, image_id: str) -> tuple[int | None, int | None]:
+    """``(objects, spots)`` of a finished image: n_nuclei of its image_summary table and the rows of its spots
+    table (the image summary has no spot total), or None for what is not there. Each table is read again only
+    when its modification time or size changed. Reads files: call it in a worker for a network path."""
+    folder = Path(out_dir)
+    objects = _cached_read(folder / f"{image_id}__image_summary.csv", _summary_objects)
+    spots = _cached_read(folder / f"{image_id}__spots.csv", _count_lines)
     return objects, spots
+
+
+def series_result(out_dir, image_id: str) -> bool:
+    """Whether ``out_dir`` holds the results of an image with timepoints (``<id>__series.json`` next to one
+    t<NNN>/ folder per timepoint) rather than one image's tables. Reads the folder: call it in a worker."""
+    try:
+        return os.path.isfile(_long(Path(out_dir) / f"{image_id}{SERIES_RECORD_SUFFIX}"))
+    except (OSError, ValueError):
+        return False
 
 
 def _qc(value) -> bool | None:
@@ -395,6 +442,16 @@ def counts_text(counts: dict | None) -> str:
            f"{int(c.get('skipped', 0) or 0)} skipped"
 
 
+def collect_text(record) -> str:
+    """The words of ``project collect``'s record (the engine's collect_project: root, results, outlier_factor,
+    images, counts {table: rows}, summary): how many images, the summary table it wrote, the rows per table."""
+    rec = record if isinstance(record, dict) else {}
+    counts = rec.get("counts") if isinstance(rec.get("counts"), dict) else {}
+    rows = ", ".join(f"{table} {n}" for table, n in counts.items() if n)
+    where = rec.get("summary") or rec.get("results") or "results/"
+    return f"collected {rec.get('images', 0)} image(s) into {where}" + (f" (rows: {rows})" if rows else "")
+
+
 def run_text(result: dict) -> tuple[str, str]:
     """``(text, level)`` of a finished project run (the runner's project_run_result): level ok, warn or bad."""
     rid, state = result.get("run_id"), result.get("state")
@@ -433,10 +490,30 @@ def badge(status: dict | None, manifest: dict | None, *, root=None) -> tuple[str
     return "not validated", "warn"
 
 
-def lock_text(lock: dict | None) -> str | None:
-    """What the header says about a held lock (status record ``lock``), or None when the project is not locked."""
+def lock_holder(lock: dict | None) -> tuple[str, int] | None:
+    """``(host, pid)`` of a held lock as the status record gives it, or None: not held, or a lock file the engine
+    cannot read (its lock_report then gives no host or pid), which only a person removes, by hand."""
+    if not isinstance(lock, dict) or not lock.get("held") or lock.get("host") is None:
+        return None
+    try:
+        return str(lock["host"]), int(lock.get("pid"))
+    except (TypeError, ValueError):
+        return None
+
+
+def unreadable_lock_text(root) -> str:
+    """The engine's own advice for a lock file it cannot read (project/lock.py, unlock_hint)."""
+    return (f"the lock file cannot be read (a command may have stopped while it was making it): if no germquant "
+            f"command is writing this project, delete {Path(root) / LOCK_NAME} by hand")
+
+
+def lock_text(lock: dict | None, *, root=None) -> str | None:
+    """What the header says about a held lock (status record ``lock``), or None when the project is not locked.
+    ``root`` names the lock file of a lock the engine cannot read."""
     if not isinstance(lock, dict) or not lock.get("held"):
         return None
+    if lock_holder(lock) is None:
+        return unreadable_lock_text(root if root is not None else ".")
     who = f"{lock.get('host')} (pid {lock.get('pid')}) since {lock.get('since')}"
     if lock.get("stale"):
         return (f"locked by {who}: older than 12 h, so the command that took it has probably stopped. Once that "
