@@ -422,8 +422,7 @@ class RecipeTab(QWidget):
                 self.warnings_label.setText("")
             else:
                 self.header_label.setText(f"Project {v.name} ({v.root}): pack {v.pack}, recipe {v.recipe}")
-                self.hash_label.setText(f"config_hash {v.config_hash} ("
-                                        f"{'edited' if v.edited else 'the pack recipe'})")
+                self.hash_label.setText(f"config_hash {v.config_hash} ({_params.hash_note(v)})")
                 text, level = _params.validated_badge(v.validated)
                 self.badge_label.setText(text)
                 self.badge_label.setStyleSheet(_colour_css(GREEN if level == "ok" else AMBER))

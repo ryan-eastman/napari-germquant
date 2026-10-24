@@ -19,7 +19,15 @@ from conftest import need_features
 from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QSpinBox
 
 from napari_germquant import _settings
-from napari_germquant._params import MISSING, RESET, Tunable, form_change, recipe_edits, validated_badge
+from napari_germquant._params import (
+    MISSING,
+    RESET,
+    Tunable,
+    form_change,
+    hash_note,
+    recipe_edits,
+    validated_badge,
+)
 from napari_germquant._recipe_widget import RecipeTab
 from napari_germquant._runner import EngineRefused, InProcessRunner
 
@@ -198,6 +206,14 @@ def test_reset_returns_to_the_pack_hash(project_env, qtbot):
     assert tab.last_error is None, tab.status_label.text()
     assert recipe_files(root) == {"recipe.yaml": None, "channel_map.yaml": None} and tab.config_hash == PACK_HASH
     assert tab.role_choice("dna") is None and tab.form_rows[MIN_SNR].widget.value() == 2.0
+    assert tab.hash_label.text() == f"config_hash {PACK_HASH} (the pack recipe)"
+
+    # a stage switch off (the Run tab's, `--no-spots`) enters the hash: the line names it (review N7)
+    switched = engine_edit(root, "--no-spots")["config_hash"]
+    tab.reload()
+    _settle(tab, qtbot)
+    assert tab.config_hash == switched != PACK_HASH
+    assert tab.hash_label.text() == f"config_hash {switched} (the pack recipe, with the stage switch spots off)"
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -453,6 +469,19 @@ def test_the_form_rules_follow_the_engines():
         u.check(1)
     assert _t({"key": "k", "type": "float"}, pack=MISSING).pack_text() == "pack value unknown"
     assert _t({"key": "k", "label": "Lbl", "type": "float", "unit": "um3"}).title == "Lbl"
+
+
+def test_the_hash_line_names_the_stage_switches_off(tmp_path):
+    """The hash line says what the config_hash is the hash of: the pack recipe or an edited one, and the stage
+    switches the project turns off, which enter the hash too (review N7)."""
+    v = fake_view(tmp_path)
+    assert hash_note(v) == "the pack recipe"
+    v.overrides = {"spots.enabled": False}
+    assert hash_note(v) == "the pack recipe, with the stage switch spots off"
+    v.edited, v.overrides = True, {"spots.enabled": False, "coloc.enabled": False, "x.y": 3}
+    assert hash_note(v) == "edited, with the stage switches coloc, spots off, with the overrides x.y=3"
+    v.overrides = {}
+    assert hash_note(v) == "edited"
 
 
 def test_recipe_edits_leave_out_the_role_editors_own_map(tmp_path):

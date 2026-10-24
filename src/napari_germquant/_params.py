@@ -230,7 +230,8 @@ class RecipeView:
     """A project's recipe as the tab shows it (``read_view``). ``config_hash`` is the project's hash as this
     environment computes it on open (the engine's dry run confirms it), ``validated`` the manifest's record,
     ``digest`` the sha256 of the manifest and the two recipe files (a preview made for another digest is
-    stale), ``saved`` the manifest's saved stamp (every write changes it)."""
+    stale), ``saved`` the manifest's saved stamp (every write changes it), ``overrides`` the stage switches the
+    project turns off (the manifest's recipe overrides, ``{"spots.enabled": False}``: they enter the hash)."""
 
     root: Path
     name: str
@@ -251,6 +252,7 @@ class RecipeView:
     warnings: list
     digest: str
     saved: dict | None = None
+    overrides: dict = dataclasses.field(default_factory=dict)
 
     def role(self, name: str) -> Role:
         for r in self.roles:
@@ -436,7 +438,8 @@ def read_view(root, *, reference: str | None = None) -> RecipeView:
                       tunables=tunables, others=others, roles=roles, match_by=match_by, images=images,
                       reference=chosen["id"] if chosen else None, channels=channels, channels_error=channels_error,
                       warnings=warnings, digest=digest,
-                      saved=dict(m["saved"]) if isinstance(m.get("saved"), dict) else None)
+                      saved=dict(m["saved"]) if isinstance(m.get("saved"), dict) else None,
+                      overrides=dict((m.get("recipe") or {}).get("overrides") or {}))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -524,6 +527,22 @@ def cell_text(binding: dict | None) -> str:
     if b.get("channel") is None:
         return "(none)"
     return f"{b['channel']} ({HOW_TEXT.get(str(b.get('how')), b.get('how'))})"
+
+
+def hash_note(view: RecipeView) -> str:
+    """What the project's config_hash is the hash of, for the hash line: the edited recipe (recipe.yaml) or the
+    pack recipe, and the stage switches the project turns off (Run tab, ``--no-<stage>``), which enter the hash
+    too; any other override is named with its value."""
+    over = dict(view.overrides or {})
+    switch = {k: v for k, v in over.items() if str(k).endswith(".enabled") and v is False}
+    off = sorted(str(k)[:-len(".enabled")] for k in switch)
+    other = sorted(f"{k}={value_text(v)}" for k, v in over.items() if k not in switch)
+    parts = ["edited" if view.edited else "the pack recipe"]
+    if off:
+        parts.append(f"with the stage switch{'es' if len(off) > 1 else ''} {', '.join(off)} off")
+    if other:
+        parts.append("with the overrides " + ", ".join(other))
+    return ", ".join(parts)
 
 
 def validated_badge(validated: dict | None) -> tuple[str, str]:
