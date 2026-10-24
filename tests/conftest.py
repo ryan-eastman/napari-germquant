@@ -12,7 +12,15 @@ Cellpose cache, a private per-user folder and a private examples folder. A subpr
 it, so both runners see the same packs and stores.
 
 The Run dock checks engines, lists packs and checks recipes in a thread worker, never in the GUI thread:
-``settle(w, qtbot)`` waits until those calls are done before a test reads what they set."""
+``settle(w, qtbot)`` waits until those calls are done before a test reads what they set.
+
+The tranche-5 Train B features (projects, the sample sheet, imported labels, learning curves, derived packs,
+spot tuning, post-stages, single planes, labels from files) come from the engine the suite runs against. A test
+that needs one calls ``need_features(...)``: it skips, naming the feature, when the engine lacks it, and fails
+instead when $NAPARI_GERMQUANT_REQUIRE_FEATURES lists that feature (the final CI runs set it). ``project_env``
+gives a short project folder, ``seams_runner`` an engine child whose Cellpose training seams are stand-ins, and
+``served_model_pack`` a test pack copy whose basic recipe needs a served model and declares
+spots.spot_radius_um."""
 from __future__ import annotations
 
 import os
@@ -331,3 +339,125 @@ def classical_overlay(tmp_path_factory, engine_root) -> Path:
     p = tmp_path_factory.mktemp("recipe") / "rad51_classical.yaml"
     p.write_text(f"extends: {base}\nsegmentation:\n  nuclei:\n    method: classical\n", encoding="utf-8")
     return p
+
+
+# ---------------------------------------------------------------------------------------------------
+# the tranche-5 Train B features: skip, or fail when required (NAPARI_GERMQUANT_REQUIRE_FEATURES)
+# ---------------------------------------------------------------------------------------------------
+
+REQUIRE_FEATURES_ENV = "NAPARI_GERMQUANT_REQUIRE_FEATURES"
+
+
+def required_features() -> frozenset[str]:
+    """The features $NAPARI_GERMQUANT_REQUIRE_FEATURES names (separated by commas or spaces). A test that needs
+    one of them fails instead of skipping when the engine lacks it. An unknown name fails at once: a typo would
+    otherwise require nothing."""
+    raw = os.environ.get(REQUIRE_FEATURES_ENV, "")
+    names = frozenset(n for n in re.split(r"[\s,;]+", raw) if n)
+    unknown = sorted(names - set(_engine.FEATURES))
+    if unknown:
+        pytest.fail(f"{REQUIRE_FEATURES_ENV} names unknown features {unknown}; the engine features are "
+                    f"{list(_engine.FEATURES)}", pytrace=False)
+    return names
+
+
+def engine_features() -> frozenset[str]:
+    """The features of the engine this suite runs: the germquant of this environment, which the subprocess
+    tests also start as their engine interpreter (its version document's list, the project API names checked
+    in process; _runner.InProcessRunner.features)."""
+    from napari_germquant._runner import InProcessRunner
+
+    return InProcessRunner().features()
+
+
+def need_features(*names: str, have=None) -> None:
+    """The one feature gate of the tests: return when the engine has every feature in ``names``; otherwise skip
+    the calling test, naming each missing feature, or fail when $NAPARI_GERMQUANT_REQUIRE_FEATURES lists one of
+    them. ``have`` replaces the engine's own list (the gate's own test)."""
+    unknown = [n for n in names if n not in _engine.FEATURES]
+    if unknown:
+        raise ValueError(f"not engine features: {unknown}; the engine features are {list(_engine.FEATURES)}")
+    have = engine_features() if have is None else frozenset(have)
+    missing = [n for n in names if n not in have]
+    if not missing:
+        return
+    from germquant import api
+
+    text = (f"the engine lacks the feature{'s' if len(missing) > 1 else ''} {', '.join(missing)} (germquant "
+            f"{api.__version__} at {Path(api.__file__).parent})")
+    required = sorted(set(missing) & required_features())
+    if required:
+        pytest.fail(f"{text}; {REQUIRE_FEATURES_ENV} requires {', '.join(required)}", pytrace=False)
+    pytest.skip(text)
+
+
+# ---------------------------------------------------------------------------------------------------
+# projects, the seams runner and the served model pack
+# ---------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def project_env(pack_env):
+    """pack_env plus a short folder for projects, <$RUNNER_TEMP or the system temporary folder>/gqp<random>,
+    removed afterwards. A project nests results/<image id>/, runs/ and training/<round>/models/<name>/ below
+    its root, which under a long pytest base folder would pass the 260-character path limit of a Windows
+    without long paths. ``new_dir()`` names a fresh project folder there (not created: ``project new`` makes
+    it); ``image`` is a copy of the test pack's synthetic example in ``images``."""
+    import itertools
+
+    root = Path(tempfile.mkdtemp(prefix="gqp", dir=os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()))
+    images = root / "images"
+    images.mkdir()
+    image = images / TEST_IMAGE.name
+    shutil.copyfile(TEST_IMAGE, image)
+    counter = itertools.count(1)
+
+    def new_dir(name: str | None = None) -> Path:
+        return root / (name or f"p{next(counter)}")
+
+    try:
+        yield SimpleNamespace(root=root, images=images, image=image, new_dir=new_dir, pack=pack_env,
+                              models=pack_env.models, blobs=pack_env.blobs)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture
+def seams_runner():
+    """A subprocess runner (this interpreter) whose ``python -m germquant`` commands start through the seams
+    wrapper of tests/_p6_runner.py: in the engine child the Cellpose training seams (_build_net, _train_seg,
+    _predict) are the stand-ins of tests/_p6_runner_seams.py, then germquant.cli.main runs the command. The
+    torch-free entries run as they are. Other seams (tune-spots' SpotMAX seam, I8): make a runner with
+    ``_p6_runner.make_seams_runner(seams={"module.attr": "module:attr"})``."""
+    from _p6_runner import make_seams_runner
+
+    return make_seams_runner()
+
+
+@pytest.fixture
+def served_model_pack(pack_env, tmp_path, monkeypatch):
+    """A copy of the test pack, ``served_model_pack@0.1.0``, the only pack listed ($GERMQUANT_PACKS). Its basic
+    recipe also needs tinynet@f5055f8a, the 64-byte stand-in, which a 127.0.0.1 server holds next to its cache
+    source, so Get models is real: the card shows the model missing and Run off, then fetching makes basic
+    usable. basic also declares spots.spot_radius_um as a tunable (pack_base.yaml sets it, 0.3), the
+    parameter the codeless acceptance edits (D38). basic still runs classically and keeps its config hash:
+    pack.yaml is not hashed, and copy_pack rebuilds SHA256SUMS."""
+    from germquant import packs
+
+    with serve({"models/tinynet": TINYNET_BYTES}) as (base, handler):
+        def edit(d):
+            d["id"] = "served_model_pack"
+            d["models"][0]["sources"] = [*d["models"][0]["sources"], {"type": "url", "url": base + "models/tinynet"}]
+            basic = next(r for r in d["recipes"] if r["id"] == "basic")
+            basic["needs"]["models"] = [TINYNET]
+            basic["tunables"] = [*basic["tunables"], {"key": "spots.spot_radius_um", "label": "Spot radius",
+                                                      "type": "float", "unit": "um", "min": 0.05, "max": 2.0}]
+
+        root = tmp_path / "served_model_packs"
+        copy_pack(TEST_PACK, root / "served_model_pack", edit=edit)
+        monkeypatch.setenv("GERMQUANT_PACKS", str(root))
+        packs.refresh()
+        yield SimpleNamespace(ref="served_model_pack@0.1.0", id="served_model_pack", recipe="basic",
+                              tunable="spots.spot_radius_um", base=base, log=handler.log, root=root,
+                              folder=root / "served_model_pack", env=pack_env)
+    packs.refresh()
