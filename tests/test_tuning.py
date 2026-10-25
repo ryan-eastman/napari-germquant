@@ -115,6 +115,9 @@ def test_points_saved_tuned_top_five_and_applied(make_napari_viewer, qtbot, proj
     best = yaml.safe_load((run / "best.yaml").read_text(encoding="ascii"))
     assert best["backend"] == "log" and list(best["keys"]) == ["spots.log.min_snr"]
     value = best["keys"]["spots.log.min_snr"]
+    # every default min_snr finds the same ten spots on this example, so the grid's first value ranks first:
+    # not the recipe's own 2.0, so Apply is an edit (a value equal to the recipe's is none: docs/TUNING.md)
+    assert value != 2.0
     assert f"spots.log.min_snr = {value}" in w.best_label.text()
     # Apply, through the engine, with the plugin version
     assert w.apply()
@@ -128,8 +131,7 @@ def test_points_saved_tuned_top_five_and_applied(make_napari_viewer, qtbot, proj
     m = read_manifest(P)
     assert m["recipe"]["origins"] == {"spots.log.min_snr": "tuning"}
     new_hash = m["recipe"]["expected_config_hash"]
-    if value != 2.0:                                  # the recipe's own value is no edit (docs/TUNING.md)
-        assert new_hash != BASE_HASH
+    assert new_hash != BASE_HASH
     assert new_hash in w.last_message and "validated: false" in w.last_message
     assert hub.reloads == 1
     status = InProcessRunner().project_status(P)      # what the Project dock's board shows

@@ -112,9 +112,12 @@ def test_the_dock_lists_the_projects_images_with_their_runs_and_points(qtbot, tp
 
 def test_opening_an_image_puts_the_source_results_and_a_truth_layer_on_the_runs_grid(make_napari_viewer, qtbot,
                                                                                      tproj, fake):
+    """Through napari's public proxy of the viewer, what a dock opened from the Plugins menu gets."""
+    from napari.utils._proxies import PublicOnlyProxy
+
     standard_project(tproj, stride=2, z_range=(1, 5))
     viewer = make_napari_viewer()
-    w = _dock(qtbot, viewer, runner=fake)
+    w = _dock(qtbot, PublicOnlyProxy(viewer), runner=fake)
     w.set_annotator("other")                         # no truth points of "other" yet
     _opened(qtbot, w, tproj)
     assert w.select_image("img_a") and w.open_image()
