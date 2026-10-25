@@ -60,7 +60,7 @@ from qtpy.QtWidgets import (
 
 from . import _settings, _tuning
 from ._engine_session import NOT_CHOSEN, EngineNotChosen, EngineSession, session_for
-from ._qt_common import add_layer_tuples, set_viewer_status
+from ._qt_common import WorkerRunner, add_layer_tuples, set_viewer_status
 from ._runner import FeatureMissing, RunCancelled, RunnerError, detect_interpreters, plugin_version
 
 RED = QColor(200, 60, 60)
@@ -138,8 +138,6 @@ class SpotTuningWidget(QWidget):
         self._io_jobs: list[dict] = []
         self._lines = _Lines(self)
         self._lines.line.connect(self._on_line)
-        from ._qt_common import WorkerRunner
-
         self.engine_worker = WorkerRunner(napari_viewer, self)     # tune-spots, its apply, the engine check
         self.io_worker = WorkerRunner(None, self)                  # the project's files, the image's layers, Save
         self._build()
@@ -581,6 +579,8 @@ class SpotTuningWidget(QWidget):
             first = next((i for i, r in enumerate(self.rows) if r.finished and r.usable), 0)
             self.image_list.setCurrentRow(first)
         self.image_list.blockSignals(False)
+        now = self._row()
+        moved = (now.image_id if now is not None else None) != keep
         self.runs_combo.blockSignals(True)
         self.runs_combo.clear()
         for run in self.runs:
@@ -590,7 +590,7 @@ class SpotTuningWidget(QWidget):
         self.runs_combo.blockSignals(False)
         self._show_grid()
         self._show_run()
-        self._show_points()
+        self._show_points(sync_box=moved)
         self._show_notice()
 
     def _show_notice(self) -> None:

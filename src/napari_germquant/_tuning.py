@@ -29,6 +29,7 @@ from __future__ import annotations
 from . import _engine  # noqa: F401,I001  (import order: germquant.api before anything else)
 
 import csv
+import functools
 import importlib
 import io
 import json
@@ -64,9 +65,11 @@ class TuningError(RuntimeError):
     """What the dock cannot do, with the reason and the fix (shown as it is)."""
 
 
+@functools.lru_cache(maxsize=None)
 def tune_module(name: str):
     """``germquant.tune.<name>`` of this napari environment's germquant, or None when it has no germquant.tune
-    (an engine from before tranche 5 Train B)."""
+    (an engine from before tranche 5 Train B). Kept once looked up: the buttons ask at every refresh, and Python
+    keeps no record of an import that failed."""
     try:
         return importlib.import_module(f"germquant.tune.{name}")
     except ImportError:
@@ -340,12 +343,14 @@ def run_info(root, row: ImageRow) -> RunInfo:
                    config=rs.run_config(), config_hash=rs.config_hash())
 
 
-def read_labels(info: RunInfo) -> np.ndarray:
-    """The run's label image, (Z, Y, X) on the run's grid (a single plane's YX image gains its axis)."""
+def labels_shape(info: RunInfo) -> tuple[int, int, int]:
+    """The (Z, Y, X) shape of the run's label image, from its header (no pixels read; a single plane's YX image
+    is one plane)."""
     import tifffile
 
-    arr = np.asarray(tifffile.imread(_long(info.result_dir / f"{info.image_id}__nuclei_labels.tif")))
-    return arr[None] if arr.ndim == 2 else arr
+    with tifffile.TiffFile(_long(info.result_dir / f"{info.image_id}__nuclei_labels.tif")) as tf:
+        shape = tuple(int(s) for s in tf.series[0].shape)
+    return (1, *shape) if len(shape) == 2 else shape   # type: ignore[return-value]
 
 
 def source_layers(info: RunInfo) -> list:
@@ -390,7 +395,7 @@ def read_truth(info: RunInfo, annotator: str) -> tuple[np.ndarray, bool, str]:
         return empty, False, f"{path.name} is there, but {points_problem()}"
     try:
         table = pts.read_points(path)
-        frame = pts.to_run_frame(table, shape=read_labels(info).shape, spacing=info.table_spacing,
+        frame = pts.to_run_frame(table, shape=labels_shape(info), spacing=info.table_spacing,
                                  xy_stride=info.xy_stride, z_range=info.z_range)
     except (ValueError, OSError) as e:
         return empty, False, f"{path.name} cannot be read ({e}); fix or remove it before saving over it"
