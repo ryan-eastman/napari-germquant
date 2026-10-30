@@ -347,6 +347,12 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
     assert r.import_labels("seg.npz", "cellacdc-npz", "img.tif", "pairs", channel=1) == {"pairs": 2}
     assert calls[-1] == ("import_labels", ("seg.npz", "cellacdc-npz", "img.tif", "pairs"),
                          {"allow_pickle": False, "channel": 1})
+    # the text the command line reads as an index is an index here too (the dock sends "1" for a channel whose
+    # name is not unique); any other text is a channel name
+    r.import_labels("seg.npz", "cellacdc-npz", "img.tif", "pairs", channel=" 1 ")
+    assert calls[-1][2] == {"allow_pickle": False, "channel": 1}
+    r.import_labels("seg.npz", "cellacdc-npz", "img.tif", "pairs", channel="Cy3 RAD-51")
+    assert calls[-1][2] == {"allow_pickle": False, "channel": "Cy3 RAD-51"}
     assert r.tune_spots(P, grid="g.yaml")["run_dir"] == "tuning/t1"
     assert calls[-1][2] == {"points": "annotations", "grid": "g.yaml", "out": None, "max_runs": 50}
     assert r.tune_apply(P, "tuning/t1")["config_hash"] == "fedcba987654"

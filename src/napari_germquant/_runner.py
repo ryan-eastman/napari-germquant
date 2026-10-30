@@ -773,7 +773,8 @@ class EngineRunner:
     def import_labels(self, src, fmt: str, image, pairs, *, allow_pickle: bool = False, frame: int | None = None,
                       channel=None, should_stop=None) -> dict:
         """``import-labels``: the engine's record (plan 9.4 #11). ``channel``: the image channel the labels were
-        drawn on, an index or a name (``--channel``), passed only when set."""
+        drawn on, an index or a name (``--channel``; text of digits only is an index, as the command reads it),
+        passed only when set."""
         raise NotImplementedError
 
     def export_training(self, results, out, *, orientations=None, slices_per_image: int | None = None,
@@ -1216,6 +1217,10 @@ class InProcessRunner(EngineRunner):
         if frame is not None:
             kw["frame"] = int(frame)
         if channel is not None:
+            # as the command reads `--channel C`: text of digits only is an index, any other text a channel name
+            # (the Training dock sends the index as text for a channel whose name is not unique)
+            if isinstance(channel, str) and re.fullmatch(r"[0-9]+", channel.strip()):
+                channel = int(channel.strip())
             kw["channel"] = channel
         return _jsonable(self._api_call(self._api("import_labels"), src, fmt, image, pairs, **kw))
 
