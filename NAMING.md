@@ -10,7 +10,7 @@ plugin name with a hyphen (`napari-germquant`) and the Python import name with a
 |---|---|
 | `pyproject.toml` | `name = "napari-germquant"` under `[project]` (THE name) |
 | `pyproject.toml` | the key of the `[project.entry-points."napari.manifest"]` entry |
-| `src/napari_germquant/napari.yaml` | `name:` and the prefix of every command `id:` (npe2 requires the prefix to equal `name`) |
+| `src/napari_germquant/napari.yaml` | `name:` and the prefix of every command `id:` (npe2 requires the prefix to equal `name`), the docks' `napari-germquant.project_widget` (Project) and `napari-germquant.tuning_widget` (Spot tuning) among them |
 | `src/napari_germquant/__init__.py` | `metadata.version("napari-germquant")` |
 | `tests/test_manifest.py`, `tests/test_reader.py`, `tests/test_training.py`, `tests/test_timelapse.py` | the plugin name passed to `viewer.open(..., plugin=...)`, `get_manifest(...)` and `viewer.window.add_plugin_dock_widget(...)` |
 | `src/napari_germquant/_engine.py`, `_reader.py`, `_training.py` | text in the exported YAML and commands headers, in user-facing messages and in the note of the `corrections.json` a training folder gets |
@@ -32,6 +32,7 @@ The manifest's `display_name: germquant` is what the napari menus show; it can s
 | `src/napari_germquant/_results.py` | the `napari_germquant_results` metadata key on every layer the results loader adds |
 | `src/napari_germquant/_training_widget.py` | `META_KEY = "napari_germquant_training"`: the metadata key on the two layers the Training dock shows |
 | `src/napari_germquant/_timelapse.py` | `META_KEY = "napari_germquant_timelapse"`: the metadata key on every layer the Time-lapse dock adds |
+| `src/napari_germquant/_tuning.py` | `LAYER_KEY = "napari_germquant_tuning"`: the metadata key on the truth-point layers the Spot tuning dock adds |
 | `src/napari_germquant/_runner.py`, `_qt_common.py` | the logger `napari_germquant.engine` that carries an engine subprocess's lines to the status bar |
 | `src/napari_germquant/_settings.py`, `tests/conftest.py` | the environment variable `NAPARI_GERMQUANT_SETTINGS` (a private settings file) |
 | `tests/*.py` | `from napari_germquant import ...` |
