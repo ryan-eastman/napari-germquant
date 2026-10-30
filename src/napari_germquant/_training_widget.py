@@ -17,8 +17,12 @@ Where it computes (tranche 5 Train B, decision D36; plugin_specs.md 4.4, "Route"
 of the viewer's engine session (shared with the Project and Spot tuning docks). When an engine is chosen for this
 computer, export, import and training go through that engine's runner (``python -m germquant export-training``,
 ``import-labels``, ``train-nuclei`` in its own environment, with the devices it offers, the epoch lines on the
-status bar and Cancel). With none chosen the dock keeps computing in this napari environment and says so in amber;
-it never switches silently. Correcting pairs and registering stay in napari's process either way.
+status bar and Cancel). In a project whose recipe has its own interpreter on this computer (stored as in the Run
+dock) those three steps run in that interpreter instead: the device list, the geometry line and the channel list
+are still read off the engine chosen for this computer, the export asks the interpreter that runs it whether it
+takes ``--orientations auto`` (an older one gets the ticked slices, and the dock says so), and Cancel follows that
+interpreter. With none chosen the dock keeps computing in this napari environment and says so in amber; it never
+switches silently. Correcting pairs and registering stay in napari's process either way.
 
 The project mode (design 8.6 and 10). With a project open (the one the Project dock has open, followed through
 its hub, or one opened here) the folders default to the project: the source is ``<project>/results/``, the
@@ -662,13 +666,14 @@ class TrainingWidget(QWidget):
         return runner
 
     def _auto_supported(self) -> bool:
-        """Whether the export that would run follows each run's geometry (``--orientations auto``)."""
+        """Whether the export that would run follows each run's geometry (``--orientations auto``), as the engine
+        chosen for this computer says; the export asks the interpreter that runs it again (a recipe's own)."""
         if self._engine_chosen():
             runner = self._ui_runner()
             if runner is None:
                 return False
             try:
-                return "train_curve" in runner.features()
+                return T.PROJ_EXPORT_FEATURE in runner.features()
             except Exception:  # noqa: BLE001 - an engine that cannot say gets the plain list
                 return False
         return T.export_auto_supported()
@@ -1188,23 +1193,28 @@ class TrainingWidget(QWidget):
         engine = self._engine_chosen()
         where = "through the engine" if engine else "in this napari environment"
         self._status(f"exporting slices from {source} into {pairs_dir} {where} ...\n{settings.command(source, pairs_dir)}")
+        recipe = self._recipe()
         if engine:
-            recipe, worker = self._recipe(), self.runner
+            worker = self.runner
+            ticked = tuple(o for o, cb in self.orient_checks.items() if cb.isChecked())
 
             def job():
                 runner = self._job_runner(engine=True, recipe=recipe, should_stop=worker.should_stop)
-                runner.export_training(str(source), str(pairs_dir), orientations=settings.orientations,
-                                       slices_per_image=settings.slices_per_image, seed=settings.seed,
-                                       zone_column=settings.zone_column, min_labels=settings.min_labels,
-                                       max_gb=settings.max_gb, say=_say, should_stop=worker.should_stop)
-                return T.read_manifest_csv(pairs_dir)
+                # the interpreter that runs it decides "auto": a recipe's own may be older than the engine shown
+                used = T.engine_export_settings(settings, ticked, auto_supported=T.PROJ_EXPORT_FEATURE in
+                                                runner.features(should_stop=worker.should_stop))
+                runner.export_training(str(source), str(pairs_dir), orientations=used.orientations,
+                                       slices_per_image=used.slices_per_image, seed=used.seed,
+                                       zone_column=used.zone_column, min_labels=used.min_labels,
+                                       max_gb=used.max_gb, say=_say, should_stop=worker.should_stop)
+                return T.read_manifest_csv(pairs_dir), used
         else:
             def job():
-                return T.export_slices(source, pairs_dir, settings)
+                return T.export_slices(source, pairs_dir, settings), settings
         self._start_step("export", job, label=f"exporting training slices from {source.name}",
-                         returned=lambda manifest: self._on_exported(manifest, pairs_dir, source, settings,
-                                                                     started_root),
-                         what="export", engine=engine)
+                         returned=lambda got: self._on_exported(got[0], pairs_dir, source, settings, started_root,
+                                                                used=got[1]),
+                         what="export", engine=engine, recipe=recipe)
         return True
 
     def _recipe(self) -> tuple | None:
@@ -1218,16 +1228,22 @@ class TrainingWidget(QWidget):
         return self.project is None or _same(self.project.root, started_root)
 
     def _on_exported(self, manifest, pairs_dir: Path, source: Path, settings: T.ExportSettings,
-                     started_root=None) -> None:
+                     started_root=None, used: T.ExportSettings | None = None) -> None:
+        """``used``: the settings the engine that ran the export got (the ticked slices instead of auto for an
+        interpreter from before the proj export)."""
         self.last_manifest = manifest
+        used = settings if used is None else used
+        note = ("" if used == settings else
+                f"\nThe interpreter that ran it predates the proj export (no --orientations auto): it got "
+                f"--orientations {used.orientations_text()} and exported every run as those slices.")
         if not self._in_view(started_root):
-            self._status(f"{T.export_summary(manifest, pairs_dir)}\nAnother project was opened meanwhile: open "
+            self._status(f"{T.export_summary(manifest, pairs_dir)}{note}\nAnother project was opened meanwhile: open "
                          f"{pairs_dir} to see these pairs.", AMBER)
             return
         if self.is_dirty():
             # edits made while the export ran are never thrown away: the new pairs open on request
-            self._status(f"{T.export_summary(manifest, pairs_dir)}\nThe slice shown has unsaved edits: save or revert "
-                         f"them, then press Open training folder.", AMBER)
+            self._status(f"{T.export_summary(manifest, pairs_dir)}{note}\nThe slice shown has unsaved edits: save or "
+                         f"revert them, then press Open training folder.", AMBER)
             return
         try:
             self.set_pairs_dir(pairs_dir)
@@ -1235,8 +1251,8 @@ class TrainingWidget(QWidget):
         except Exception as e:  # noqa: BLE001 - the export itself succeeded
             self._status(f"{T.export_summary(manifest, pairs_dir)}\nbut the pairs could not be opened: {e}", AMBER)
             return
-        self._status(f"{T.export_summary(manifest, pairs_dir)}\n{n} pair(s) in the folder; correct them below.\n"
-                     f"same as: {settings.command(source, pairs_dir)}", GREEN)
+        self._status(f"{T.export_summary(manifest, pairs_dir)}\n{n} pair(s) in the folder; correct them below.{note}\n"
+                     f"same as: {used.command(source, pairs_dir)}", AMBER if note else GREEN)
         set_viewer_status(self.viewer, f"exported {len(manifest)} slice pair(s) to {pairs_dir}")
 
     # ------------------------------------------------------------------ import labels made elsewhere
@@ -1381,18 +1397,20 @@ class TrainingWidget(QWidget):
         if channel is not None:
             kw["channel"] = channel
         cmd = T.import_command(src, fmt, image, pairs, allow_pickle=allow, frame=frame, channel=channel)
-        engine, worker, started_root = self._engine_chosen(), self.runner, self.root
+        engine, worker, started_root, recipe = self._engine_chosen(), self.runner, self.root, self._recipe()
         self.last_import = None
         self.last_error = None
         self._status(f"importing {Path(src).name} for {Path(image).name} into {pairs} ...\n{cmd}")
 
         def job():
-            runner = self._job_runner("import_labels", engine=engine, should_stop=worker.should_stop)
+            # in a project, the recipe's own interpreter on this computer when one is stored, as export and train
+            runner = self._job_runner("import_labels", engine=engine, recipe=recipe if engine else None,
+                                      should_stop=worker.should_stop)
             return runner.import_labels(src, fmt, image, pairs, should_stop=worker.should_stop, **kw)
 
         self._start_step("import", job, label=f"importing labels for {Path(image).name}",
                          returned=lambda rec: self._on_imported(rec, Path(pairs), cmd, started_root), what="import",
-                         engine=engine)
+                         engine=engine, recipe=recipe)
         return True
 
     def _on_imported(self, rec: dict, pairs_dir: Path, cmd: str, started_root=None) -> None:
@@ -1669,8 +1687,9 @@ class TrainingWidget(QWidget):
         where = "through the engine" if engine else "in this napari environment"
         self._status(f"training {settings.model_name()} on {settings.device} {where} ...\n{notes}\n"
                      f"{settings.command(pairs_dir)}")
+        recipe = self._recipe()
         if engine:
-            recipe, worker = self._recipe(), self.runner
+            worker = self.runner
 
             def job():
                 runner = self._job_runner(engine=True, recipe=recipe, should_stop=worker.should_stop)
@@ -1693,7 +1712,7 @@ class TrainingWidget(QWidget):
 
             returned = lambda res: self._on_trained(res, settings, pairs_dir, notes)  # noqa: E731
         self._start_step("train", job, label=f"training {settings.model_name()} ({settings.device})", returned=returned,
-                         what="training", engine=engine,
+                         what="training", engine=engine, recipe=recipe,
                          line_format=lambda line: T.epoch_progress(line, epochs) or line[:160])
         return True
 
@@ -1896,17 +1915,28 @@ class TrainingWidget(QWidget):
         self._status("\n".join(lines), GREEN if entry is not None else AMBER)
 
     # ------------------------------------------------------------------ worker plumbing
-    def _start_step(self, kind: str, job, *, label: str, returned, what: str, engine: bool, line_format=None) -> None:
-        """One step in the dock's worker. ``engine``: an engine process runs it, so Cancel can end it."""
-        runner = self._ui_runner() if engine else None
-        if engine and runner is None:                 # being checked: a stored interpreter runs in its own process
-            self._job_cancellable = _settings.engine_choice() not in (None, _settings.INPROCESS)
-        else:
-            self._job_cancellable = bool(engine and getattr(runner, "cancellable", False))
+    def _start_step(self, kind: str, job, *, label: str, returned, what: str, engine: bool, recipe: tuple | None = None,
+                    line_format=None) -> None:
+        """One step in the dock's worker. ``engine``: an engine runs it, so Cancel can end it when that engine is a
+        process of its own; ``recipe`` (pack id, recipe id): the recipe whose own interpreter runs it, when one is
+        stored on this computer."""
+        self._job_cancellable = engine and self._step_cancellable(recipe)
         self._busy_kind = kind
         self._update_buttons()
         self.runner.start(job, label=label, returned=returned, errored=lambda e: self._on_errored(e, what),
                           finished=self._on_finished, line_format=line_format)
+
+    def _step_cancellable(self, recipe: tuple | None) -> bool:
+        """Whether the engine a step goes to runs in a process of its own (Cancel ends it): the recipe's own
+        interpreter when one is stored, else the checked engine; while the engine is being checked, the stored choice
+        (an interpreter runs in its own process, napari's own process cannot be stopped)."""
+        mapped = _settings.recipe_interpreter(*recipe) if recipe is not None else None
+        if mapped:
+            return mapped != _settings.INPROCESS
+        runner = self._ui_runner()
+        if runner is None:
+            return _settings.engine_choice() not in (None, _settings.INPROCESS)
+        return bool(getattr(runner, "cancellable", False))
 
     def cancel(self) -> bool:
         """End the engine's export, import or training (Cancel). False when none runs, or it cannot be stopped."""

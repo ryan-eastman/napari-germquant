@@ -279,6 +279,20 @@ def export_orientations(ticked, geoms: list[RunGeometry] | None, *, auto_support
     return ticked
 
 
+# the engines whose export-training takes --orientations auto and writes proj pairs (they came with train-curve)
+PROJ_EXPORT_FEATURE = "train_curve"
+
+
+def engine_export_settings(settings: ExportSettings, ticked, *, auto_supported: bool) -> ExportSettings:
+    """The export settings the engine that runs the export gets: ``settings`` as they are, except that an engine
+    without the proj export (``auto_supported`` False, which would refuse ``"auto"``) gets the ticked slices, every
+    one when none is ticked (the boxes are off when no run is 3D): it slices every run in those orientations."""
+    if settings.orientations != AUTO or auto_supported:
+        return settings
+    chosen = set(ticked)
+    return dataclasses.replace(settings, orientations=tuple(o for o in ORIENTATIONS if o in chosen) or ORIENTATIONS)
+
+
 # ---------------------------------------------------------------------------------------------------
 # the project the dock works in
 # ---------------------------------------------------------------------------------------------------
@@ -832,7 +846,7 @@ def train_summary(res: dict, asked_device: str | None = None) -> str:
 _SUMMARY_START = re.compile(r"^\S.*: trained on \d+ slice\(s\) from ")
 
 # the engines whose train-nuclei takes the model card fields: --system, --kind and --dataset came with train-curve
-CARD_FIELDS_FEATURE = "train_curve"
+CARD_FIELDS_FEATURE = PROJ_EXPORT_FEATURE
 
 
 def card_fields_missing(fields: dict, *, interpreter: str | None = None, info: dict | None = None) -> str:

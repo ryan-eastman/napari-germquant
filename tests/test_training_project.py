@@ -868,3 +868,66 @@ def test_card_fields_go_only_to_an_engine_that_takes_them(make_napari_viewer, qt
     _settle(qtbot, w)
     kw = old.last("train_nuclei")[1]
     assert kw["kind"] is None and kw["system"] is None and kw["dataset"] is None and w.last_train is not None
+
+
+class _RecipeSession(StaticSession):
+    """An engine session whose project recipe has its own interpreter on this computer (``recipe``), next to the
+    engine chosen for this computer (``runner``)."""
+
+    def __init__(self, runner, recipe, **kw) -> None:
+        super().__init__(runner, **kw)
+        self.recipe_runner = recipe
+
+    def runner_for(self, pack_id=None, recipe_id=None, should_stop=None):
+        return self.recipe_runner if pack_id and recipe_id else self._runner
+
+
+def test_the_recipes_own_interpreter_decides_its_steps(qtbot, tmp_path):
+    """N7: export, import and training of a project go to its recipe's own interpreter when one is stored. One from
+    before the proj export gets the ticked slices instead of auto (which it would refuse), and the import goes there
+    too, as the dock says."""
+    root = write_project(tmp_path / "study", images=[("img", "images/img.ome.tif")], rounds=("r01",))
+    write_run(root / "results" / "a", "a", kind="3d")
+    write_run(root / "results" / "b", "b", kind="projected")
+    main, old = FakeTrainRunner(), FakeTrainRunner(features={"packs", "projects", "import_labels"})
+    w = TrainingWidget(None, session=_RecipeSession(main, old), hub=FakeHub())
+    w.set_project(root)
+    _settle(qtbot, w)
+    assert "proj" in w.geometry_label.text()              # the engine chosen for this computer has the proj export
+    assert w.export()
+    _settle(qtbot, w)
+    assert not main.called("export_training")
+    assert old.last("export_training")[1]["orientations"] == ("xy", "xz", "yz")
+    text = w.status_label.text()
+    assert "predates the proj export" in text and "--orientations xy,xz,yz" in text and AMBER in w.status_label.styleSheet()
+    w.set_labels_file(tmp_path / "img_segm.npz")
+    assert w.import_labels()
+    _settle(qtbot, w)
+    assert old.called("import_labels") and not main.called("import_labels")
+
+
+def test_cancel_follows_the_interpreter_that_runs_the_step(qtbot, tmp_path):
+    """N7 and S1: Cancel is on for a step that runs in a process of its own, whatever the engine chosen for this
+    computer is: the project recipe's own interpreter (a Python path) can be ended, napari's own process cannot."""
+    from napari_germquant import _settings
+
+    root = write_project(tmp_path / "study", rounds=("r01",))
+    write_pairs(root / "training" / "r01", "img_a", 2)
+    runner = FakeTrainRunner()
+    runner.cancellable = False                              # the engine chosen here: napari's own process
+    runner.gates["train_nuclei"] = threading.Event()
+    runner.entered["train_nuclei"] = threading.Event()
+    w = TrainingWidget(None, session=StaticSession(runner), hub=FakeHub())
+    w.set_project(root)
+    _settle(qtbot, w)
+    seen = []
+    for mapped in ("C:/lab/packs/.venv/Scripts/python.exe", _settings.INPROCESS):
+        _settings.set_recipe_interpreter("test_pack", "basic", mapped)
+        runner.entered["train_nuclei"].clear()
+        runner.gates["train_nuclei"].clear()
+        assert w.train()
+        qtbot.waitUntil(lambda: runner.entered["train_nuclei"].is_set(), timeout=30_000)
+        seen.append(w.cancel_btn.isEnabled())
+        runner.gates["train_nuclei"].set()
+        _settle(qtbot, w)
+    assert seen == [True, False]
