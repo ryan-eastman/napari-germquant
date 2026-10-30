@@ -83,6 +83,14 @@ def _table(w) -> tuple[list[str], list[list[str]]]:
     return head, [[t.item(r, c).text() for c in range(t.columnCount())] for r in range(t.rowCount())]
 
 
+def _held(fn, gate: threading.Event):
+    """``fn``, held in the dock's worker until ``gate`` is set."""
+    def run(*a, **k):
+        assert gate.wait(30)
+        return fn(*a, **k)
+    return run
+
+
 def test_the_dock_lists_the_projects_images_with_their_runs_and_points(qtbot, tproj, fake):
     standard_project(tproj)
     w = _dock(qtbot, runner=fake)
@@ -465,3 +473,152 @@ def test_a_source_that_is_not_there_still_opens_the_results(make_napari_viewer, 
     assert "img_b nuclei" in names and "img_b truth points (tester)" in names
     assert not any(n.startswith("img_b [") for n in names)
     assert "source image" in w.last_message and "not found" in w.last_message
+
+
+# A reading of the dock's own project (Refresh, a Save's, the Project dock's) drops none of the project's jobs; a
+# job of a project the dock has left is dropped (reviews/P6-TUNE.md S1).
+
+
+def test_a_reading_of_the_same_project_keeps_an_image_being_opened(make_napari_viewer, qtbot, tproj, fake,
+                                                                    monkeypatch):
+    """The Project dock reads the project again (a run ended, a Save there) while an image opens here."""
+    standard_project(tproj)
+    gate = threading.Event()
+    viewer = make_napari_viewer()
+    hub = FakeHub()
+    w = _dock(qtbot, viewer, runner=fake, hub=hub)
+    w.set_annotator("tester")
+    hub.open(tproj)
+    _settle(qtbot, w)
+    monkeypatch.setattr(_tuning, "image_layers", _held(_tuning.image_layers, gate))
+    assert w.select_image("img_b") and w.open_image()
+    qtbot.waitUntil(lambda: w.io_worker.busy, timeout=WAIT)
+    hub.changed.emit()
+    gate.set()
+    _settle(qtbot, w)
+    assert w.root == tproj and w.truth_layer("img_b") is not None
+    assert "opened img_b" in w.last_message and "closed" not in w.last_message
+
+
+def test_save_then_open_the_next_image_opens_it(make_napari_viewer, qtbot, tproj, fake, monkeypatch):
+    """The annotation loop: Save points on one image, then Open image on the next before the Save has returned
+    (the Save's own reading of the project comes in between)."""
+    standard_project(tproj)
+    viewer = make_napari_viewer()
+    w = _dock(qtbot, viewer, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    assert w.open_image("img_a")
+    _settle(qtbot, w)
+    w.truth_layer("img_a").add(np.array([[1.0, 2.0, 2.4]]))
+    gate = threading.Event()
+    monkeypatch.setattr(_tuning, "points_problem", lambda: None)       # a writer in any engine this suite runs on
+    monkeypatch.setattr(_tuning, "save_truth", _held(lambda meta, data, projected: Path(meta["file"]), gate))
+    assert w.save_points()
+    qtbot.waitUntil(lambda: w.io_worker.busy, timeout=WAIT)
+    assert w.select_image("img_b") and w.open_image()                  # waits behind the Save
+    gate.set()
+    _settle(qtbot, w)
+    assert w.truth_layer("img_b") is not None and "opened img_b" in w.last_message
+
+
+def test_a_refresh_during_a_search_keeps_its_result(qtbot, tproj, fake):
+    standard_project(tproj)
+    fake.gate = threading.Event()
+    w = _dock(qtbot, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    assert w.tune()
+    qtbot.waitUntil(fake.started.is_set, timeout=WAIT)
+    w.refresh()
+    qtbot.waitUntil(lambda: not w.io_worker.busy and not w._io_jobs, timeout=WAIT)
+    fake.release()
+    _settle(qtbot, w)
+    assert w.current_run is not None and Path(w.current_run).parent == tproj / "tuning"
+    assert w.ranked_table.rowCount() == 5 and "finished" in w.last_message and "closed" not in w.last_message
+
+
+def test_a_refresh_during_apply_still_reads_the_applied_project(qtbot, tproj, fake):
+    standard_project(tproj)
+    write_tuning_run(tproj, "20261024T100000Z_0000aaaa", best={GRID_KEY: 2.5})
+    gate = threading.Event()
+    fake.tune_apply = _held(fake.tune_apply, gate)
+    w = _dock(qtbot, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    assert w.apply()
+    qtbot.waitUntil(lambda: w.engine_worker.busy, timeout=WAIT)
+    w.refresh()
+    qtbot.waitUntil(lambda: not w.io_worker.busy and not w._io_jobs, timeout=WAIT)
+    gate.set()
+    _settle(qtbot, w)
+    assert TUNED_HASH in w.project_label.text() and w.row("img_a").stale
+
+
+def test_an_image_opening_of_a_project_the_dock_left_adds_nothing(make_napari_viewer, qtbot, tproj, fake,
+                                                                   monkeypatch):
+    """Another project is taken while an image of the first one waits to open: the opening returns to a dock
+    with another project open, and adds nothing."""
+    standard_project(tproj)
+    other = tproj / "other"
+    standard_project(other)
+    viewer = make_napari_viewer()
+    w = _dock(qtbot, viewer, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    gate = threading.Event()
+    monkeypatch.setattr(_tuning, "read_project", _held(_tuning.read_project, gate))
+    w.set_project(other)                                               # its reading waits in the file worker
+    qtbot.waitUntil(lambda: w.io_worker.busy, timeout=WAIT)
+    assert w.root == tproj and w.select_image("img_b") and w.open_image()   # waits behind that reading
+    gate.set()
+    _settle(qtbot, w)
+    assert w.root == other and len(viewer.layers) == 0
+    assert "img_b was not opened" in w.last_message and str(other) in w.last_message
+
+
+def test_a_search_that_ends_after_its_project_was_left_changes_nothing(qtbot, tproj, fake):
+    """A search's result belongs to its project: one that ends after another project was opened here, or after the
+    project was closed, adds no run to what the dock shows, and the message names the tuning run on disk. A
+    project closed and opened again meanwhile is the same project: the result is shown."""
+    standard_project(tproj)
+    other = tproj / "other"
+    standard_project(other)
+    fake.gate = threading.Event()
+    w = _dock(qtbot, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    try:
+        assert w.tune()
+        qtbot.waitUntil(fake.started.is_set, timeout=WAIT)
+        w.set_project(other)                                           # read in the file worker meanwhile
+        qtbot.waitUntil(lambda: w.root == other, timeout=WAIT)
+    finally:
+        fake.release()
+    _settle(qtbot, w)
+    (run,) = (tproj / "tuning").iterdir()
+    assert w.root == other and w.runs == [] and w.current_run is None and w.ranked_table.rowCount() == 0
+    assert f"the search of {tproj} finished" in w.last_message and run.name in w.last_message
+    assert "is no longer the one open in this dock" in w.last_message
+    fake.gate, fake.started = threading.Event(), threading.Event()
+    try:
+        assert w.tune()                                                # a search of the other project
+        qtbot.waitUntil(fake.started.is_set, timeout=WAIT)
+        w.close_project()
+    finally:
+        fake.release()
+    _settle(qtbot, w)
+    assert w.root is None and w.runs == [] and "the project was closed meanwhile" in w.last_message
+    _opened(qtbot, w, other)
+    fake.gate, fake.started = threading.Event(), threading.Event()
+    try:
+        assert w.tune()
+        qtbot.waitUntil(fake.started.is_set, timeout=WAIT)
+        w.close_project()
+        w.set_project(other)                                           # the same project again
+        qtbot.waitUntil(lambda: w.root == other, timeout=WAIT)
+    finally:
+        fake.release()
+    _settle(qtbot, w)
+    assert w.current_run == str(w.last_tune["run_dir"]) and w.ranked_table.rowCount() == 5
+    assert "finished" in w.last_message and "meanwhile" not in w.last_message

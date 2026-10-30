@@ -25,9 +25,12 @@ What it shows, top to bottom:
   reads it again.
 
 Tune and Apply wait while a run of the project goes, and Tune while truth points are not saved. The GUI thread
-never waits: the engine's calls go to one thread worker, the file reads and the Save to another. Every control has
-a programmatic twin (set_project, set_annotator, select_image, open_image, save_points, set_projected,
-set_grid_file, set_max_runs, tune, cancel, select_run, apply) that opens no dialog.
+never waits: the engine's calls go to one thread worker, the file reads and the Save to another. An image opening,
+a search or an Apply belongs to the project folder it was started on: when it returns while the dock has no
+project open, or another one, it changes nothing in the dock; a reading of the same project (Refresh, a Save's,
+the Project dock's) drops none of them. Every control has a programmatic twin (set_project, set_annotator,
+select_image, open_image, save_points, set_projected, set_grid_file, set_max_runs, tune, cancel, select_run,
+apply) that opens no dialog.
 """
 from __future__ import annotations
 
@@ -132,7 +135,10 @@ class SpotTuningWidget(QWidget):
         self.engine_error: str | None = None
         self.interpreter_dialog = None
         self._hub_root: Path | None = None             # the project the Project dock opened, which this dock follows
-        self._request = 0                               # one more at every project request: a reading names its own
+        # one more at every reading of a project asked for (and at Close): only the newest reading is taken. A job of
+        # the project (an image opening, a search, an Apply) is not a reading: it keeps its project's folder and is
+        # dropped only when the dock no longer has that project open (``_owns``), so a refresh never drops one.
+        self._reading = 0
         self._truth: dict[tuple, object] = {}           # (root, image id, annotator) -> its truth layer
         self._saved: dict[tuple, np.ndarray] = {}       # the same key -> its points as last read or saved
         self._io_jobs: list[dict] = []
@@ -489,28 +495,28 @@ class SpotTuningWidget(QWidget):
         """Open the project in ``root`` (read in the file worker): its images, runs, truth points and tuning
         runs. A folder that is no project is refused, and the project that was open stays open."""
         folder = Path(os.path.abspath(str(root).strip().strip('"')))
-        self._request += 1
-        self._read(folder, self._request)
+        self._reading += 1
+        self._read(folder, self._reading)
 
     def refresh(self) -> None:
-        """Read the open project again."""
+        """Read the open project again (an image being opened, a search and an Apply of it go on)."""
         if self.root is not None:
-            self._request += 1
-            self._read(self.root, self._request)
+            self._reading += 1
+            self._read(self.root, self._reading)
 
-    def _read(self, folder: Path, request: int) -> None:
+    def _read(self, folder: Path, reading: int) -> None:
         annotator, grid_file = self._annotator(), self.grid_file
 
         def job(should_stop):
             return _tuning.read_project(folder, annotator, grid_file)
 
         def done(state):
-            if request != self._request:
-                return                                # a newer request (another project, or Close) came since
+            if reading != self._reading:
+                return                                # a newer reading (another project, or Close) came since
             self._take(state)
 
         def failed(exc):
-            if request != self._request:
+            if reading != self._reading:
                 return
             self._failed(exc, f"{folder}: ")
 
@@ -530,12 +536,24 @@ class SpotTuningWidget(QWidget):
         self._show_project()
 
     def close_project(self) -> None:
-        """Close the project in this dock (its layers stay in the viewer)."""
-        self._request += 1
+        """Close the project in this dock (its layers stay in the viewer); a reading of it that returns later is
+        dropped, and so is an image opening, a search or an Apply of it while no project, or another one, is open
+        here."""
+        self._reading += 1
         self.root, self.manifest, self.rows, self.runs, self.views = None, None, [], [], {}
         self.current_run = None
         self.backend, self.backend_source = None, ""
         self._show_project()
+
+    def _owns(self, root) -> bool:
+        """Whether the dock has the project in ``root`` open now: a job started on that project changes the dock
+        only then (it was closed, or another project taken, meanwhile otherwise)."""
+        return _same(self.root, root)
+
+    def _gone(self) -> str:
+        """Why a job of a project the dock no longer has open changes nothing now."""
+        return ("was closed meanwhile" if self.root is None else
+                f"is no longer the one open in this dock (it has {self.root} open now)")
 
     def _on_hub_opened(self, root: str) -> None:
         self._hub_root = Path(root)
@@ -668,7 +686,7 @@ class SpotTuningWidget(QWidget):
             self._select_layer(layer)
             self._message(f"{row.image_id} is already open: its truth points are the layer {layer.name}", None)
             return True
-        root, request = self.root, self._request
+        root = self.root
 
         def job(should_stop):
             info = _tuning.run_info(root, row)
@@ -676,8 +694,8 @@ class SpotTuningWidget(QWidget):
 
         def done(res):
             layers, data, note = res
-            if request != self._request:
-                self._message(f"{row.image_id} was not opened: the project was closed meanwhile", AMBER)
+            if not self._owns(root):
+                self._message(f"{row.image_id} was not opened: its project {self._gone()}", AMBER)
                 return
             added = add_layer_tuples(self.viewer, layers)
             truth = added[-1]
@@ -833,7 +851,7 @@ class SpotTuningWidget(QWidget):
         if unsaved:
             self._message(f"Save the truth points of {', '.join(unsaved)} first: a search reads the saved files", AMBER)
             return False
-        root, request = self.root, self._request
+        root = self.root
         grid, max_runs = self.grid_file, int(self.max_runs_spin.value())
         say = self._lines.line.emit
         self.progress_text = ""
@@ -849,10 +867,12 @@ class SpotTuningWidget(QWidget):
         def done(res):
             rec, view = res
             self.last_tune = rec
-            if request != self._request:
-                self._message("the search finished, but the project was closed meanwhile", AMBER)
-                return
             run = str(rec.get("run_dir")) if rec.get("run_dir") else None
+            if not self._owns(root):
+                where = f" (its tuning run is {run})" if run else ""
+                self._message(f"the search of {root} finished{where}, but the project {self._gone()}: open it "
+                              f"again to see and apply the result", AMBER)
+                return
             if run and view is not None:
                 self.views[run] = {**view, "warnings": list(rec.get("warnings") or [])}
                 if run not in self.runs:
@@ -934,7 +954,7 @@ class SpotTuningWidget(QWidget):
         if self.engine_worker.busy:
             self._message(f"the engine is busy ({self.engine_worker.label}); apply when it has finished", AMBER)
             return False
-        root, request = self.root, self._request
+        root = self.root
         old = _tuning.project_hash(self.manifest or {})
         version = plugin_version()
 
@@ -945,11 +965,13 @@ class SpotTuningWidget(QWidget):
         def done(rec):
             self.last_apply = rec
             new = rec.get("config_hash") if isinstance(rec, dict) else None
-            self._message(_tuning.applied_text(new, old), GREEN)
+            text = _tuning.applied_text(new, old)
+            owned = self._owns(root)
+            self._message(text if owned else f"{root}: {text}", GREEN)    # the write happened either way
             hub = self.hub
             if hub is not None and _same(getattr(hub, "root", None), root):
                 hub.request_reload()
-            if request == self._request:
+            if owned:
                 self.refresh()
 
         return self._engine_job(job, "applying the tuning run (germquant tune-spots --apply)", done,
