@@ -650,3 +650,26 @@ def test_a_search_that_ends_after_its_project_was_left_changes_nothing(qtbot, tp
     _settle(qtbot, w)
     assert w.current_run == str(w.last_tune["run_dir"]) and w.ranked_table.rowCount() == 5
     assert "finished" in w.last_message and "meanwhile" not in w.last_message
+
+
+def test_the_label_image_is_decoded_once_while_its_file_stays_the_same(tmp_path, monkeypatch):
+    """Every Save looks the points' objects up in the run's label image, which the engine writes zlib-compressed
+    (no memory map): one decoded image is kept, and a run made again (a new file) is read again."""
+    import tifffile
+
+    path = tmp_path / "img__nuclei_labels.tif"
+    tifffile.imwrite(str(path), np.arange(24, dtype=np.int32).reshape(2, 3, 4), photometric="minisblack")
+    reads = []
+    real = tifffile.imread
+    monkeypatch.setattr(tifffile, "imread", lambda *a, **k: reads.append(a) or real(*a, **k))
+    _tuning.forget_labels()
+    try:
+        first = _tuning.run_labels(path)
+        assert _tuning.run_labels(path) is first and len(reads) == 1 and not first.flags.writeable
+        tifffile.imwrite(str(path), np.ones((2, 3, 4), np.int32), photometric="minisblack")   # run again
+        st = os.stat(path)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+        again = _tuning.run_labels(path)
+        assert len(reads) == 2 and int(again.sum()) == 24
+    finally:
+        _tuning.forget_labels()

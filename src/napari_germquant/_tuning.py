@@ -23,6 +23,11 @@ the run's micrometres (napari's world coordinates of those layers; the layer has
 existing file are put on the run's grid with ``germquant.tune.points.to_run_frame``; Save gives the layer's points
 to ``write_points`` with the run's labels, voxel size and geometry, which fills every column of the file (its own
 grid and frame, the run's object under each point, projected).
+
+Save refuses what would put a wrong file on disk: the points of other planes in a run of one plane (they are left
+out of the layer, and a Save would remove them from the file), and a run whose grid changed since the layer was
+opened (the image was run again with another stride, z range or voxel size: ``RunChanged``). The label image is
+decoded once for the Saves of one image (``run_labels``).
 """
 from __future__ import annotations
 
@@ -36,6 +41,7 @@ import json
 import math
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -63,6 +69,11 @@ RUN_ID_RE = re.compile(r"\d{8}T\d{6}Z_[0-9a-f]{8}")
 
 class TuningError(RuntimeError):
     """What the dock cannot do, with the reason and the fix (shown as it is)."""
+
+
+class RunChanged(TuningError):
+    """The image's run changed its grid (stride, z range, label image or voxel size) since its truth layer was
+    opened: the layer's points sit on the old grid, so they are not saved on the new one."""
 
 
 @functools.lru_cache(maxsize=None)
@@ -305,12 +316,15 @@ class RunInfo:
         spots = (self.config or {}).get("spots")
         return str(spots.get("backend") or "spotmax") if isinstance(spots, dict) else None
 
-    def meta(self, annotator: str, file: Path, projected: bool) -> dict:
-        """The truth layer's record (LAYER_KEY): enough to save it again."""
+    def meta(self, annotator: str, file: Path, projected: bool, *, labels_shape=None, other_planes: int = 0) -> dict:
+        """The truth layer's record (LAYER_KEY): enough to save it again, and to tell at Save whether the run
+        still has the grid the layer was opened on (``labels_shape``, the label image's (Z, Y, X)).
+        ``other_planes`` counts the file's points that a one-plane run cannot hold (``read_truth``)."""
         return {"root": str(self.root), "image_id": self.image_id, "annotator": annotator, "file": str(file),
                 "result_dir": str(self.result_dir), "table_spacing": [float(s) for s in self.table_spacing],
                 "xy_stride": int(self.xy_stride), "z_range": list(self.z_range) if self.z_range else None,
-                "planar": bool(self.planar), "projected": bool(projected)}
+                "labels_shape": [int(v) for v in labels_shape] if labels_shape is not None else None,
+                "planar": bool(self.planar), "projected": bool(projected), "other_planes": int(other_planes)}
 
 
 def _table_spacing(rs: ResultsSet) -> tuple[float, float, float]:
@@ -343,14 +357,55 @@ def run_info(root, row: ImageRow) -> RunInfo:
                    config=rs.run_config(), config_hash=rs.config_hash())
 
 
-def labels_shape(info: RunInfo) -> tuple[int, int, int]:
-    """The (Z, Y, X) shape of the run's label image, from its header (no pixels read; a single plane's YX image
-    is one plane)."""
+def labels_file(result_dir, image_id: str) -> Path:
+    return Path(result_dir) / f"{image_id}__nuclei_labels.tif"
+
+
+def tiff_shape(path) -> tuple[int, int, int]:
+    """The (Z, Y, X) shape of a label image, from its header (no pixels read; a single plane's YX image is one
+    plane)."""
     import tifffile
 
-    with tifffile.TiffFile(_long(info.result_dir / f"{info.image_id}__nuclei_labels.tif")) as tf:
+    with tifffile.TiffFile(_long(path)) as tf:
         shape = tuple(int(s) for s in tf.series[0].shape)
     return (1, *shape) if len(shape) == 2 else shape   # type: ignore[return-value]
+
+
+def labels_shape(info: RunInfo) -> tuple[int, int, int]:
+    """The (Z, Y, X) shape of the run's label image, from its header."""
+    return tiff_shape(labels_file(info.result_dir, info.image_id))
+
+
+# The run's label image, decoded once for the Saves of one image: the engine writes it zlib-compressed, so it
+# cannot be memory-mapped, and at stride 1 a large gonad decodes to more than a gigabyte. One image is kept,
+# keyed by its file's path, size and modification time, so a run made again since is read again.
+_LABELS_LOCK = threading.Lock()
+_LABELS: dict[tuple, np.ndarray] = {}
+
+
+def run_labels(path) -> np.ndarray:
+    """The label image ``path`` (read only), decoded once while its file stays the same."""
+    import tifffile
+
+    lp = _long(path)
+    st = os.stat(lp)
+    key = (os.path.normcase(os.path.abspath(str(path))), st.st_mtime_ns, st.st_size)
+    with _LABELS_LOCK:
+        hit = _LABELS.get(key)
+    if hit is not None:
+        return hit
+    labels = np.asarray(tifffile.imread(lp))
+    labels.setflags(write=False)
+    with _LABELS_LOCK:
+        _LABELS.clear()
+        _LABELS[key] = labels
+    return labels
+
+
+def forget_labels() -> None:
+    """Let the kept label image go (the dock's project closed, or another one was taken)."""
+    with _LABELS_LOCK:
+        _LABELS.clear()
 
 
 def source_layers(info: RunInfo) -> list:
@@ -382,43 +437,70 @@ def points_file(root, image_id: str, annotator: str) -> Path:
     return Path(root) / POINTS_DIR / name
 
 
-def read_truth(info: RunInfo, annotator: str) -> tuple[np.ndarray, bool, str]:
-    """The annotator's truth points of the image on the run's frame: ``(points (N, 3) in um, projected, note)``.
-    No file: no points. A file this environment cannot read (no germquant.tune) or that is malformed: no points,
-    and the note says why."""
+def other_planes_text(image_id: str, n: int, file_name: str) -> str:
+    """Why the dock does not save a one-plane run's truth layer when the file holds points of other planes."""
+    many = n != 1
+    return (f"{n} truth point{'s' if many else ''} of {file_name} lie{'' if many else 's'} on "
+            f"{'planes' if many else 'a plane'} this one-plane run did not read, so {'they are' if many else 'it is'} "
+            f"not shown, and saving here would remove {'them' if many else 'it'} from the file: annotate {image_id} "
+            f"on a run of its planes, or remove {'those points' if many else 'that point'} from the file first")
+
+
+def read_truth(info: RunInfo, annotator: str, shape=None) -> tuple[np.ndarray, bool, str, int]:
+    """The annotator's truth points of the image on the run's frame: ``(points (N, 3) in um, projected, note,
+    other_planes)``. No file: no points. A file this environment cannot read (no germquant.tune) or that is
+    malformed: no points, and the note says why. ``shape`` is the run's label image (Z, Y, X) (read from its
+    header when None).
+
+    A run of one plane puts every point on its plane (the engine's to_run_frame and write_points), so the points
+    of the file's other planes are left out of the layer and counted in ``other_planes``: shown on this plane
+    they would be in the wrong place, and a Save would move them there (``save_truth`` refuses instead)."""
     path = points_file(info.root, info.image_id, annotator)
     empty = np.zeros((0, 3), float)
     if not _isfile(path):
-        return empty, False, ""
+        return empty, False, "", 0
     pts = tune_module("points")
     if pts is None:
-        return empty, False, f"{path.name} is there, but {points_problem()}"
+        return empty, False, f"{path.name} is there, but {points_problem()}", 0
     try:
+        shape = labels_shape(info) if shape is None else tuple(int(v) for v in shape)
         table = pts.read_points(path)
-        frame = pts.to_run_frame(table, shape=labels_shape(info), spacing=info.table_spacing,
-                                 xy_stride=info.xy_stride, z_range=info.z_range)
+        frame = pts.to_run_frame(table, shape=shape, spacing=info.table_spacing, xy_stride=info.xy_stride,
+                                 z_range=info.z_range)
     except (ValueError, OSError) as e:
-        return empty, False, f"{path.name} cannot be read ({e}); fix or remove it before saving over it"
-    data = np.column_stack([frame["z_um"], frame["y_um"], frame["x_um"]]).astype(float) if len(table) else empty
-    flags = table["projected"].to_numpy(bool) if len(table) else np.zeros(0, bool)
+        return empty, False, f"{path.name} cannot be read ({e}); fix or remove it before saving over it", 0
+    n = len(table)
+    keep = np.ones(n, bool)
+    if shape[0] == 1 and n:
+        keep = np.asarray(frame["zr"]) == 0             # the points of the run's own plane
+    other = int((~keep).sum())
+    data = (np.column_stack([frame["z_um"], frame["y_um"], frame["x_um"]]).astype(float)[keep] if n else empty)
+    flags = table["projected"].to_numpy(bool)[keep] if n else np.zeros(0, bool)
     projected = bool(len(flags) and flags.all())
     notes = []
-    outside = int((~np.asarray(frame["inside"], bool)).sum()) if len(table) else 0
+    if other:
+        notes.append(f"{other} of its points {'lies' if other == 1 else 'lie'} on planes this one-plane run did not "
+                     f"read: {'it is' if other == 1 else 'they are'} not shown, and Save is refused while the file "
+                     f"holds {'it' if other == 1 else 'them'} (annotate the image on a run of its planes)")
+    outside = int((~np.asarray(frame["inside"], bool) & keep).sum()) if n else 0
     if outside:
-        notes.append(f"{outside} of its points lie outside this run's field (planes or pixels the run did not read)")
+        notes.append(f"{outside} of its points {'lies' if outside == 1 else 'lie'} outside this run's field (planes "
+                     f"or pixels the run did not read)")
     if len(flags) and flags.any() and not flags.all():
         notes.append("some of its points are marked projected and some not; Save marks every point as the "
                      "'placed on a projection' box says")
-    return data, projected, "; ".join(notes)
+    return data, projected, "; ".join(notes), other
 
 
-def truth_layer(info: RunInfo, annotator: str, data: np.ndarray, projected: bool) -> tuple:
+def truth_layer(info: RunInfo, annotator: str, data: np.ndarray, projected: bool, *, labels_shape=None,
+                other_planes: int = 0) -> tuple:
     """The editable Points layer of the annotator's truth points on the run's frame (no scale: its coordinates
     are the run's micrometres, napari's world coordinates of the run's layers)."""
     size = spot_marker_size_um(info.config, "spots")
     file = points_file(info.root, info.image_id, annotator)
+    record = info.meta(annotator, file, projected, labels_shape=labels_shape, other_planes=other_planes)
     kwargs = {"name": truth_name(info.image_id, annotator), "ndim": 3, "size": size, "face_color": TRUTH_COLOR,
-              "border_color": "white", "metadata": {LAYER_KEY: info.meta(annotator, file, projected)}}
+              "border_color": "white", "metadata": {LAYER_KEY: record}}
     return (np.asarray(data, float).reshape(-1, 3), kwargs, "points")
 
 
@@ -434,31 +516,79 @@ def image_layers(info: RunInfo, annotator: str) -> tuple[list, np.ndarray, str]:
     except Exception as e:  # noqa: BLE001 - an unreadable source never stops the run's own layers
         notes.append(f"{info.image_id}: the source image {info.source} cannot be read ({type(e).__name__}: {e})")
     layers += load_results_layers(ResultsSet(info.result_dir, info.image_id), include_source=False)
-    data, projected, note = read_truth(info, annotator)
+    shape = labels_shape(info)
+    data, projected, note, other = read_truth(info, annotator, shape)
     if note:
         notes.append(note)
-    layers.append(truth_layer(info, annotator, data, projected))
+    layers.append(truth_layer(info, annotator, data, projected, labels_shape=shape, other_planes=other))
     return layers, data, "; ".join(notes)
+
+
+def _z_range(value) -> tuple[int, int] | None:
+    return (int(value[0]), int(value[1])) if isinstance(value, (list, tuple)) and len(value) == 2 else None
+
+
+def _same_spacing(a, b) -> bool:
+    try:
+        return all((math.isnan(x) and math.isnan(y)) or math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-12)
+                   for x, y in zip((float(v) for v in a), (float(v) for v in b), strict=True))
+    except (TypeError, ValueError):
+        return False
+
+
+def run_changed(meta: dict) -> str | None:
+    """What changed in the grid of the image's run since its truth layer was opened (``meta``, the layer's
+    record): its stride, z range, label image or voxel size; None when nothing did. TuningError when the image
+    has no finished run now (it is being run again, or its run failed)."""
+    rdir, image_id = Path(meta["result_dir"]), str(meta["image_id"])
+    rs = ResultsSet(rdir, image_id)
+    marker = rs.done_marker()
+    lab = labels_file(rdir, image_id)
+    if not isinstance(marker, dict) or not _isfile(lab):
+        raise TuningError(f"results/{image_id} has no finished run now (it is being run again, or its run failed): "
+                          f"save its points when its run has finished")
+    what = []
+    stride, was = int(marker.get("xy_stride") or 1), int(meta.get("xy_stride") or 1)
+    if stride != was:
+        what.append(f"xy stride {was} to {stride}")
+    zr, zr_was = _z_range(marker.get("z_range")), _z_range(meta.get("z_range"))
+    if zr != zr_was:
+        what.append(f"z range {list(zr_was) if zr_was else 'all planes'} to {list(zr) if zr else 'all planes'}")
+    if meta.get("labels_shape") is not None:
+        shape, shape_was = tiff_shape(lab), tuple(int(v) for v in meta["labels_shape"])
+        if shape != shape_was:
+            what.append(f"label image {list(shape_was)} to {list(shape)}")
+    spacing = _table_spacing(rs)
+    if meta.get("table_spacing") is not None and not _same_spacing(spacing, meta["table_spacing"]):
+        what.append(f"voxel size {list(meta['table_spacing'])} to {[float(s) for s in spacing]} um")
+    return "; ".join(what) or None
 
 
 def save_truth(meta: dict, data, *, projected: bool) -> Path:
     """Write the truth layer's points (``data``, the run's frame) to its file through the engine's writer,
     ``germquant.tune.points.write_points``, with the run's labels, voxel size and geometry (``meta``, the layer's
-    LAYER_KEY record). TuningError when this environment has no writer, or the writer refuses the points."""
+    LAYER_KEY record). TuningError when this environment has no writer, when the file holds points of planes a
+    one-plane run did not read (a Save would remove them), when the image has no finished run now, or when the
+    writer refuses the points; RunChanged when the run's grid changed since the layer was opened."""
     pts = tune_module("points")
     if pts is None:
         raise TuningError(points_problem() or "no germquant.tune in this napari environment")
-    import tifffile
-
-    rdir = Path(meta["result_dir"])
-    labels = np.asarray(tifffile.imread(_long(rdir / f"{meta['image_id']}__nuclei_labels.tif")))
+    image_id = str(meta["image_id"])
+    other = int(meta.get("other_planes") or 0)
+    if other:
+        raise TuningError(other_planes_text(image_id, other, Path(meta["file"]).name))
+    changed = run_changed(meta)
+    if changed:
+        raise RunChanged(f"the run of {image_id} changed since its truth layer was opened ({changed}), so its "
+                         f"points sit on the old grid and were not saved")
+    labels = run_labels(labels_file(meta["result_dir"], image_id))
     zr = meta.get("z_range")
     try:
         return pts.write_points(Path(meta["file"]), np.asarray(data, float).reshape(-1, 3), labels=labels,
                                 spacing=tuple(meta["table_spacing"]), xy_stride=int(meta.get("xy_stride") or 1),
                                 z_range=tuple(zr) if zr else None, projected=bool(projected))
     except ValueError as e:
-        raise TuningError(f"the points of {meta['image_id']} were not saved: {e}") from None
+        raise TuningError(f"the points of {image_id} were not saved: {e}") from None
 
 
 # ---------------------------------------------------------------------------------------------------

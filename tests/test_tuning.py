@@ -205,6 +205,77 @@ def test_truth_points_round_trip_on_the_runs_grid(make_napari_viewer, qtbot, tpr
     assert one["z_um"].tolist() == [0.0] and one["zi"].tolist() == [0] and one["object_id"].tolist() == [1]
 
 
+def test_a_one_plane_run_leaves_the_points_of_other_planes_alone(make_napari_viewer, qtbot, tproj):
+    """A run of one plane (here a z range of one plane of a stack) holds no other plane: the file's points on
+    other planes are not shown on its plane, and Save is refused (the engine's writer would put every point on
+    the run's plane), so the file keeps them where they are."""
+    need_features("tune_spots")
+    from germquant.tune.points import read_points
+
+    standard_project(tproj)
+    write_finished_run(tproj, "img_b", tproj / "images" / "img_b.ome.tif", z_range=(2, 3),
+                       labels=run_labels(z_range=(2, 3)))
+    ann = tproj / "annotations" / "img_b__points_tester.csv"
+    ann.write_text("point_id,z_um,y_um,x_um,zi,yi,xi,object_id,projected\n"
+                   "0,1.0,2.0,2.4,2,10,12,1,false\n1,2.0,4.0,6.8,4,20,34,2,false\n", encoding="ascii")
+    before = ann.read_bytes()
+    viewer = make_napari_viewer()
+    w = SpotTuningWidget(viewer, session=StaticSession(FakeTuneRunner()))
+    qtbot.addWidget(w)
+    w.set_annotator("tester")
+    w.set_project(tproj)
+    _settle(qtbot, w)
+    assert w.select_image("img_b") and w.open_image()
+    _settle(qtbot, w)
+    layer = w.truth_layer("img_b")
+    assert np.allclose(layer.data, [[0.0, 2.0, 2.4]])                 # the point of plane 2, the run's plane
+    assert "1 of its points lies on planes this one-plane run did not read" in w.last_message
+    layer.add(np.array([[0.0, 3.0, 3.0]]))
+    assert not w.save_points()
+    assert "1 truth point of img_b__points_tester.csv lies on a plane this one-plane run did not read" \
+        in w.last_message
+    assert ann.read_bytes() == before and read_points(ann)["zi"].tolist() == [2, 4]
+    with pytest.raises(_tuning.TuningError, match="would remove it from the file"):
+        _tuning.save_truth(dict(layer.metadata[_tuning.LAYER_KEY]), layer.data, projected=False)
+
+
+def test_a_run_made_again_on_another_grid_is_not_saved_over(make_napari_viewer, qtbot, tproj):
+    """An image run again with another stride and z range after its truth layer was opened: the layer's points
+    sit on the old grid, so Save refuses them and the file stays as it was; the layer is kept, renamed, and Open
+    image opens the new run with the points of the file."""
+    need_features("tune_spots")
+    from germquant.tune.points import read_points
+
+    made = standard_project(tproj, stride=2, z_range=(1, 5))
+    viewer = make_napari_viewer()
+    w = SpotTuningWidget(viewer, session=StaticSession(FakeTuneRunner()))
+    qtbot.addWidget(w)
+    w.set_annotator("tester")
+    w.set_project(tproj)
+    _settle(qtbot, w)
+    assert w.select_image("img_a") and w.open_image()
+    _settle(qtbot, w)
+    old = w.truth_layer("img_a")
+    old.add(np.array([[1.0, 3.2, 4.0]]))
+    ann = tproj / "annotations" / "img_a__points_tester.csv"
+    before = ann.read_bytes()
+    write_finished_run(tproj, "img_a", made["sources"]["img_a"])      # run again: stride 1, every plane
+    assert w.save_points()
+    _settle(qtbot, w)
+    assert "changed since its truth layer was opened" in w.last_message and "xy stride 2 to 1" in w.last_message
+    assert ann.read_bytes() == before
+    assert w.truth_layer("img_a") is None and old.name == "img_a truth points (tester) (old run)"
+    assert w.open_image("img_a")                                       # the new run, the file's two points on it
+    _settle(qtbot, w)
+    new = w.truth_layer("img_a")
+    assert new is not old and new.name == "img_a truth points (tester)"
+    assert np.allclose(new.data, [[1.0, 2.0, 2.4], [1.0, 4.0, 6.8]])
+    new.add(np.array([[1.5, 3.2, 4.0]]))
+    assert w.save_points()
+    _settle(qtbot, w)
+    assert read_points(ann)["zi"].tolist() == [2, 2, 3] and w.unsaved_images() == []
+
+
 def test_the_count_line_names_the_detections_the_grid_means(qtbot, tproj):
     """What a search means before it starts (germquant.tune.grid.n_runs): the default grid of the runs' backend or
     a grid file, on the images that have truth points and a finished run, against Max runs."""

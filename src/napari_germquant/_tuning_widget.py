@@ -13,7 +13,9 @@ What it shows, top to bottom:
   Save points. Open image adds the image's finished run on its own grid: the run's labels and spots, the source
   image read at the run's stride and on its planes, and one editable Points layer "<image_id> truth points
   (<annotator>)" in add mode, holding the points of annotations/<image_id>__points_<annotator>.csv when the file
-  exists. Save writes that file through the engine's own writer, in napari's process (D39).
+  exists. Save writes that file through the engine's own writer, in napari's process (D39); it refuses a file
+  that would come out wrong (points of other planes in a run of one plane, or a run made again on another grid
+  since the layer was opened: the layer is then renamed "(old run)" and Open image opens the new run).
 * Tune: the grid (the engine's default for the recipe's spot backend, or a grid file), Max runs, how many
   detections the search means on the annotated images, Tune and Cancel. Tune runs ``germquant tune-spots
   --project DIR --points annotations --max-runs N [--grid FILE] --json`` through the engine runner, in a thread
@@ -525,6 +527,8 @@ class SpotTuningWidget(QWidget):
 
     def _take(self, state: dict) -> None:
         changed = not _same(self.root, state["root"])
+        if changed:
+            _tuning.forget_labels()                   # the label image kept for the last project's Saves
         self.root = Path(state["root"])
         self.manifest = state["manifest"]
         self.rows = list(state["rows"])
@@ -544,6 +548,7 @@ class SpotTuningWidget(QWidget):
         self.root, self.manifest, self.rows, self.runs, self.views = None, None, [], [], {}
         self.current_run = None
         self.backend, self.backend_source = None, ""
+        _tuning.forget_labels()
         self._show_project()
 
     def _owns(self, root) -> bool:
@@ -745,6 +750,10 @@ class SpotTuningWidget(QWidget):
             self._message(problem, RED)
             return False
         meta = dict(layer.metadata[_tuning.LAYER_KEY])
+        if meta.get("other_planes"):
+            self._message(_tuning.other_planes_text(meta["image_id"], int(meta["other_planes"]),
+                                                    Path(meta["file"]).name), AMBER)
+            return False
         key = (os.path.normcase(meta["root"]), meta["image_id"], meta["annotator"])
         data = np.array(layer.data, float).reshape(-1, 3)
         projected = self.projected_check.isChecked()
@@ -759,9 +768,33 @@ class SpotTuningWidget(QWidget):
             self._message(f"saved {n} point{'s' if n != 1 else ''} of {meta['image_id']} to {Path(path).name}", GREEN)
             self.refresh()
 
-        self._io("save", job, f"saving the truth points of {meta['image_id']}", done,
-                 lambda e: self._failed(e, f"{meta['image_id']}: "))
+        def failed(exc):
+            if isinstance(exc, _tuning.RunChanged):
+                self._retire(key, layer)
+                self._message(f"{meta['image_id']}: {exc}. The layer stays in the viewer as {layer.name}; Open image "
+                              f"opens the image on its new run with the points of its file", AMBER)
+                self._show_points()
+                return
+            self._failed(exc, f"{meta['image_id']}: ")
+
+        self._io("save", job, f"saving the truth points of {meta['image_id']}", done, failed)
         return True
+
+    def _retire(self, key, layer) -> None:
+        """A truth layer whose run changed its grid: no longer the image's layer here (Open image opens the new
+        run), and renamed so it is not taken for it."""
+        self._truth.pop(key, None)
+        self._saved.pop(key, None)
+        self._rename_old([layer])
+
+    def _rename_old(self, layers) -> None:
+        """Mark ``layers`` (those still in the viewer) as layers of an earlier run of their image."""
+        for old in layers:
+            try:
+                if old in self.viewer.layers and not old.name.endswith("(old run)"):
+                    old.name = f"{old.name} (old run)"
+            except Exception:  # noqa: BLE001 - a layer that is gone keeps nothing to rename
+                pass
 
     def _show_points(self, *, sync_box: bool = False) -> None:
         """The selected image's truth-point line; ``sync_box`` (another image selected) also sets the projected box
