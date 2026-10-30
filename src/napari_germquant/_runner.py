@@ -84,6 +84,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
 
 from germquant import api
@@ -810,7 +811,9 @@ class EngineRunner:
         raise NotImplementedError
 
     def tune_apply(self, project, run_dir, *, plugin_version: str | None = None, should_stop=None) -> dict:
-        """``tune-spots --apply``: writes recipe.yaml; ``config_hash`` when the engine says it."""
+        """``tune-spots --apply`` (plan 9.4 #7): writes recipe.yaml, stamped with the plugin version (D42); the
+        record ``{"config_hash", "warnings"}`` (``run_dir`` too through the subprocess runner), its warnings the
+        engine's TuningWarning messages."""
         raise NotImplementedError
 
     def list_post_stages(self, *, should_stop=None) -> list:
@@ -1315,10 +1318,23 @@ class InProcessRunner(EngineRunner):
         return _jsonable(res)
 
     def tune_apply(self, project, run_dir, *, plugin_version=None, should_stop=None) -> dict:
+        """apply_tuning: the record ``{"config_hash", "warnings"}``, its warnings the engine's TuningWarning
+        messages (plan 9.4 #7: the recipe changed after the tuning run's images were run, and the write still
+        happened), as the command's --json record has them. The warnings machinery is the process's while the
+        one write runs (Python has no per-thread form), so a warning another thread raises in that window is
+        shown when the write is done."""
         self._start(should_stop, "tune_spots")
-        h = self._api_call(self._api("apply_tuning"), self._open(project), str(run_dir),
-                           plugin_version=plugin_version or _plugin_version())
-        return {"config_hash": h}
+        from germquant.tune import TuningWarning
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", TuningWarning)
+            h = self._api_call(self._api("apply_tuning"), self._open(project), str(run_dir),
+                               plugin_version=plugin_version or _plugin_version())
+        for w in caught:                     # anything else is shown as it would have been (as cli_tune does)
+            if not issubclass(w.category, TuningWarning):
+                warnings.showwarning(w.message, w.category, w.filename, w.lineno)
+        notes = [str(w.message) for w in caught if issubclass(w.category, TuningWarning)]
+        return {"config_hash": h, "warnings": notes}
 
     def list_post_stages(self, *, should_stop=None) -> list:
         self._start(should_stop, "post_stages")
@@ -1951,14 +1967,14 @@ class SubprocessRunner(EngineRunner):
         return self._command_json(self.engine_argv(*args, "--json"), say=say, should_stop=should_stop, ok=(0, 1))
 
     def tune_apply(self, project, run_dir, *, plugin_version=None, should_stop=None) -> dict:
-        """``tune-spots --project DIR --apply tuning/<run>`` (the engine stamps its own write)."""
+        """``tune-spots --project DIR --apply tuning/<run> --plugin-version V --json`` (plan 9.4 #7): the write is
+        stamped with this plugin's version (D42); the command's record, ``{"config_hash", "run_dir",
+        "warnings"}``."""
         self._start(should_stop, "tune_spots")
-        argv = self.engine_argv("tune-spots", "--project", project, "--apply", run_dir)
-        rc, lines = self._command_lines(argv, should_stop=should_stop)
-        res = self._lines_result(argv, rc, lines)
-        res["config_hash"] = next((m.group(1) for m in (re.search(r"config_hash\W+([0-9a-f]{12})\b", ln)
-                                                       for ln in lines) if m), None)
-        return res
+        argv = self.engine_argv("tune-spots", "--project", project, "--apply", run_dir, "--plugin-version",
+                                plugin_version or _plugin_version(), "--json")
+        rec = self._command_json(argv, should_stop=should_stop)
+        return dict(rec) if isinstance(rec, dict) else {"config_hash": None, "result": rec}
 
     # -- the torch-free packs entry: pack derive
     def pack_derive(self, from_ref, recipe, model, card, out, *, new_id=None, should_stop=None) -> dict:

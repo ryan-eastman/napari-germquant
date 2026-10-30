@@ -4,7 +4,7 @@ tests/_p6_runner.py answer with what they were given), the torch-free entries us
 plugin version stamped on every project write, ``project=`` on the pack calls, the device list of the runtime
 probe, the refusal forms of the Train B commands, and the in-process runner: the same commands through
 germquant.api, but its project writes through the torch-free command of this environment (and, on an engine
-with projects, both runners writing the same project files)."""
+with projects, both runners writing the same project files, and an Apply's record with the engine's warning)."""
 from __future__ import annotations
 
 import inspect
@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import types
+import warnings
 from pathlib import Path
 
 import pytest
@@ -172,7 +173,9 @@ def test_one_method_per_command_builds_the_documented_command_line(standin, tmp_
     assert last("germquant") == ["tune-spots", "--project", P, "--points", "annotations", "--grid", "grid.yaml",
                                  "--max-runs", "20", "--out", "tuning/t1", "--json"]
     res = r.tune_apply(P, "tuning/t1")
-    assert last("germquant") == ["tune-spots", "--project", P, "--apply", "tuning/t1"] and res["exit_code"] == 0
+    assert last("germquant") == ["tune-spots", "--project", P, "--apply", "tuning/t1", "--plugin-version",
+                                 plugin_version(), "--json"]
+    assert res["argv"] == last("germquant")       # the stand-in echoes its arguments as the --json record
     res = r.info("img.ome.tif")
     assert last("germquant") == ["info", "img.ome.tif"] and echo(res["lines"])["argv"] == ["info", "img.ome.tif"]
     r.collect("results", samples="samples.csv")
@@ -322,6 +325,13 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
     fake_post = types.ModuleType("germquant.post_stages")
     fake_post.write_post_stages_file = lambda path, entries, **k: writes.append((Path(path), entries)) or Path(path)
     monkeypatch.setitem(sys.modules, "germquant.post_stages", fake_post)
+    try:                                   # the warning class an Apply records (9.4 #7)
+        from germquant.tune import TuningWarning
+    except ImportError:                    # an engine before P5-TUNE: a stand-in germquant.tune
+        TuningWarning = type("TuningWarning", (UserWarning,), {})
+        fake_tune = types.ModuleType("germquant.tune")
+        fake_tune.TuningWarning = TuningWarning
+        monkeypatch.setitem(sys.modules, "germquant.tune", fake_tune)
 
     r = InProcessRunner()
     assert {"projects", "import_labels", "tune_spots", "post_stages"} <= r.features()
@@ -355,7 +365,23 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
     assert calls[-1][2] == {"allow_pickle": False, "channel": "Cy3 RAD-51"}
     assert r.tune_spots(P, grid="g.yaml")["run_dir"] == "tuning/t1"
     assert calls[-1][2] == {"points": "annotations", "grid": "g.yaml", "out": None, "max_runs": 50}
-    assert r.tune_apply(P, "tuning/t1")["config_hash"] == "fedcba987654"
+    assert r.tune_apply(P, "tuning/t1") == {"config_hash": "fedcba987654", "warnings": []}
+    assert calls[-1][1][1:] == ("tuning/t1",) and calls[-1][2] == {"plugin_version": plugin_version()}
+    # the engine's TuningWarning is the record's, as in the command's --json record (9.4 #7; reviews/P6-TUNE.md
+    # S2), also under a filter of this process that ignores warnings; any other warning is shown as it would be
+    note = "t1: its images were run with config 02bb83cf74f9, and the recipe is now fedcba987654"
+
+    def apply_warned(project, run_dir, *, plugin_version=None):
+        warnings.warn(note, TuningWarning, stacklevel=2)
+        warnings.warn("an unrelated note", RuntimeWarning, stacklevel=2)
+        return "805dad578390"
+
+    monkeypatch.setattr(api, "apply_tuning", apply_warned)
+    with pytest.warns(RuntimeWarning, match="an unrelated note"):
+        assert r.tune_apply(P, "tuning/t1") == {"config_hash": "805dad578390", "warnings": [note]}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert r.tune_apply(P, "tuning/t1") == {"config_hash": "805dad578390", "warnings": [note]}
     assert r.list_post_stages() == [{"name": "fixture_post"}]
     r.write_post_stages(P, [{"name": "fixture_post", "params": {}}])
     assert writes == [(Path(P) / "post_stages.yaml", [{"name": "fixture_post", "params": {}}])]
@@ -665,3 +691,41 @@ def test_a_project_edit_through_both_runners_writes_the_same_files(project_env):
         with pytest.raises(EngineRefused, match="z range"):
             r.project_edit(roots[k], edits={"spots.log.min_snr": 4.0}, z_range=(5, 2))
     assert {k: _project_state(roots[k]) for k in runners} == after                    # none of it was written
+
+
+def test_an_apply_gives_the_engines_tuning_warning_through_both_runners(project_env):
+    """Apply (plan 9.4 #7) through both runners on the engine, of a tuning run whose images were run with another
+    config (its run.json says so): the same recipe.yaml, manifest and config_hash, the save stamped with the
+    plugin version (D42), and the engine's TuningWarning in the record: the command's --json record through the
+    subprocess runner, apply_tuning's warning recorded in process (reviews/P6-TUNE.md S2 and S3)."""
+    need_features("projects", "tune_spots")
+    import yaml
+
+    rid, made_with = "20261030T120000Z_0123abcd", "0123456789ab"
+    runners = {"subprocess": SubprocessRunner(sys.executable), "inprocess": InProcessRunner()}
+    roots = {k: project_env.new_dir(k) for k in runners}
+    for root in roots.values():
+        api.new_project(root, "test_pack@0.1.0", recipe="basic")
+        run = root / "tuning" / rid                    # the files apply reads (9.3), as a search writes them
+        run.mkdir(parents=True)
+        (run / "grid.yaml").write_bytes(b"spots.log.min_snr:\n- 1.5\n- 3.0\n")
+        (run / "best.yaml").write_bytes(yaml.safe_dump({"objective": "pooled F1", "backend": "log",
+                                                        "keys": {"spots.log.min_snr": 3.0}}).encode("ascii"))
+        (run / "run.json").write_bytes(json.dumps({"items": [{"image_id": "x", "config_hash": made_with}]})
+                                       .encode("ascii"))
+
+    def saved_plugin(root: Path):
+        return yaml.safe_load((root / "germquant_project.yaml").read_bytes().decode("ascii"))["saved"]["plugin"]
+
+    start = {k: _project_state(roots[k]) for k in runners}
+    assert start["subprocess"] == start["inprocess"]
+    assert [saved_plugin(root) for root in roots.values()] == [None, None]
+    recs = {k: r.tune_apply(roots[k], f"tuning/{rid}") for k, r in runners.items()}
+    after = {k: _project_state(roots[k]) for k in runners}
+    assert after["subprocess"] == after["inprocess"] != start["subprocess"]
+    assert [saved_plugin(root) for root in roots.values()] == [plugin_version()] * 2
+    sub, inproc = recs["subprocess"], recs["inprocess"]
+    assert inproc == {"config_hash": after["inprocess"][2], "warnings": inproc["warnings"]}
+    assert sub == {"config_hash": inproc["config_hash"], "run_dir": f"tuning/{rid}", "warnings": inproc["warnings"]}
+    (note,) = inproc["warnings"]                       # the run, the config it was made with and the recipe's now
+    assert rid in note and made_with in note and start["inprocess"][2] in note
