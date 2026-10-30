@@ -715,6 +715,8 @@ class TrainingWidget(QWidget):
         self._known_choice = _settings.engine_choice()
         self._show_engine()                           # at once: the engine stored now, or "checking ..."
         if self._engine_chosen():
+            if self.session.runner() is None:
+                self._device_list = "stale"           # another engine, not checked yet: its devices are unknown
             self._check_engine()
         else:
             self.engine_error = None
@@ -1577,10 +1579,13 @@ class TrainingWidget(QWidget):
             raise ValueError("choose a model folder")
         base = self._clean(self.base_combo.currentText()) or "cpsam"
         kind = self.kind_combo.currentData()
+        device = str(self.device_combo.currentData())
+        if self._engine_chosen() and self._device_list != "engine":
+            device = "auto"                           # the engine chooses until the dock has read its device list
         return T.TrainSettings(out=Path(out), name=self._clean(self.name_edit.text()) or None, base=base,
                                epochs=int(self.epochs_spin.value()), split_by=self.split_combo.currentText(),
                                val_frac=float(self.val_spin.value()), seed=int(self.split_seed_spin.value()),
-                               device=str(self.device_combo.currentData()),
+                               device=device,
                                system=self._clean(self.system_edit.text()) or None,
                                kind=kind if kind in T.OBJECT_KINDS else None,
                                dataset=self._clean(self.dataset_edit.text()) or None)
@@ -1850,7 +1855,10 @@ class TrainingWidget(QWidget):
     def _start_step(self, kind: str, job, *, label: str, returned, what: str, engine: bool, line_format=None) -> None:
         """One step in the dock's worker. ``engine``: an engine process runs it, so Cancel can end it."""
         runner = self._ui_runner() if engine else None
-        self._job_cancellable = bool(engine and getattr(runner, "cancellable", False))
+        if engine and runner is None:                 # being checked: a stored interpreter runs in its own process
+            self._job_cancellable = _settings.engine_choice() not in (None, _settings.INPROCESS)
+        else:
+            self._job_cancellable = bool(engine and getattr(runner, "cancellable", False))
         self._busy_kind = kind
         self._update_buttons()
         self.runner.start(job, label=label, returned=returned, errored=lambda e: self._on_errored(e, what),

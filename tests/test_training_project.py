@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -633,3 +634,44 @@ def test_use_in_project_needs_the_model_and_its_card(make_napari_viewer, qtbot, 
     else:
         # no card next to the model: the engine is asked without one and says what it needs
         assert ok and runner.last("project_use_model")[1]["card"] is None
+
+
+# ---- the review's findings (reviews/P6-TRAIN.md) ---------------------------------------------------------------
+
+class _SlowCheck(FakeTrainRunner):
+    """A fake engine whose version check takes as long as a real engine process start (about a second)."""
+
+    def version(self, refresh: bool = False, should_stop=None) -> dict:
+        time.sleep(1.0)
+        return super().version()
+
+
+def test_an_engine_chosen_just_before_train_chooses_its_device_and_can_be_cancelled(qtbot, tmp_path, monkeypatch):
+    """S1: napari's environment has no GPU (the workstation's plugin venv has CPU torch), the engine has CUDA. An
+    engine stored in another dock just before Train is still being checked when the step starts: the training asks
+    for auto (the engine's own choice), never the device napari's list chose, and Cancel can end it."""
+    from napari_germquant import _engine_session, _settings
+
+    pairs = tmp_path / "pairs"
+    write_pairs(pairs, "a", 2)
+    runner = _SlowCheck(available={"cuda": True, "mps": False})
+    runner.gates["train_nuclei"] = threading.Event()
+    runner.entered["train_nuclei"] = threading.Event()
+    monkeypatch.setattr(_engine_session.EngineSession, "_make", lambda self, choice: runner)
+    monkeypatch.setattr(T, "device_status", lambda: {"cuda": False, "mps": False, "cpu": True})
+    w = TrainingWidget(None, hub=FakeHub())
+    assert w.engine_route() == "napari" and w.device_combo.currentData() == "cpu"
+    w.open_pairs(pairs)
+    w.model_dir_edit.setText(str(tmp_path / "models" / "m1"))
+    _settings.set_engine_choice("C:/lab/engine/.venv/Scripts/python.exe")   # the Run dock stores the choice
+    assert w.train()
+    qtbot.waitUntil(lambda: runner.entered["train_nuclei"].is_set(), timeout=30_000)
+    asked = runner.last("train_nuclei")[1]["device"]
+    cancel_on = w.cancel_btn.isEnabled()
+    qtbot.waitUntil(lambda: w.device_combo.findData("cuda") >= 0, timeout=30_000)
+    cancel_after = w.cancel_btn.isEnabled()
+    runner.gates["train_nuclei"].set()
+    _settle(qtbot, w)
+    assert w.engine_route() == "engine" and _items(w.device_combo) == ["auto", "cuda", "cpu"]
+    assert asked == "auto"                                 # the engine's own choice, never napari's list
+    assert cancel_on and cancel_after                      # Cancel on for the engine process
