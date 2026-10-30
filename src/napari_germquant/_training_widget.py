@@ -234,6 +234,8 @@ class TrainingWidget(QWidget):
         self._projects_problem: str | None = None     # why the project's rounds cannot come from the engine
         self._following_hub = False
         self._reading = 0                              # one more at every project reading asked for, and at Close
+        self._reading_root: Path | None = None         # the folder of the newest reading still in flight
+        self._rounds_req = 0                           # one more at every round listing asked for, and at New round
         self._hub_reading: int | None = None           # the reading of the Project dock's project still in flight
         self._device_list = "napari"                   # whose devices the device list shows: napari or engine
         self._geometry_req = 0
@@ -809,6 +811,7 @@ class TrainingWidget(QWidget):
         root = Path(os.path.abspath(self._clean(str(root))))
         self._reading += 1
         req = self._reading
+        self._reading_root = root
         self._hub_reading = req if follow_hub else None
         self._files.submit("project", lambda: T.read_project(root), label=f"reading the project {root.name}",
                            returned=lambda p: self._on_project_read(p, req, follow_hub),
@@ -822,6 +825,7 @@ class TrainingWidget(QWidget):
     def _on_project_read(self, project: T.TrainingProject, req: int, follow_hub: bool) -> None:
         if req != self._reading:
             return                                    # a newer reading, or a Close, came since
+        self._reading_root = None
         same = self.project is not None and _same(self.project.root, project.root)
         self.project = project
         self._following_hub = follow_hub or (same and self._following_hub)
@@ -848,11 +852,13 @@ class TrainingWidget(QWidget):
     def _on_project_failed(self, exc: BaseException, req: int, root: Path) -> None:
         if req != self._reading:
             return
+        self._reading_root = None
         self._status(f"cannot work in {root}: {exc}", RED)
 
     def close_project(self) -> None:
         """Leave the project: the folders stay as they are, for a folder of your own choosing."""
         self._reading += 1
+        self._reading_root = None
         was = self.project
         self.project = None
         self.rounds = []
@@ -885,27 +891,28 @@ class TrainingWidget(QWidget):
         if self.project is None:
             return
         root, req, engine = self.project.root, self._reading, self._engine_chosen()
-        worker = self.engine_worker
+        self._rounds_req += 1
+        rreq, worker = self._rounds_req, self.engine_worker
 
         def job():
             runner = self._job_runner("projects", engine=engine, should_stop=worker.should_stop)
             return runner.project_rounds(root, should_stop=worker.should_stop)
 
         self._engine_jobs.submit("rounds", job, label="listing the training rounds",
-                                 returned=lambda rec: self._on_rounds(rec, req, select),
-                                 errored=lambda e: self._on_rounds_failed(e, req))
+                                 returned=lambda rec: self._on_rounds(rec, req, select, rreq),
+                                 errored=lambda e: self._on_rounds_failed(e, req, rreq))
 
-    def _on_rounds(self, rec: dict, req: int, select: str | None = None) -> None:
-        if req != self._reading or self.project is None:
-            return
+    def _on_rounds(self, rec: dict, req: int, select: str | None = None, rreq: int | None = None) -> None:
+        if req != self._reading or self.project is None or rreq not in (None, self._rounds_req):
+            return                                    # another project, or a newer listing or New round, came since
         self._projects_problem = None
         self.rounds = [str(r) for r in (rec or {}).get("rounds") or []]
         self._fill_rounds(select)
         self._show_project()
         self._update_buttons()
 
-    def _on_rounds_failed(self, exc: BaseException, req: int) -> None:
-        if req != self._reading or self.project is None:
+    def _on_rounds_failed(self, exc: BaseException, req: int, rreq: int | None = None) -> None:
+        if req != self._reading or self.project is None or rreq not in (None, self._rounds_req):
             return
         self.rounds = []
         self._projects_problem = str(exc) if isinstance(exc, (FeatureMissing, EngineNotChosen)) else \
@@ -992,6 +999,7 @@ class TrainingWidget(QWidget):
     def _on_round_made(self, rec: dict, root: Path) -> None:
         created = (rec or {}).get("created")
         if self.project is not None and _same(self.project.root, root):
+            self._rounds_req += 1                     # a listing still in flight predates this round
             self._projects_problem = None
             self.rounds = [str(r) for r in rec.get("rounds") or []]
             self._fill_rounds(select=created)
@@ -1051,6 +1059,8 @@ class TrainingWidget(QWidget):
     def _on_hub_changed(self) -> None:
         hub = self.hub
         if self.project is not None and hub is not None and _same(getattr(hub, "root", None), self.project.root):
+            if self._reading_root is not None and not _same(self._reading_root, self.project.root):
+                return                                # another project is being opened here: that reading decides
             self.refresh_project()
 
     # ------------------------------------------------------------------ folders
@@ -1161,6 +1171,7 @@ class TrainingWidget(QWidget):
             return False
         self.last_manifest = None
         self.last_error = None
+        started_root = self.root
         engine = self._engine_chosen()
         where = "through the engine" if engine else "in this napari environment"
         self._status(f"exporting slices from {source} into {pairs_dir} {where} ...\n{settings.command(source, pairs_dir)}")
@@ -1178,7 +1189,8 @@ class TrainingWidget(QWidget):
             def job():
                 return T.export_slices(source, pairs_dir, settings)
         self._start_step("export", job, label=f"exporting training slices from {source.name}",
-                         returned=lambda manifest: self._on_exported(manifest, pairs_dir, source, settings),
+                         returned=lambda manifest: self._on_exported(manifest, pairs_dir, source, settings,
+                                                                     started_root),
                          what="export", engine=engine)
         return True
 
@@ -1186,14 +1198,16 @@ class TrainingWidget(QWidget):
         """The open project's (pack id, recipe id): its recipe's own interpreter on this computer runs its steps."""
         return (self.project.pack_id, self.project.recipe) if self.project is not None else None
 
-    def _in_view(self, folder) -> bool:
-        """Whether a step's folder belongs to what the dock works on now: any folder without a project, else a
-        folder inside the open project (another project may have been opened while the step ran)."""
-        return self.project is None or T.project_relative(self.project.root, folder) is not None
+    def _in_view(self, started_root) -> bool:
+        """Whether a step's pairs belong to what the dock works on now: no project is open now, or the one the step
+        started in (another project may have been opened while the step ran). A folder of the user's own, inside the
+        project or not, is in view."""
+        return self.project is None or _same(self.project.root, started_root)
 
-    def _on_exported(self, manifest, pairs_dir: Path, source: Path, settings: T.ExportSettings) -> None:
+    def _on_exported(self, manifest, pairs_dir: Path, source: Path, settings: T.ExportSettings,
+                     started_root=None) -> None:
         self.last_manifest = manifest
-        if not self._in_view(pairs_dir):
+        if not self._in_view(started_root):
             self._status(f"{T.export_summary(manifest, pairs_dir)}\nAnother project was opened meanwhile: open "
                          f"{pairs_dir} to see these pairs.", AMBER)
             return
@@ -1354,7 +1368,7 @@ class TrainingWidget(QWidget):
         if channel is not None:
             kw["channel"] = channel
         cmd = T.import_command(src, fmt, image, pairs, allow_pickle=allow, frame=frame, channel=channel)
-        engine, worker = self._engine_chosen(), self.runner
+        engine, worker, started_root = self._engine_chosen(), self.runner, self.root
         self.last_import = None
         self.last_error = None
         self._status(f"importing {Path(src).name} for {Path(image).name} into {pairs} ...\n{cmd}")
@@ -1364,14 +1378,15 @@ class TrainingWidget(QWidget):
             return runner.import_labels(src, fmt, image, pairs, should_stop=worker.should_stop, **kw)
 
         self._start_step("import", job, label=f"importing labels for {Path(image).name}",
-                         returned=lambda rec: self._on_imported(rec, Path(pairs), cmd), what="import", engine=engine)
+                         returned=lambda rec: self._on_imported(rec, Path(pairs), cmd, started_root), what="import",
+                         engine=engine)
         return True
 
-    def _on_imported(self, rec: dict, pairs_dir: Path, cmd: str) -> None:
+    def _on_imported(self, rec: dict, pairs_dir: Path, cmd: str, started_root=None) -> None:
         self.last_import = rec
         summary = T.import_summary(rec)
         color = AMBER if rec.get("warnings") else GREEN
-        if not self._in_view(pairs_dir):
+        if not self._in_view(started_root):
             self._status(f"{summary}\nAnother project was opened meanwhile: open {pairs_dir} to see these pairs.\n"
                          f"same as: {cmd}", AMBER)
             return

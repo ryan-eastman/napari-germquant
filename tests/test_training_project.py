@@ -729,3 +729,92 @@ def test_a_typed_import_image_survives_a_reading_of_the_project(make_napari_view
     hub.changed.emit()
     _settle(qtbot, w)
     assert w.image_combo.currentText() == "img_b"
+
+
+def test_an_export_into_a_folder_outside_the_project_opens_its_pairs(make_napari_viewer, qtbot, tmp_path):
+    """N1: with a project open, a training folder of the user's own (outside the project) is in view: the export's
+    and the import's pairs open there, and no other project is said to have been opened."""
+    root = write_project(tmp_path / "study", rounds=("r01",))
+    write_run(root / "results" / "img", "img", kind="3d")
+    runner = FakeTrainRunner()
+    viewer, w = _dock(make_napari_viewer, runner)
+    w.set_project(root)
+    _settle(qtbot, w)
+    w.set_pairs_dir(tmp_path / "scratch_pairs")             # Browse...: a folder of the user's own
+    assert w.export()
+    _settle(qtbot, w)
+    assert w.root == root and runner.called("export_training")
+    assert "Another project was opened meanwhile" not in w.status_label.text() and len(w.pairs) == 2
+    image = tmp_path / "img.ome.tif"
+    image.write_bytes(b"x")
+    w.set_labels_file(tmp_path / "masks.tif")
+    w.set_import_image(image)
+    assert w.import_labels()
+    _settle(qtbot, w)
+    assert "Another project was opened meanwhile" not in w.status_label.text() and len(w.pairs) == 3
+
+
+def test_a_project_opened_here_is_kept_when_the_project_dock_reads_its_own(make_napari_viewer, qtbot, tmp_path,
+                                                                           monkeypatch):
+    """N2: Open project... b while following the Project dock's a; the Project dock reads a again meanwhile (a Save
+    there, the end of a run): b's reading still decides, and the dock works in b."""
+    a = write_project(tmp_path / "a", rounds=("r01",))
+    b = write_project(tmp_path / "b")
+    hub = FakeHub()
+    viewer, w = _dock(make_napari_viewer, FakeTrainRunner(), hub)
+    hub.open(a)
+    _settle(qtbot, w)
+    assert w.root == a
+    gate = threading.Event()
+    real = T.read_project
+
+    def slow(root):
+        if Path(root) == b:
+            gate.wait(30)
+        return real(root)
+
+    monkeypatch.setattr(T, "read_project", slow)
+    w.set_project(b)
+    hub.changed.emit()
+    gate.set()
+    _settle(qtbot, w)
+    assert w.root == b
+
+
+class _HeldListing(FakeTrainRunner):
+    """A round listing (no --new) that reads the round folders when it starts and answers when the test lets it."""
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.hold = threading.Event()
+        self.started = threading.Event()
+        self.held = False
+
+    def project_rounds(self, root, *, new=None, plugin_version=None, should_stop=None) -> dict:
+        if new or not self.held:
+            return super().project_rounds(root, new=new, plugin_version=plugin_version, should_stop=should_stop)
+        d = Path(root) / "training"
+        rounds = sorted(p.name for p in d.iterdir() if p.is_dir())
+        self.started.set()
+        self.hold.wait(30)
+        return {"rounds": rounds, "created": None, "path": None}
+
+
+def test_a_listing_older_than_new_round_changes_nothing(make_napari_viewer, qtbot, tmp_path):
+    """N3: a round listing that started before New round and answers after it is dropped: the round just made
+    stays in the list and the folders stay on it."""
+    root = write_project(tmp_path / "study", rounds=("r01",))
+    hub, runner = FakeHub(), _HeldListing()
+    viewer, w = _dock(make_napari_viewer, runner, hub)
+    hub.open(root)
+    _settle(qtbot, w)
+    runner.held = True
+    (root / "training" / "r05").mkdir()                     # a round made in a terminal
+    hub.changed.emit()                                      # the folders differ: a listing starts
+    qtbot.waitUntil(runner.started.is_set, timeout=30_000)
+    assert w.new_round()                                    # meanwhile New round: the engine makes r02
+    qtbot.waitUntil(lambda: w.round_combo.currentText() == "r02", timeout=30_000)
+    runner.hold.set()                                       # the older listing answers now
+    _settle(qtbot, w)
+    assert w.rounds == ["r01", "r02", "r05"]
+    assert Path(w.pairs_edit.text()) == root / "training" / "r02"
