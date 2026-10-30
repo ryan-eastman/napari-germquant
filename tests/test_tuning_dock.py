@@ -36,7 +36,7 @@ from _p6_tune import (
 
 from napari_germquant import _settings, _tuning
 from napari_germquant._runner import plugin_version
-from napari_germquant._tuning_widget import SpotTuningWidget
+from napari_germquant._tuning_widget import AMBER, GREEN, SpotTuningWidget, css
 
 WAIT = 60_000
 
@@ -213,16 +213,44 @@ def test_apply_goes_through_the_engine_with_the_plugin_version_and_the_project_r
     assert kw == {"project": str(tproj), "run_dir": str(run), "plugin_version": plugin_version()}
     assert TUNED_HASH in w.last_message and "validated: false" in w.last_message
     assert BASE_HASH in w.last_message                       # the images run with the earlier config are named stale
+    assert "warning" not in w.last_message and w.message_label.styleSheet() == css(GREEN)
     assert hub.reloads == 1                                   # the Project dock reads the project again
     assert read_manifest(tproj)["recipe"]["expected_config_hash"] == TUNED_HASH
     by = {r.image_id: r for r in w.rows}                     # the dock read it again too
     assert by["img_a"].stale and "stale" in by["img_a"].text and TUNED_HASH in by["img_a"].text
+    # the engine's warning of an Apply (the recipe changed after the tuning run's images were run; the write still
+    # happened) is shown, in amber, in either form the runner gives it: a WARNING: line, or the --json "warnings"
+    note = "20261024T100000Z_0000aaaa: its images were run with config 02bb83cf74f9, and the recipe is now ..."
+    fake.apply_warning_lines = [f"WARNING: {note}"]
+    assert w.apply()
+    _settle(qtbot, w)
+    assert "unchanged" in w.last_message and f"warning: {note}" in w.last_message
+    assert w.message_label.styleSheet() == css(AMBER) and hub.reloads == 2
+    fake.apply_warnings = [note]                             # both forms at once: shown once
+    assert w.apply()
+    _settle(qtbot, w)
+    assert w.last_message.count(f"warning: {note}") == 1 and w.message_label.styleSheet() == css(AMBER)
+    fake.apply_warning_lines = []
+    assert w.apply()
+    _settle(qtbot, w)
+    assert w.last_message.count(f"warning: {note}") == 1
+    # whether the project reads validated is the manifest's record after the write (an Apply that takes the
+    # recipe back to the pack's own setting leaves a validated pack recipe validated)
+    fake.apply_warnings = []
+    fake.new_hash = BASE_HASH
+    fake.apply_validated = {"value": True, "why": "validated: the record passes",
+                            "record": "packs/test_pack/0.1.0/validation/basic.json"}
+    assert w.apply()
+    _settle(qtbot, w)
+    assert f"config_hash {BASE_HASH} (validated: true, record packs/test_pack/0.1.0/validation/basic.json)" \
+        in w.last_message
     # a refused apply writes nothing and shows the engine's reason
     fake.apply_refusal = "best.yaml sets ['spots.log.diameter_um'], which the run's grid does not search"
     before = (tproj / "recipe.yaml").read_bytes()
+    reloads = hub.reloads
     assert w.apply()
     _settle(qtbot, w)
-    assert "which the run's grid does not search" in w.last_message and hub.reloads == 1
+    assert "which the run's grid does not search" in w.last_message and hub.reloads == reloads
     assert (tproj / "recipe.yaml").read_bytes() == before
 
 

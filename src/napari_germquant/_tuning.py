@@ -632,12 +632,37 @@ def objective_text(best: dict | None, record: dict) -> str:
     return f"ranked by {text}" if text else ""
 
 
-def applied_text(new_hash: str | None, old_hash: str | None) -> str:
-    """What an Apply did, as the dock says it."""
+def validated_text(validated) -> str:
+    """The manifest's validated record ({value, why, record}) as the dock says it."""
+    if not isinstance(validated, dict) or not isinstance(validated.get("value"), bool):
+        return "validated: not read (germquant_project.yaml could not be read after the write)"
+    if validated["value"]:
+        return "validated: true" + (f", record {validated['record']}" if validated.get("record") else "")
+    return "validated: false"
+
+
+def applied_text(new_hash: str | None, old_hash: str | None, validated=None) -> str:
+    """What an Apply did, as the dock says it: the new config hash, whether the project reads validated (the
+    manifest's record after the write, ``validated``) and which images turn stale."""
     if new_hash and old_hash and new_hash == old_hash:
         return f"applied: config_hash {new_hash}, unchanged (the recipe already holds this setting)"
     stale = f"; the images run with {old_hash} are stale until they are run again" if old_hash else ""
-    return f"applied: config_hash {new_hash or 'not reported'} (validated: false){stale}"
+    return f"applied: config_hash {new_hash or 'not reported'} ({validated_text(validated)}){stale}"
+
+
+def apply_warnings(rec) -> list[str]:
+    """The warnings of an Apply's record, each once and in order: the command's ``warnings`` (its --json
+    record) and its ``WARNING:`` lines (the engine prints each TuningWarning so: the recipe changed after the
+    tuning run's images were run, and the write still happened)."""
+    if not isinstance(rec, dict):
+        return []
+    raw = rec.get("warnings") or []
+    notes = [str(w).strip() for w in ([raw] if isinstance(raw, str) else raw)]
+    for line in rec.get("lines") or []:
+        text = str(line).strip()
+        if text.startswith("WARNING:"):
+            notes.append(text.split(":", 1)[1].strip())
+    return list(dict.fromkeys(n for n in notes if n))
 
 
 # ---------------------------------------------------------------------------------------------------

@@ -21,8 +21,9 @@ What it shows, top to bottom:
 * Result: the project's tuning runs (newest first), the top five rows of the selected run's ranked.csv (the
   columns the engine writes, the objective named), its best setting and warnings, and Apply, which runs
   ``germquant tune-spots --project DIR --apply tuning/<run>`` through the engine with the plugin version (D42).
-  The project's config_hash then changes, it reads validated: false, its images turn stale, and the Project dock
-  reads it again.
+  The project's config_hash then changes, the message says whether it reads validated (the manifest after the
+  write) and shows the engine's warnings of the Apply in amber, its images turn stale, and the Project dock reads
+  it again.
 
 Tune and Apply wait while a run of the project goes, and Tune while truth points are not saved. The GUI thread
 never waits: the engine's calls go to one thread worker, the file reads and the Save to another. An image opening,
@@ -960,14 +961,26 @@ class SpotTuningWidget(QWidget):
 
         def job(should_stop):
             runner = self.session.require(_tuning.FEATURE, should_stop=should_stop)
-            return runner.tune_apply(str(root), str(run), plugin_version=version, should_stop=should_stop)
+            rec = runner.tune_apply(str(root), str(run), plugin_version=version, should_stop=should_stop)
+            try:                                      # what the write left: the hash and whether it reads validated
+                manifest = _tuning.read_manifest(root)
+            except _tuning.TuningError:
+                manifest = None
+            return rec, manifest
 
-        def done(rec):
+        def done(res):
+            rec, manifest = res
             self.last_apply = rec
-            new = rec.get("config_hash") if isinstance(rec, dict) else None
-            text = _tuning.applied_text(new, old)
+            record = rec if isinstance(rec, dict) else {}
+            new = record.get("config_hash") or (_tuning.project_hash(manifest) if manifest else None)
+            text = _tuning.applied_text(new, old, (manifest or {}).get("validated"))
             owned = self._owns(root)
-            self._message(text if owned else f"{root}: {text}", GREEN)    # the write happened either way
+            if not owned:                             # the write happened either way
+                text = f"{root}: {text}"
+            notes = _tuning.apply_warnings(record)    # the engine's TuningWarning: the write still happened
+            if notes:
+                text += "\n" + "\n".join(f"warning: {n}" for n in notes)
+            self._message(text, AMBER if notes else GREEN)
             hub = self.hub
             if hub is not None and _same(getattr(hub, "root", None), root):
                 hub.request_reload()

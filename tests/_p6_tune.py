@@ -215,7 +215,10 @@ class FakeTuneRunner(EngineRunner):
     ``apply_refusal`` (a text) make the call refused (EngineRefused, exit 2), ``tune_error`` a failed search
     (RunnerError); ``scored_nothing`` a search that ran but scored nothing (best None); ``gate`` (a
     threading.Event) holds tune_spots until it is set, or until should_stop asks (then RunCancelled);
-    ``new_hash`` is the config hash an apply writes."""
+    ``new_hash`` is the config hash an apply writes. An apply's warnings come as the engine gives them:
+    ``apply_warnings`` in the record's "warnings" (the command's --json record), ``apply_warning_lines`` as
+    "WARNING: ..." lines among its "lines" (the line form); ``apply_validated`` is the validated record the
+    apply leaves in the manifest (None: the manifest's own). ``cancellable`` can be set per engine."""
 
     kind = "fake"
     via = "gui-subprocess"
@@ -236,6 +239,9 @@ class FakeTuneRunner(EngineRunner):
         self.threads: list[str] = []
         self.rows = ranked_rows()
         self.best = {GRID_KEY: 1.5}
+        self.apply_warnings: list[str] = []
+        self.apply_warning_lines: list[str] = []
+        self.apply_validated: dict | None = None
 
     def describe(self) -> str:
         return "a fake engine (tests/_p6_tune.py)"
@@ -290,8 +296,14 @@ class FakeTuneRunner(EngineRunner):
         m["recipe"].update({"file": "recipe.yaml", "expected_config_hash": self.new_hash,
                             "origins": {k: "tuning" for k in best["keys"]}})
         m["saved"] = stamp(plugin_version)
+        if self.apply_validated is not None:
+            m["validated"] = dict(self.apply_validated)
         (root / MANIFEST).write_bytes(yaml.safe_dump(m, sort_keys=False, allow_unicode=False).encode("ascii"))
-        return {"config_hash": self.new_hash, "exit_code": 0, "lines": [f"applied {run_dir}: config_hash {self.new_hash}"]}
+        lines = [*self.apply_warning_lines, f"applied {run_dir}: config_hash {self.new_hash}"]
+        rec = {"config_hash": self.new_hash, "exit_code": 0, "lines": lines}
+        if self.apply_warnings:
+            rec["warnings"] = list(self.apply_warnings)
+        return rec
 
     def release(self) -> None:
         if self.gate is not None:
