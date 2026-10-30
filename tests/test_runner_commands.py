@@ -128,6 +128,9 @@ def test_one_method_per_command_builds_the_documented_command_line(standin, tmp_
     r.import_labels("seg.npz", "cellacdc-npz", "img.ome.tif", "pairs", allow_pickle=True, frame=2)
     assert last("germquant") == ["import-labels", "seg.npz", "--format", "cellacdc-npz", "--image", "img.ome.tif",
                                  "--pairs", "pairs", "--allow-pickle", "--frame", "2", "--json"]
+    r.import_labels("seg.npz", "cellacdc-npz", "img.ome.tif", "pairs", channel="Cy3 RAD-51")
+    assert last("germquant") == ["import-labels", "seg.npz", "--format", "cellacdc-npz", "--image", "img.ome.tif",
+                                 "--pairs", "pairs", "--channel", "Cy3 RAD-51", "--json"]
     with pytest.raises(ValueError, match="format"):
         r.import_labels("seg.zip", "zip", "img.ome.tif", "pairs")
     said: list[str] = []
@@ -341,6 +344,9 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
     assert r.import_labels("seg.npz", "cellacdc-npz", "img.tif", "pairs", frame=1) == {"pairs": 2}
     assert calls[-1] == ("import_labels", ("seg.npz", "cellacdc-npz", "img.tif", "pairs"),
                          {"allow_pickle": False, "frame": 1})
+    assert r.import_labels("seg.npz", "cellacdc-npz", "img.tif", "pairs", channel=1) == {"pairs": 2}
+    assert calls[-1] == ("import_labels", ("seg.npz", "cellacdc-npz", "img.tif", "pairs"),
+                         {"allow_pickle": False, "channel": 1})
     assert r.tune_spots(P, grid="g.yaml")["run_dir"] == "tuning/t1"
     assert calls[-1][2] == {"points": "annotations", "grid": "g.yaml", "out": None, "max_runs": 50}
     assert r.tune_apply(P, "tuning/t1")["config_hash"] == "fedcba987654"

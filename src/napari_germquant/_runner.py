@@ -771,7 +771,9 @@ class EngineRunner:
         raise NotImplementedError
 
     def import_labels(self, src, fmt: str, image, pairs, *, allow_pickle: bool = False, frame: int | None = None,
-                      should_stop=None) -> dict:
+                      channel=None, should_stop=None) -> dict:
+        """``import-labels``: the engine's record (plan 9.4 #11). ``channel``: the image channel the labels were
+        drawn on, an index or a name (``--channel``), passed only when set."""
         raise NotImplementedError
 
     def export_training(self, results, out, *, orientations=None, slices_per_image: int | None = None,
@@ -1205,13 +1207,16 @@ class InProcessRunner(EngineRunner):
             _write_atomic(out, str(text).encode("utf-8"))
         return {"text": str(text), "out": str(out) if out is not None else None}
 
-    def import_labels(self, src, fmt, image, pairs, *, allow_pickle=False, frame=None, should_stop=None) -> dict:
+    def import_labels(self, src, fmt, image, pairs, *, allow_pickle=False, frame=None, channel=None,
+                      should_stop=None) -> dict:
         self._start(should_stop, "import_labels")
         if fmt not in IMPORT_FORMATS:
             raise ValueError(f"not an import format: {fmt!r} (one of {', '.join(IMPORT_FORMATS)})")
         kw = {"allow_pickle": bool(allow_pickle)}
         if frame is not None:
             kw["frame"] = int(frame)
+        if channel is not None:
+            kw["channel"] = channel
         return _jsonable(self._api_call(self._api("import_labels"), src, fmt, image, pairs, **kw))
 
     def export_training(self, results, out, *, orientations=None, slices_per_image=None, seed=None,
@@ -1846,7 +1851,8 @@ class SubprocessRunner(EngineRunner):
                 pass                                  # no file after all: what the engine printed
         return {"text": text, "out": str(out) if out is not None else None}
 
-    def import_labels(self, src, fmt, image, pairs, *, allow_pickle=False, frame=None, should_stop=None) -> dict:
+    def import_labels(self, src, fmt, image, pairs, *, allow_pickle=False, frame=None, channel=None,
+                      should_stop=None) -> dict:
         self._start(should_stop, "import_labels")
         if fmt not in IMPORT_FORMATS:
             raise ValueError(f"not an import format: {fmt!r} (one of {', '.join(IMPORT_FORMATS)})")
@@ -1855,6 +1861,8 @@ class SubprocessRunner(EngineRunner):
             args.append("--allow-pickle")
         if frame is not None:
             args += ["--frame", int(frame)]
+        if channel is not None:
+            args += ["--channel", channel]
         return self._command_json(self.engine_argv(*args, "--json"), should_stop=should_stop)
 
     def export_training(self, results, out, *, orientations=None, slices_per_image=None, seed=None,
