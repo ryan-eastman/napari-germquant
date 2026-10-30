@@ -692,8 +692,12 @@ def test_the_label_image_is_decoded_once_while_its_file_stays_the_same(tmp_path,
         _tuning.forget_labels()
 
 
-def test_the_projected_box_is_kept_for_each_truth_layer(make_napari_viewer, qtbot, tproj, fake):
+def test_the_projected_box_is_kept_for_each_truth_layer(make_napari_viewer, qtbot, tproj, fake, monkeypatch):
+    """The box belongs to the selected image's truth layer, and a box changed since its points were saved is not
+    saved yet. The points are saved through a stand-in writer, so the test needs no germquant.tune."""
     standard_project(tproj)
+    monkeypatch.setattr(_tuning, "points_problem", lambda: None)
+    monkeypatch.setattr(_tuning, "save_truth", lambda meta, data, projected: Path(meta["file"]))
     viewer = make_napari_viewer()
     w = _dock(qtbot, viewer, runner=fake)
     w.set_annotator("tester")
@@ -702,11 +706,15 @@ def test_the_projected_box_is_kept_for_each_truth_layer(make_napari_viewer, qtbo
         assert w.open_image(image_id)
         _settle(qtbot, w)
     assert w.select_image("img_a") and not w.projected_check.isChecked()
+    w.truth_layer("img_a").add(np.array([[1.0, 2.0, 2.4]]))
+    assert w.save_points()
+    _settle(qtbot, w)
+    assert w.unsaved_images() == [] and "saved" in w.points_label.text() and "not saved" not in w.points_label.text()
     w.set_projected(True)
     assert w.truth_layer("img_a").metadata[_tuning.LAYER_KEY]["box"] is True
     assert w.select_image("img_b") and not w.projected_check.isChecked()    # img_b's own box
     assert w.select_image("img_a") and w.projected_check.isChecked()        # img_a's tick was kept
-    assert w.unsaved_images() == ["img_a"]                                 # a changed box is not saved yet
+    assert w.unsaved_images() == ["img_a"] and "box changed, not saved" in w.points_label.text()
     assert not w.tune() and "Save the truth points of img_a first" in w.last_message
     assert w.select_image("img_c") and not w.projected_check.isEnabled()    # no truth layer, no box
 
