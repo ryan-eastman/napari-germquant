@@ -106,6 +106,7 @@ LEVELS = {"ok": GREEN, "warn": AMBER, "edited": AMBER, "bad": RED, None: None}
 # The dock's tabs after Images, Samples and Run: (title, "module:Class"), each class a ProjectTab subclass made with
 # the dock. Unit P6-RECIPE registers its Recipe tab (role editor and parameter form) here with one line.
 EXTRA_TABS: list[tuple[str, str]] = [
+    ("Recipe", "napari_germquant._recipe_widget:RecipeProjectTab"),
 ]
 
 BOARD_COLUMNS = ("Image", "Status", "qc_pass", "nuclei", "spots", "Last run", "Device")
