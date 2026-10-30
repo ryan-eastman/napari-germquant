@@ -68,6 +68,59 @@ def test_without_an_engine_the_dock_computes_in_this_napari_environment(make_nap
     assert not w.use_btn.isEnabled() and not w.derive_btn.isEnabled()
 
 
+def test_an_engine_chosen_in_another_dock_is_shown_before_the_next_step(make_napari_viewer, qtbot, tmp_path,
+                                                                       monkeypatch):
+    """The engine choice is per computer: stored by another dock while this one is open, the next step goes there,
+    and the engine line says so first (never a silent switch)."""
+    from napari_germquant import _settings
+
+    tree = tmp_path / "results"
+    write_run(tree / "a", "a", kind="3d")
+    seen: list = []
+
+    def export_training(self, results, out, **kw):
+        seen.append(kw)
+        write_pairs(out, "a", 2)
+        return {"exit_code": 0, "lines": []}
+
+    from napari_germquant._runner import InProcessRunner
+
+    monkeypatch.setattr(InProcessRunner, "export_training", export_training)
+    viewer = make_napari_viewer()
+    w = TrainingWidget(viewer)
+    assert w.engine_route() == "napari" and "No engine chosen" in w.engine_label.text()
+    _settings.set_engine_choice(_settings.INPROCESS)       # chosen in the Run dock, say
+    w.set_source(tree)
+    w.set_pairs_dir(tmp_path / "pairs")
+    _settle(qtbot, w)
+    assert w.export()
+    _settle(qtbot, w)
+    assert w.engine_route() == "engine" and len(seen) == 1           # the engine runner's export, not the dock's
+    assert "No engine chosen" not in w.engine_label.text() and "in process" in w.engine_label.text()
+    assert len(w.pairs) == 2
+
+
+def test_a_step_that_returns_after_another_project_opened_leaves_its_folders(make_napari_viewer, qtbot, tmp_path):
+    a = write_project(tmp_path / "a", rounds=("r01",))
+    b = write_project(tmp_path / "b")
+    write_run(a / "results" / "img", "img", kind="3d")
+    runner = FakeTrainRunner()
+    runner.gates["export_training"] = threading.Event()
+    runner.entered["export_training"] = threading.Event()
+    viewer, w = _dock(make_napari_viewer, runner)
+    w.set_project(a)
+    _settle(qtbot, w)
+    assert Path(w.pairs_edit.text()) == a / "training" / "r01"
+    assert w.export()
+    qtbot.waitUntil(lambda: runner.entered["export_training"].is_set(), timeout=30_000)
+    w.set_project(b)                                       # the files worker reads b while a's export waits
+    qtbot.waitUntil(lambda: w.root == b, timeout=30_000)
+    runner.gates["export_training"].set()
+    _settle(qtbot, w)
+    assert w.root == b and w.pairs_edit.text() == "" and w.pairs == []
+    assert "Another project was opened meanwhile" in w.status_label.text() and str(a) in w.status_label.text()
+
+
 def test_with_an_engine_the_dock_offers_the_engines_devices(make_napari_viewer, qtbot):
     runner = FakeTrainRunner(available={"cuda": True, "mps": False})
     viewer, w = _dock(make_napari_viewer, runner)

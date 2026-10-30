@@ -240,6 +240,7 @@ class TrainingWidget(QWidget):
         self._channels_req = 0
         self._channels: list[str] = []
         self._job_cancellable = False
+        self._known_choice = _settings.engine_choice()  # the engine choice the engine line shows
         self._build()
         self._update_buttons()
         try:
@@ -250,7 +251,7 @@ class TrainingWidget(QWidget):
             self.hub.opened.connect(self._on_hub_opened)
             self.hub.closed.connect(self._on_hub_closed)
             self.hub.changed.connect(self._on_hub_changed)
-            self.hub.running_changed.connect(lambda _running: self._update_buttons())
+            self.hub.running_changed.connect(self._on_hub_running)
         self._show_engine()
         self._show_project()
         if self._engine_chosen():
@@ -687,6 +688,7 @@ class TrainingWidget(QWidget):
     def _on_engine_checked(self, result) -> None:
         _runner, devices, problem = result
         self.engine_error = None
+        self._known_choice = _settings.engine_choice()
         self._engine_devices = list(devices) if devices else ["auto", "cpu"]
         self._fill_engine_devices()
         self._show_engine(problem)
@@ -701,7 +703,16 @@ class TrainingWidget(QWidget):
         self._fill_napari_devices()
         self._show_engine()
 
+    def _sync_engine(self) -> None:
+        """Another dock may have stored another engine for this computer since the engine line was shown: show it
+        (and check it) before a step goes there. A step's status says where it runs either way."""
+        choice = _settings.engine_choice()
+        if choice != self._known_choice:
+            self._known_choice = choice
+            self._on_session_changed()
+
     def _on_session_changed(self) -> None:
+        self._known_choice = _settings.engine_choice()
         if self._engine_chosen():
             self._check_engine()
         else:
@@ -965,6 +976,7 @@ class TrainingWidget(QWidget):
         if self.runner.busy:
             self._status("the dock is busy; wait for the current step to finish", AMBER)
             return False
+        self._sync_engine()
         root, engine, worker = self.project.root, self._engine_chosen(), self.runner
         self.last_error = None
         self._start_step("round", lambda: self._job_runner("projects", engine=engine, should_stop=worker.should_stop)
@@ -1020,6 +1032,9 @@ class TrainingWidget(QWidget):
         # the Project dock's project, open here or still being read: closed with it; one opened here stays
         if self._following_hub or (self._hub_reading is not None and self._hub_reading == self._reading):
             self.close_project()
+
+    def _on_hub_running(self, _running: bool) -> None:
+        self._update_buttons()
 
     def _on_hub_changed(self) -> None:
         hub = self.hub
@@ -1106,6 +1121,7 @@ class TrainingWidget(QWidget):
         if self.runner.busy:
             self._status("the dock is busy; wait for the current step to finish", AMBER)
             return False
+        self._sync_engine()
         source = Path(self._clean(self.source_edit.text()))
         pairs = self._clean(self.pairs_edit.text())
         if not self._clean(self.source_edit.text()) or not source.is_dir():
@@ -1158,8 +1174,17 @@ class TrainingWidget(QWidget):
         """The open project's (pack id, recipe id): its recipe's own interpreter on this computer runs its steps."""
         return (self.project.pack_id, self.project.recipe) if self.project is not None else None
 
+    def _in_view(self, folder) -> bool:
+        """Whether a step's folder belongs to what the dock works on now: any folder without a project, else a
+        folder inside the open project (another project may have been opened while the step ran)."""
+        return self.project is None or T.project_relative(self.project.root, folder) is not None
+
     def _on_exported(self, manifest, pairs_dir: Path, source: Path, settings: T.ExportSettings) -> None:
         self.last_manifest = manifest
+        if not self._in_view(pairs_dir):
+            self._status(f"{T.export_summary(manifest, pairs_dir)}\nAnother project was opened meanwhile: open "
+                         f"{pairs_dir} to see these pairs.", AMBER)
+            return
         if self.is_dirty():
             # edits made while the export ran are never thrown away: the new pairs open on request
             self._status(f"{T.export_summary(manifest, pairs_dir)}\nThe slice shown has unsaved edits: save or revert "
@@ -1293,6 +1318,7 @@ class TrainingWidget(QWidget):
         if self.runner.busy:
             self._status("the dock is busy; wait for the current step to finish", AMBER)
             return False
+        self._sync_engine()
         src = self._clean(self.labels_edit.text())
         fmt = self.format_combo.currentData()
         image = self._import_image()
@@ -1333,6 +1359,10 @@ class TrainingWidget(QWidget):
         self.last_import = rec
         summary = T.import_summary(rec)
         color = AMBER if rec.get("warnings") else GREEN
+        if not self._in_view(pairs_dir):
+            self._status(f"{summary}\nAnother project was opened meanwhile: open {pairs_dir} to see these pairs.\n"
+                         f"same as: {cmd}", AMBER)
+            return
         if self.is_dirty():
             self._status(f"{summary}\nThe slice shown has unsaved edits: save or revert them, then press Open training "
                          f"folder.\nsame as: {cmd}", AMBER)
@@ -1565,6 +1595,7 @@ class TrainingWidget(QWidget):
         if self.runner.busy:
             self._status("the dock is busy; wait for the current step to finish", AMBER)
             return False
+        self._sync_engine()
         pairs_text = self._clean(self.pairs_edit.text())
         if not pairs_text or not Path(pairs_text).is_dir():
             self._status("choose a training folder with slice pairs", RED)
@@ -1713,6 +1744,7 @@ class TrainingWidget(QWidget):
         if self.runner.busy:
             self._status("the dock is busy; wait for the current step to finish", AMBER)
             return False
+        self._sync_engine()
         if self._running():
             self._status("a run of this project is going: Use in project changes its recipe, so it waits until the "
                          "run has finished", AMBER)
@@ -1767,6 +1799,7 @@ class TrainingWidget(QWidget):
         if self.runner.busy:
             self._status("the dock is busy; wait for the current step to finish", AMBER)
             return False
+        self._sync_engine()
         got = self._project_model()
         if got is None:
             return False
