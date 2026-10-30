@@ -240,6 +240,20 @@ def test_an_engine_without_projects_gets_one_message_and_the_folders_stay_free(m
     assert Path(w.source_edit.text()) == root / "results" and w.pairs_edit.isEnabled()
 
 
+def test_a_step_the_engine_cannot_do_gets_its_one_message(make_napari_viewer, qtbot, tmp_path):
+    runner = FakeTrainRunner(features={"packs"})
+    viewer, w = _dock(make_napari_viewer, runner)
+    _settle(qtbot, w)
+    w.set_labels_file(tmp_path / "masks.tif")
+    w.set_import_image(tmp_path / "img.ome.tif")
+    w.set_pairs_dir(tmp_path / "pairs")
+    assert w.import_labels()
+    _settle(qtbot, w)
+    text = w.status_label.text()
+    assert "Importing labels needs the tranche-5 Train B engine" in text and "FAILED" not in text
+    assert w.last_import is None and not runner.called("import_labels")
+
+
 def test_a_reading_that_returns_after_the_project_closed_changes_nothing(make_napari_viewer, qtbot, tmp_path):
     root = write_project(tmp_path / "study", rounds=("r01",))
     runner = FakeTrainRunner()

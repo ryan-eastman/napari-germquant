@@ -1873,6 +1873,11 @@ class TrainingWidget(QWidget):
             self._status(f"{what} cancelled: {exc}", AMBER)
             set_viewer_status(self.viewer, f"germquant {what} cancelled")
             return
+        if isinstance(exc, (FeatureMissing, EngineNotChosen)):
+            # the one message of an engine without the feature (or of no engine): what to do, nothing failed
+            self._status(f"{what}: {exc}", RED)
+            set_viewer_status(self.viewer, f"germquant {what}: the engine cannot do this")
+            return
         if isinstance(exc, EngineRefused):
             self._status(f"{what} refused by the engine:\n{exc}", RED)
         elif isinstance(exc, RunnerError):
