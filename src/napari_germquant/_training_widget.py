@@ -705,6 +705,13 @@ class TrainingWidget(QWidget):
         self._fill_napari_devices()
         self._show_engine()
 
+    def _session_error(self) -> str | None:
+        """Why the engine stored now cannot be used, when the session's check of it failed (never starts one)."""
+        try:
+            return self.session.error()
+        except Exception:  # noqa: BLE001 - a session that cannot say has no recorded failure
+            return None
+
     def _sync_engine(self) -> None:
         """Another dock may have stored another engine for this computer since the engine line was shown: show it
         (and check it) before a step goes there. A step's status says where it runs either way."""
@@ -719,6 +726,12 @@ class TrainingWidget(QWidget):
         if self._engine_chosen():
             if self.session.runner() is None:
                 self._device_list = "stale"           # another engine, not checked yet: its devices are unknown
+                failed = self._session_error()
+                if failed:
+                    # the check of the engine stored now has failed: a failed check makes the session emit changed,
+                    # so checking again here would loop; the next step, or another choice, checks it again
+                    self._on_engine_failed(RunnerError(failed))
+                    return
             self._check_engine()
         else:
             self.engine_error = None

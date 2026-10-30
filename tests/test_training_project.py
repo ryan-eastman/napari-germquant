@@ -29,7 +29,7 @@ from _p6_train import (
 )
 
 from napari_germquant import _training as T
-from napari_germquant._runner import plugin_version
+from napari_germquant._runner import RunnerError, plugin_version
 from napari_germquant._training_widget import TrainingWidget
 
 AMBER = "rgb(225, 160, 40)"
@@ -818,3 +818,30 @@ def test_a_listing_older_than_new_round_changes_nothing(make_napari_viewer, qtbo
     _settle(qtbot, w)
     assert w.rounds == ["r01", "r02", "r05"]
     assert Path(w.pairs_edit.text()) == root / "training" / "r02"
+
+
+class _BrokenEngine(FakeTrainRunner):
+    """A stored interpreter that is no usable engine: its version check fails (a moved .venv, another Python)."""
+
+    checks = 0
+
+    def version(self, refresh: bool = False, should_stop=None) -> dict:
+        type(self).checks += 1
+        time.sleep(0.05)
+        raise RunnerError("not a germquant engine: python -m germquant.packs --version failed (exit 1)")
+
+
+def test_a_stored_engine_whose_check_fails_is_checked_once(qtbot, monkeypatch):
+    """A failed check makes the engine session emit changed: the dock shows why and checks again only at the next
+    step or another choice, never in a loop (each check starts an engine process)."""
+    from napari_germquant import _engine_session, _settings
+
+    monkeypatch.setattr(_BrokenEngine, "checks", 0)
+    monkeypatch.setattr(_engine_session.EngineSession, "_make", lambda self, choice: _BrokenEngine())
+    _settings.set_engine_choice("C:/moved/.venv/Scripts/python.exe")
+    w = TrainingWidget(None, hub=FakeHub())
+    _settle(qtbot, w, timeout=10_000)                       # a loop keeps the dock busy: never idle
+    qtbot.wait(1000)                                        # and would have checked about 20 times more by now
+    assert w.idle and _BrokenEngine.checks == 1
+    assert "cannot be used" in w.engine_label.text() and "not a germquant engine" in w.engine_label.text()
+    assert w.engine_route() == "engine"                     # still the stored choice: never napari silently
