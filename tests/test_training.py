@@ -401,3 +401,217 @@ def test_undo_after_paging_does_not_carry_a_stroke_into_the_next_pair(make_napar
     lab.redo()
     assert np.array_equal(lab.data, expected) and not w.is_dirty()
     assert lab.editable
+
+
+# ---- acceptance 6 of the tranche-5 Train B plan (unit P6-TRAIN): import, export, train, use, derive ---------------
+# The real engine through its runners: each test needs a Train B feature and skips naming it (conftest.need_features)
+# while the engine lacks it. The helpers live in tests/_p6_train.py; tests/test_training_project.py runs the dock's
+# project mode against a fake engine.
+
+def _boxes(shape=(12, 64, 96), n_rows=2, n_cols=3) -> np.ndarray:
+    """(Z, Y, X) labels of the test pack example's grid: six boxes over planes 2 to 9, so an xy slice cuts six
+    objects (enough for the engine's min_train_masks of 5), an xz slice three and a yz slice two."""
+    lab = np.zeros(shape, np.int32)
+    k = 1
+    for r in range(n_rows):
+        for c in range(n_cols):
+            y0, x0 = 8 + r * 28, 8 + c * 30
+            lab[2:10, y0:y0 + 16, x0:x0 + 18] = k
+            k += 1
+    return lab
+
+
+def _round_trip_dock(make_napari_viewer, runner, hub=None):
+    from _p6_train import FakeHub, StaticSession
+
+    viewer = make_napari_viewer()
+    # the devices as an engine without a GPU lists them: its runtime probe would import torch in one more child
+    return TrainingWidget(viewer, session=StaticSession(runner, devices=["auto", "cpu"]),
+                          hub=hub if hub is not None else FakeHub())
+
+
+def _settled(qtbot, w, timeout: int = 300_000) -> None:
+    qtbot.waitUntil(lambda: w.idle, timeout=timeout)
+
+
+@pytest.mark.parametrize("route", ["inprocess", "subprocess"])
+def test_import_cellacdc_and_seg_npy_create_pairs(make_napari_viewer, qtbot, tmp_path, route):
+    """Labels made elsewhere join a training folder through `germquant import-labels`, run by the engine runner of
+    either kind: a Cell-ACDC segm.npz (read without unpickling) and a Cellpose _seg.npy, which the engine refuses
+    until the dock's "Allow pickle" box is ticked. The pairs carry the source import:<tool>, the dock opens them, and
+    it shows the engine's warnings (the channel it took)."""
+    import shutil
+    import sys
+
+    from conftest import TEST_IMAGE, need_features
+
+    from napari_germquant._runner import InProcessRunner, SubprocessRunner
+
+    runner = InProcessRunner() if route == "inprocess" else SubprocessRunner(sys.executable)
+    need_features("import_labels", have=None if route == "inprocess" else runner.features())
+    image = tmp_path / TEST_IMAGE.name                           # 2 channels, 12 planes of 64 x 96
+    shutil.copyfile(TEST_IMAGE, image)
+    lab = _boxes()
+    npz = tmp_path / "test_pack_synthetic_segm.npz"
+    np.savez_compressed(npz, lab)
+    seg = tmp_path / "test_pack_synthetic_seg.npy"
+    np.save(seg, np.array({"masks": lab, "outlines": np.zeros_like(lab)}, dtype=object), allow_pickle=True)
+    pairs = tmp_path / "pairs"
+
+    w = _round_trip_dock(make_napari_viewer, runner)
+    _settled(qtbot, w)
+    w.set_pairs_dir(pairs)
+    w.set_import_image(image)
+    w.set_labels_file(npz)
+    assert w.format_combo.currentData() == "cellacdc-npz" and not w.pickle_check.isEnabled()
+    assert w.import_labels()
+    _settled(qtbot, w)
+    rec = w.last_import
+    assert rec is not None, w.status_label.text()
+    assert (rec["format"], rec["source"], rec["dims"], rec["n_objects"]) == ("cellacdc-npz", "import:cellacdc", "3d", 6)
+    manifest = pd.read_csv(pairs / "manifest.csv")
+    assert set(manifest["source"]) == {"import:cellacdc"} and set(manifest["orientation"]) <= {"xy", "xz", "yz"}
+    assert len(manifest) == rec["n_pairs"] > 0 and len(w.pairs) == rec["n_pairs"]
+    assert any("channel 0" in x for x in rec["warnings"]) and "channel 0" in w.status_label.text()
+
+    # a Cellpose _seg.npy is a pickle: refused without the box, nothing written (the engine's own refusal, here in
+    # process; through the subprocess runner the dock shows the engine's REFUSED line the same way, which
+    # tests/test_training_project.py and the runner's tests pin, so that route spends no engine start on it)
+    w.set_labels_file(seg)
+    assert w.format_combo.currentData() == "cellpose-npy" and w.pickle_check.isEnabled()
+    assert not w.pickle_check.isChecked() and T.PICKLE_WARNING in w.pickle_label.text()
+    if route == "inprocess":
+        before = (pairs / "manifest.csv").read_bytes()
+        assert w.import_labels()
+        _settled(qtbot, w)
+        assert w.last_import is None and "--allow-pickle" in w.status_label.text()
+        assert (pairs / "manifest.csv").read_bytes() == before
+    # with the box ticked it is read (the same image id: its rows are replaced), and the engine says it unpickled
+    w.pickle_check.setChecked(True)
+    assert w.import_labels()
+    _settled(qtbot, w)
+    rec = w.last_import
+    assert rec is not None, w.status_label.text()
+    assert (rec["format"], rec["source"]) == ("cellpose-npy", "import:cellpose") and rec["replaced"] > 0
+    assert any(T.PICKLE_WARNING in x for x in rec["warnings"]) and T.PICKLE_WARNING in w.status_label.text()
+    manifest = pd.read_csv(pairs / "manifest.csv")
+    assert set(manifest["source"]) == {"import:cellpose"} and len(w.pairs) == len(manifest)
+
+
+def test_projected_run_exports_proj_pairs(make_napari_viewer, qtbot, tmp_path, pack_env):
+    """A projected run (segmentation.nuclei.project) gives one proj pair, the 2D image its segmenter saw: the dock
+    reads the run's geometry, offers no slice to choose, and exports with `--orientations auto`, through the
+    engine runner and in this napari environment alike."""
+    import sys
+
+    from conftest import TEST_IMAGE, need_features
+
+    from napari_germquant._runner import SubprocessRunner
+
+    need_features("train_curve")          # the proj export came with train-curve (P5-TRAIN, plan 9.4 #11)
+    from germquant import api
+
+    results = tmp_path / "results"
+    api.run(TEST_IMAGE, pack="test_pack", recipe="basic", out=results / "test_pack_synthetic",
+            overrides={"segmentation.nuclei.project": "max", "spots.enabled": False})
+
+    runner = SubprocessRunner(sys.executable)
+    w = _round_trip_dock(make_napari_viewer, runner)
+    _settled(qtbot, w)
+    w.set_source(results)
+    w.set_pairs_dir(tmp_path / "pairs")
+    _settled(qtbot, w)
+    assert [(g.image_id, g.kind) for g in w.geometry] == [("test_pack_synthetic", "projected")]
+    assert "1 projected run" in w.geometry_label.text() and not any(cb.isEnabled() for cb in w.orient_checks.values())
+    assert w.export()
+    _settled(qtbot, w)
+    argv = runner.history[-1]
+    assert argv[argv.index("--orientations") + 1] == "auto", argv
+    manifest = pd.read_csv(tmp_path / "pairs" / "manifest.csv")
+    assert list(manifest["orientation"]) == ["proj"] and len(w.pairs) == 1 and w.pairs[0].orientation == "proj"
+    exported = json.loads((tmp_path / "pairs" / "export.json").read_text(encoding="utf-8"))
+    assert exported["orientations"] == ["proj"] and exported["run_orientations"][0]["geometry"] == "projected"
+
+    # no engine chosen: this napari environment's export follows the run the same way
+    here = TrainingWidget(make_napari_viewer())
+    here.set_source(results)
+    here.set_pairs_dir(tmp_path / "pairs_here")
+    _settled(qtbot, here)
+    assert here.export()
+    _settled(qtbot, here)
+    assert here.last_error is None, here.status_label.text()
+    again = pd.read_csv(tmp_path / "pairs_here" / "manifest.csv")
+    pd.testing.assert_frame_equal(again, manifest, check_exact=True)
+    for rel in list(manifest["image"]) + list(manifest["labels"]):
+        assert np.array_equal(tifffile.imread(tmp_path / "pairs_here" / rel), tifffile.imread(tmp_path / "pairs" / rel))
+
+
+def test_train_use_in_project_and_derive_pack(make_napari_viewer, qtbot, project_env, seams_runner):
+    """A project's training round in the dock, every step through the engine: New round (`project rounds --new`),
+    labels imported for the project's image into the round, train-nuclei in an engine child whose Cellpose seams
+    are stand-ins (the wrapper interpreter), Use in project (`project use-model`: recipe.yaml names the model by its
+    path in the project, a new config_hash, validated false, the Project dock asked to read the project again), and
+    Derive pack (`pack derive` from the pinned pack's with_model recipe into the project's packs/, then listed with
+    --project)."""
+    import yaml
+    from _p6_train import FakeHub
+    from conftest import need_features
+
+    from napari_germquant._runner import plugin_version
+
+    need_features("projects", "import_labels", "pack_derive", have=seams_runner.features())
+    root = project_env.new_dir("study")
+    made = seams_runner.project_new(root, "test_pack@0.1.0", recipe="with_model", images=[project_env.image])
+    assert made["added"] == ["test_pack_synthetic"], made
+    hub = FakeHub()
+    w = _round_trip_dock(make_napari_viewer, seams_runner, hub)
+    hub.open(root)
+    _settled(qtbot, w)
+    assert w.root == root and w.rounds == [] and w.base_combo.itemText(0) == "tinynet@f5055f8a"
+    assert w.new_round()
+    _settled(qtbot, w)
+    assert w.rounds == ["r01"] and (root / "training" / "r01").is_dir()
+    assert Path(w.pairs_edit.text()) == root / "training" / "r01"
+
+    labels = project_env.root / "labels" / "test_pack_synthetic_segm.npz"
+    labels.parent.mkdir()
+    np.savez_compressed(labels, _boxes())
+    w.set_labels_file(labels)
+    assert w.image_combo.currentText() == "test_pack_synthetic"
+    assert w.import_labels()
+    _settled(qtbot, w)
+    assert w.last_import is not None, w.status_label.text()
+    assert w.last_import["pairs_dir"] == str(root / "training" / "r01") and len(w.pairs) > 0
+
+    w.base_combo.setCurrentText("none")
+    w.epochs_spin.setValue(2)
+    w.select_device("cpu")
+    assert w.train()
+    _settled(qtbot, w)
+    model = root / "training" / "r01" / "models" / "r01_nuclei" / "r01_nuclei"
+    assert w.last_train is not None, w.status_label.text()
+    assert Path(w.model_edit.text()) == model and model.is_file() and Path(w.card_edit.text()).is_file()
+    card = json.loads(Path(w.card_edit.text()).read_text(encoding="utf-8"))
+    assert card["object_kind"] == "nucleus"                      # the pack's object kind, passed as --kind
+    argv = next(a for a in reversed(seams_runner.history) if "train-nuclei" in a)
+    assert argv[argv.index("--kind") + 1] == "nucleus"           # the pack's, not the engine's default
+
+    assert w.use_in_project()
+    _settled(qtbot, w)
+    assert w.last_use is not None, w.status_label.text()
+    m = yaml.safe_load((root / "germquant_project.yaml").read_text(encoding="ascii"))
+    assert m["models"][0]["ref"] == "training/r01/models/r01_nuclei/r01_nuclei"
+    assert m["validated"]["value"] is False and m["saved"]["plugin"] == plugin_version()
+    recipe = yaml.safe_load((root / "recipe.yaml").read_text(encoding="ascii"))
+    assert recipe["segmentation"]["nuclei"]["cellpose_model"] == "training/r01/models/r01_nuclei/r01_nuclei"
+    assert w.last_use["config_hash"] != "81e38c5cf371" and w.last_use["config_hash"] in w.status_label.text()
+    assert hub.reloads == 1
+
+    assert w.derive_pack()
+    _settled(qtbot, w)
+    rec = w.last_derive
+    assert rec is not None, w.status_label.text()
+    assert rec["id"].startswith("test_pack_derived_") and Path(rec["folder"]).parent.parent == root / "packs"
+    listed = seams_runner.list_packs(project=root)
+    entry = next(p for p in listed["packs"] if p["id"] == rec["id"])
+    assert entry.get("source") == "project" and rec["id"] in w.status_label.text()
