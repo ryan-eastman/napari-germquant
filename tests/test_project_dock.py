@@ -919,8 +919,14 @@ def test_codeless_project_from_the_test_pack(make_napari_viewer, qtbot, served_m
     kinds = {type(layer).__name__ for layer in viewer.layers}
     assert {"Labels", "Points"} <= kinds
     before = w.status["config_hash"]
-    w.edit(edits={served_model_pack.tunable: 0.4})
+    tab = w.extra_tabs["Recipe"]                    # the parameter form (P6-RECIPE), where a user makes the edit
+    qtbot.waitUntil(lambda: tab.idle, timeout=120_000)
+    tab.set_value(served_model_pack.tunable, 0.4)
+    assert tab.apply_form()
+    qtbot.waitUntil(lambda: tab.idle, timeout=120_000)
     settle(w, qtbot)
+    assert tab.last_error is None, tab.status_label.text()
+    assert w.status["config_hash"] == tab.config_hash
     assert w.last_error is None, w.last_error
     assert w.status["config_hash"] != before and w.badge_label.text() == "validated: false (edited)"
     assert _board(w) == [(image_id, "stale")] and w.rows[0].reason_code == "config_hash"
