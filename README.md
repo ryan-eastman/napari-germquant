@@ -520,7 +520,7 @@ The subprocess runner tests use this Python as the engine interpreter and pass t
 
 ### Continuous integration
 
-`.github/workflows/ci.yml` runs ruff and the whole suite on ubuntu-latest, windows-latest and macos-14 (Apple
+`.github/workflows/ci.yml` runs ruff and the whole suite on ubuntu-latest, windows-latest and macos-15 (Apple
 Silicon) with Python 3.11, with `QT_QPA_PLATFORM=offscreen` on Linux and Windows and Qt's native `cocoa` platform
 on macOS. It checks the engine out from its public repository
 at a pinned commit (the head of the engine's integration branch while a train is open, then the engine's main
@@ -530,6 +530,13 @@ verifies every file of the copy against it. Pins: the engine checkout's constrai
 `constraints/ci-plugin-2026-10.txt` (napari, PyQt6, pytest-qt at the workstation's versions, and the bioio
 plugins of the readers extra; their native libraries are left to the resolver, and each job prints what it
 installed).
+
+The macOS runner. The macOS job ran on macos-14 until 2026-10-30. GitHub retires the macOS 14 images on
+2026-11-02 (actions/runner-images issue 13518), and that image's scheduled brownouts cancelled the job before it
+started (run 41101457726, all three attempts), so the job moved to macos-15: the same Apple Silicon (arm64)
+runner one macOS release newer, with the same engine constraints file (`ci-mac-arm64-2026-10.txt`), the same
+`cocoa` platform and the same 15-minute budget. The workflow names macos-15 rather than macos-latest, which GitHub
+moves to each new macOS release (it is macOS 26 now).
 
 Time. Gate G1 gives a job 15 minutes, and each change records what it adds; `timeout-minutes` is 20, so a job
 over budget fails instead of running on. A Linux replica of the ubuntu job (WSL Ubuntu 24.04, plugin bfab387,

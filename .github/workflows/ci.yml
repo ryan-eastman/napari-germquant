@@ -26,6 +26,13 @@
 # warm) took the time the README's Continuous integration section records; timeout-minutes sits a little above
 # the budget, so a job that blows it shows as failed instead of running on.
 #
+# The macOS runner: macos-15, GitHub's Apple Silicon (arm64) image of macOS 15. The job ran on macos-14 until
+# 2026-10-30: GitHub retires the macOS 14 images on 2026-11-02 (actions/runner-images issue 13518), and that
+# image's scheduled brownouts cancelled the job before it started (run 41101457726, all three attempts). macos-15
+# is the same arm64 runner class one macOS release newer, so the job keeps the engine's ci-mac-arm64-2026-10.txt,
+# PyPI's arm64 torch, Qt's cocoa platform and the 15-minute budget. Not macos-latest: GitHub moves that label to
+# each new macOS release (it is macOS 26 now), while a pinned label changes only by a commit like this one.
+#
 # Qt: QT_QPA_PLATFORM=offscreen on Linux and Windows. tests/conftest.py answers napari's two OpenGL queries with
 # constants under offscreen, so nothing is rendered and no GPU is touched (none of these runners has one).
 # macOS uses Qt's native cocoa platform instead: under offscreen there is no OpenGL context on macOS, and
@@ -72,7 +79,8 @@ jobs:
           - os: windows-latest
             engine_constraints: constraints/ci-cpu-2026-10.txt
             qt_platform: offscreen
-          - os: macos-14
+          # Apple Silicon; macos-14 until 2026-10-30 (GitHub retires it on 2026-11-02; see the header)
+          - os: macos-15
             engine_constraints: constraints/ci-mac-arm64-2026-10.txt
             qt_platform: cocoa
     env:
