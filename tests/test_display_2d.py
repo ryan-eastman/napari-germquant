@@ -2,8 +2,12 @@
 tranche 5 Train B plan, with its decision D37): a planar run's layers at (1.0, dy, dx) and its YX spots image
 given a z axis, the Points size from the run's own spot detector, a batch's config found in the batch root's
 manifest, the reader's scale for a one-plane stack (Stack.spacing_yx), and the single-plane header line of
-the Run dock. The folders and stacks are hand-made (tests/_p6_2d.py), so every engine this suite runs against
-gives the same answers; 3D folders keep exactly what they showed before."""
+the Run dock. The planar folders' two images come from the engine's own YX writers (germquant.planar,
+package P2b) and the rest of them from tests/_p6_2d.py, so a test that writes one skips on an engine before
+P2b, naming the planar feature; the tests of stacks and headers alone use hand-made ones and give the same
+answers against every engine; 3D folders keep exactly what they showed before. One test, gated on the planar
+feature, reads a calibrated plane through the engine itself, with no stand-in (review S3): the layers' scale
+at xy_stride 1 and 2, the Run dock's header line, and the display z step against the engine's PLANAR_DZ."""
 from __future__ import annotations
 
 import json
@@ -27,12 +31,14 @@ from _p6_2d import (
     write_stack_results,
     write_summary_only,
 )
+from conftest import need_features
 
 from napari_germquant import _reader, _results, _run_widget
 from napari_germquant._reader import header_spacing_text, is_single_plane, layers_from_stack, open_image
 from napari_germquant._results import load_results_layers, spot_marker_size_um
 from napari_germquant._results_widget import ResultsWidget
 from napari_germquant._run_widget import RunWidget
+from germquant import api
 
 PLANAR_SCALE = (1.0, DY, DX)
 
@@ -340,3 +346,29 @@ def test_loading_a_planar_folder_writes_nothing(tmp_path):
     pts_meta = layers[-1][1]["metadata"]["napari_germquant_results"]
     assert pts_meta["spacing_um"] == PLANAR_SCALE and pts_meta["table"] == "spots"
     assert json.loads((rs.folder / f"{PLANAR_ID}__done.json").read_text(encoding="utf-8"))["planar"] is True
+
+
+def test_the_engine_reads_a_plane_as_the_plugin_shows_it(qtbot, tmp_path):
+    # review S3: the plugin's readings of the engine's single-plane mode (P2b), pinned against the engine
+    # itself with no stand-in: Stack.spacing_yx is on the stack's own grid (after xy_stride, as Stack.spacing
+    # is), the header's spacing_yx_um is the file's own (dy, dx), and the display z step is PLANAR_DZ
+    need_features("planar")
+    from germquant import planar
+
+    assert _reader.PLANAR_DZ_UM == planar.PLANAR_DZ
+    data = np.arange(2 * PLANE[0] * PLANE[1], dtype=np.uint16).reshape(2, *PLANE)
+    src = write_cyx_image(tmp_path / "cells_001.ome.tif", data, ["DNA", "foci"])
+    for stride in (1, 2):
+        stack = api.read_image(src, xy_stride=stride)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            layers = layers_from_stack(stack, src)
+        assert not [w for w in caught if "voxel size unreadable" in str(w.message)], stride
+        assert len(layers) == 2
+        for (pixels, kw, _), channel in zip(layers, data):
+            assert tuple(kw["scale"]) == pytest.approx((1.0, stride * DY, stride * DX)), stride
+            assert np.array_equal(pixels, channel[None, ::stride, ::stride])
+    w = RunWidget(None)
+    qtbot.addWidget(w)
+    w.set_image(src)
+    assert "\nsingle plane, voxel um dy=0.100 dx=0.100\n" in w.image_info.text()
