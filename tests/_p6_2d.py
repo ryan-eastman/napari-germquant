@@ -2,15 +2,18 @@
 plan, section 5.2): results folders and image stacks shaped like the engine's single-plane mode
 (docs/DESIGN_system_packs.md 4.3, 4.6, 4.8 and 4.9, engine package P2b).
 
-``write_planar_results`` is the hand-made planar_results folder of the P6 spec (plugin_specs.md 6.1). Every
-table carries voxel_dz_um NaN with the plane's dy and dx (0.1 um); the nuclei table has volume_um3 NA,
-centroid_z_um 0.0 and the planar columns area_um2 and equivalent_diameter_um; every spot has z_um 0.0. The
-label image is an int32 OME-TIFF with axes YX and PhysicalSizeX and Y only, the spots image a YX uint16 TIFF
-with one disk per spot (tifffile.imread gives (Y, X) for both); the done marker has the planar extra;
-run_manifest.json holds the run's config (the spotmax backend with spots.spot_radius_um 0.5) and the planar
-run geometry. The files are written by hand, so the tests give the same answers against every engine the
-suite runs on; after P2b has merged (merge #1 of the train) the final check makes them with the engine's own
-YX writers.
+``write_planar_results`` is the planar_results folder of the P6 spec (plugin_specs.md 6.1). Its two images
+come from the engine's own single-plane writers, called as the pipeline's planar write block calls them:
+germquant.planar.write_labels_yx (an int32 OME-TIFF with axes YX and PhysicalSizeX and Y only) and
+write_spots_yx (a uint16 YX ImageJ TIFF calibrated in y and x, a disk of the run's spots.spot_radius_um at
+each spot); tifffile.imread gives (Y, X) for both. Everything else is written by hand: every table carries
+voxel_dz_um NaN with the plane's dy and dx (0.1 um); the nuclei table has volume_um3 NA, centroid_z_um 0.0 and
+the planar columns area_um2 and equivalent_diameter_um; every spot has z_um 0.0; the done marker has the
+planar extra; run_manifest.json holds the run's config (the spotmax backend with spots.spot_radius_um 0.5)
+and the planar run geometry. The spots stay the fixture's: a real planar run in plugin CI would have to
+switch spots off (no SpotMAX there, and the LoG backend does not declare planar_ok). On an engine before P2b
+(no YX writers in germquant.planar) a test that writes this folder skips, naming the planar feature, through
+conftest.need_features (or fails when $NAPARI_GERMQUANT_REQUIRE_FEATURES lists it).
 
 ``plane_stack`` builds a germquant Stack as the engine's readers return one from P2b on, with the plane's
 own pixel size in ``spacing_yx`` (on an engine without that field, a subclass of api.Stack that adds it).
@@ -57,15 +60,20 @@ def spots_image(shape=PLANE, spots=SPOTS, radius_px: int = 2) -> np.ndarray:
     return out
 
 
-def write_yx_labels(path: Path, labels: np.ndarray, dy: float = DY, dx: float = DX) -> Path:
-    """An int32 OME-TIFF, axes YX, with PhysicalSizeX and Y only: the format of the engine's
-    write_labels_yx."""
-    import tifffile
+def engine_planar():
+    """germquant.planar with the single-plane writers tranche 5 package P2b added to it (write_labels_yx and
+    write_spots_yx), which make the planar folder's images. An engine before P2b lacks them (its
+    germquant.planar holds the projected runs' code only) and lacks the planar feature: the calling test then
+    skips, naming it, or fails when $NAPARI_GERMQUANT_REQUIRE_FEATURES lists planar."""
+    try:
+        from germquant import planar
+    except ImportError:
+        planar = None
+    if not all(hasattr(planar, name) for name in ("write_labels_yx", "write_spots_yx")):
+        from conftest import need_features
 
-    tifffile.imwrite(str(path), labels.astype(np.int32), ome=True, photometric="minisblack",
-                     metadata={"axes": "YX", "PhysicalSizeX": dx, "PhysicalSizeXUnit": UM,
-                               "PhysicalSizeY": dy, "PhysicalSizeYUnit": UM})
-    return path
+        need_features("planar")
+    return planar
 
 
 def write_cyx_image(path: Path, data: np.ndarray, names, dy: float = DY, dx: float = DX) -> Path:
@@ -101,14 +109,24 @@ def write_planar_results(folder: Path, image_id: str = PLANAR_ID, *, dy: float =
                          config: dict | None = None, manifest: bool = True,
                          config_hash: str = "planar0hash1") -> ResultsSet:
     """The planar_results folder of the module docstring; ``config`` replaces the run's config in
-    run_manifest.json, and ``manifest=False`` leaves the manifest out (a batch image folder)."""
-    import tifffile
-
+    run_manifest.json (its spots.spot_radius_um, else the engine's 0.3, sizes the spots image's disks), and
+    ``manifest=False`` leaves the manifest out (a batch image folder)."""
+    planar = engine_planar()
     folder.mkdir(parents=True, exist_ok=True)
     meta = _meta(image_id, (float("nan"), dy, dx), config_hash)
-    labels = disk_labels()
-    write_yx_labels(folder / f"{image_id}__nuclei_labels.tif", labels, dy, dx)
-    tifffile.imwrite(str(folder / f"{image_id}__spots.tif"), spots_image(), photometric="minisblack")
+    cfg = config if config is not None else {
+        "io": {"planar": "auto"}, "spots": {"backend": "spotmax", "spot_radius_um": RADIUS_UM}}
+    labels = disk_labels()[None]                 # (1, Y, X), as a single-plane run holds its labels
+    spots = pd.DataFrame([{"spot_id": sid, "nucleus_id": nid, "z_um": 0.0, "y_um": y * dy, "x_um": x * dx,
+                           "effect_size": 4.0 + sid, **meta} for sid, nid, y, x in SPOTS])
+    # the pipeline's planar write block (pipeline.process_image): both images on the plane's own (dy, dx)
+    label_tif, spots_tif = folder / f"{image_id}__nuclei_labels.tif", folder / f"{image_id}__spots.tif"
+    planar.write_labels_yx(labels, label_tif, (dy, dx))
+    radius_um = float((cfg.get("spots") or {}).get("spot_radius_um", 0.3))
+    planar.write_spots_yx(spots, labels.shape, (dy, dx), spots_tif, radius_um=radius_um)
+    for tif in (label_tif, spots_tif):           # the writers log a failure instead of raising it
+        if not tif.is_file():
+            raise RuntimeError(f"germquant.planar wrote no {tif.name}")
     n_spots = {nid: sum(1 for s in SPOTS if s[1] == nid) for nid, *_ in NUCLEI}
     rows = []
     for nid, cy, cx, _r in NUCLEI:
@@ -117,9 +135,7 @@ def write_planar_results(folder: Path, image_id: str = PLANAR_ID, *, dy: float =
                      "centroid_y_um": cy * dy, "centroid_x_um": cx * dx, "n_spots": n_spots[nid],
                      "area_um2": area, "equivalent_diameter_um": 2.0 * float(np.sqrt(area / np.pi)), **meta})
     pd.DataFrame(rows).to_csv(folder / f"{image_id}__nuclei.csv", index=False)
-    spots = [{"spot_id": sid, "nucleus_id": nid, "z_um": 0.0, "y_um": y * dy, "x_um": x * dx,
-              "effect_size": 4.0 + sid, **meta} for sid, nid, y, x in SPOTS]
-    pd.DataFrame(spots).to_csv(folder / f"{image_id}__spots.csv", index=False)
+    spots.to_csv(folder / f"{image_id}__spots.csv", index=False)
     summary = {"n_nuclei": len(NUCLEI), "mean_spots": len(SPOTS) / len(NUCLEI), "qc_pass": True,
                "qc_flags": "read:planar", "segmentation_method": "classical", **meta}
     pd.DataFrame([summary]).to_csv(folder / f"{image_id}__image_summary.csv", index=False)
@@ -132,8 +148,6 @@ def write_planar_results(folder: Path, image_id: str = PLANAR_ID, *, dy: float =
         "stage_hashes": {}, "xy_stride": 1, "z_range": None, "planar": True, "failed_stages": [],
         "finished": "2026-10-23T00:00:00+00:00"}), encoding="utf-8")
     if manifest:
-        cfg = config if config is not None else {
-            "io": {"planar": "auto"}, "spots": {"backend": "spotmax", "spot_radius_um": RADIUS_UM}}
         write_manifest(folder, config_hash=config_hash, config=cfg, xy_stride=1, z_range=None, planar=True,
                        spacing_source="file_yx")
     return ResultsSet(folder, image_id)

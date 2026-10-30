@@ -2,8 +2,10 @@
 tranche 5 Train B plan, with its decision D37): a planar run's layers at (1.0, dy, dx) and its YX spots image
 given a z axis, the Points size from the run's own spot detector, a batch's config found in the batch root's
 manifest, the reader's scale for a one-plane stack (Stack.spacing_yx), and the single-plane header line of
-the Run dock. The folders and stacks are hand-made (tests/_p6_2d.py), so every engine this suite runs against
-gives the same answers; 3D folders keep exactly what they showed before."""
+the Run dock. The planar folders' two images come from the engine's own YX writers (germquant.planar,
+package P2b) and the rest of them from tests/_p6_2d.py, so a test that writes one skips on an engine before
+P2b, naming the planar feature; the tests of stacks and headers alone use hand-made ones and give the same
+answers against every engine; 3D folders keep exactly what they showed before."""
 from __future__ import annotations
 
 import json
