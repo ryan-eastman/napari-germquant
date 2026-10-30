@@ -39,11 +39,13 @@ def _settle(qtbot, w, timeout: int = 30_000) -> None:
     qtbot.waitUntil(lambda: w.idle, timeout=timeout)
 
 
-def _dock(make_napari_viewer, runner=None, hub=None):
-    viewer = make_napari_viewer()
+def _dock(make_napari_viewer, runner=None, hub=None, *, viewer: bool = False):
+    """The dock on a fake engine (StaticSession) and a hub. A napari viewer only for a test that reads layers or the
+    status bar: a viewer's teardown costs about half a second, twice that on the Windows runner."""
+    v = make_napari_viewer() if viewer else None
     session = StaticSession(runner) if runner is not None else None
-    w = TrainingWidget(viewer, session=session, hub=hub if hub is not None else FakeHub())
-    return viewer, w
+    w = TrainingWidget(v, session=session, hub=hub if hub is not None else FakeHub())
+    return v, w
 
 
 def _items(combo) -> list:
@@ -356,7 +358,7 @@ def test_export_and_training_go_through_the_engine(make_napari_viewer, qtbot, tm
     tree = tmp_path / "results"
     write_run(tree / "a", "a", kind="3d")
     runner = FakeTrainRunner(available={"cuda": True})
-    viewer, w = _dock(make_napari_viewer, runner)
+    viewer, w = _dock(make_napari_viewer, runner, viewer=True)
     statuses: list[str] = []
     viewer.events.status.connect(lambda e: statuses.append(str(e.value)))
     _settle(qtbot, w)

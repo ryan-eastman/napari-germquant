@@ -387,9 +387,10 @@ class StaticSession(QObject):
 
     changed = Signal()
 
-    def __init__(self, runner, parent=None) -> None:
+    def __init__(self, runner, parent=None, *, devices=None) -> None:
         super().__init__(parent)
         self._runner = runner
+        self._devices = list(devices) if devices is not None else None
         self.ensured = 0
 
     def runner(self):
@@ -417,6 +418,10 @@ class StaticSession(QObject):
         return None
 
     def devices(self, should_stop=None) -> list[str]:
+        """The engine's devices: ``devices`` when given (a real engine's runtime probe imports torch in a child
+        process, seconds a test need not spend), else its runtime probe."""
+        if self._devices is not None:
+            return list(self._devices)
         return device_choices(self._runner.runtime())
 
     def device(self) -> str:

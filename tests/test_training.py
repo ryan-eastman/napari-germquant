@@ -425,7 +425,9 @@ def _round_trip_dock(make_napari_viewer, runner, hub=None):
     from _p6_train import FakeHub, StaticSession
 
     viewer = make_napari_viewer()
-    return TrainingWidget(viewer, session=StaticSession(runner), hub=hub if hub is not None else FakeHub())
+    # the devices as an engine without a GPU lists them: its runtime probe would import torch in one more child
+    return TrainingWidget(viewer, session=StaticSession(runner, devices=["auto", "cpu"]),
+                          hub=hub if hub is not None else FakeHub())
 
 
 def _settled(qtbot, w, timeout: int = 300_000) -> None:
@@ -472,15 +474,18 @@ def test_import_cellacdc_and_seg_npy_create_pairs(make_napari_viewer, qtbot, tmp
     assert len(manifest) == rec["n_pairs"] > 0 and len(w.pairs) == rec["n_pairs"]
     assert any("channel 0" in x for x in rec["warnings"]) and "channel 0" in w.status_label.text()
 
-    # a Cellpose _seg.npy is a pickle: refused without the box, nothing written
+    # a Cellpose _seg.npy is a pickle: refused without the box, nothing written (the engine's own refusal, here in
+    # process; through the subprocess runner the dock shows the engine's REFUSED line the same way, which
+    # tests/test_training_project.py and the runner's tests pin, so that route spends no engine start on it)
     w.set_labels_file(seg)
     assert w.format_combo.currentData() == "cellpose-npy" and w.pickle_check.isEnabled()
     assert not w.pickle_check.isChecked() and T.PICKLE_WARNING in w.pickle_label.text()
-    before = (pairs / "manifest.csv").read_bytes()
-    assert w.import_labels()
-    _settled(qtbot, w)
-    assert w.last_import is None and "--allow-pickle" in w.status_label.text()
-    assert (pairs / "manifest.csv").read_bytes() == before
+    if route == "inprocess":
+        before = (pairs / "manifest.csv").read_bytes()
+        assert w.import_labels()
+        _settled(qtbot, w)
+        assert w.last_import is None and "--allow-pickle" in w.status_label.text()
+        assert (pairs / "manifest.csv").read_bytes() == before
     # with the box ticked it is read (the same image id: its rows are replaced), and the engine says it unpickled
     w.pickle_check.setChecked(True)
     assert w.import_labels()
