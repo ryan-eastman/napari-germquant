@@ -131,6 +131,8 @@ def test_points_saved_tuned_top_five_and_applied(make_napari_viewer, qtbot, proj
     assert recipe["extends"] == "pack:test_pack@0.1.0/basic" and recipe["spots"]["log"]["min_snr"] == value
     m = read_manifest(P)
     assert m["recipe"]["origins"] == {"spots.log.min_snr": "tuning"}
+    assert m["saved"]["plugin"] == plugin_version()   # the write is stamped with the plugin version (D42)
+    assert apply_argv[-3:] == ["--plugin-version", plugin_version(), "--json"]
     new_hash = m["recipe"]["expected_config_hash"]
     assert new_hash != BASE_HASH
     assert new_hash in w.last_message and "validated: false" in w.last_message

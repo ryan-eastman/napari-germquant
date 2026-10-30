@@ -240,8 +240,9 @@ def second_python(tmp_path_factory) -> Path:
 def engine_device(prefer: str | None = "auto") -> str:
     """The device the engine picks for ``prefer`` in this test session: germquant.device.select_device, the
     function the engine itself calls. CUDA is hidden here (CUDA_VISIBLE_DEVICES=-1), but an Apple GPU is not:
-    on the macos-14 runner torch offers MPS, so "auto" (and a "cuda" request) give mps there and cpu on the
-    Linux and Windows runners. Tests compare with this instead of assuming the CPU."""
+    where torch offers MPS, as it did on the CI's macos-14 runner (the macOS job runs on macos-15 since
+    2026-10-30, D54), "auto" (and a "cuda" request) give mps, and cpu on the Linux and Windows runners. Tests
+    compare with this instead of assuming the CPU."""
     from germquant.device import select_device
 
     return select_device(prefer, quiet=True)
