@@ -13,13 +13,17 @@ What it shows, top to bottom:
   Save points. Open image adds the image's finished run on its own grid: the run's labels and spots, the source
   image read at the run's stride and on its planes, and one editable Points layer "<image_id> truth points
   (<annotator>)" in add mode, holding the points of annotations/<image_id>__points_<annotator>.csv when the file
-  exists. Save writes that file through the engine's own writer, in napari's process (D39); it refuses a file
-  that would come out wrong (points of other planes in a run of one plane, or a run made again on another grid
-  since the layer was opened: the layer is then renamed "(old run)" and Open image opens the new run).
+  exists (for another annotator of an image whose run's layers this dock opened, only the truth layer is added,
+  while the image's run is the same; the layers of an earlier run are renamed "(old run)"). The box is kept for
+  each truth layer, and a changed box counts as unsaved. Save writes that file through the engine's own writer,
+  in napari's process (D39); it is off while a search runs, and it refuses a file that would come out wrong
+  (points of other planes in a run of one plane, or a run made again on another grid since the layer was opened:
+  the layer is then renamed "(old run)" and Open image opens the new run).
 * Tune: the grid (the engine's default for the recipe's spot backend, or a grid file), Max runs, how many
   detections the search means on the annotated images, Tune and Cancel. Tune runs ``germquant tune-spots
   --project DIR --points annotations --max-runs N [--grid FILE] --json`` through the engine runner, in a thread
-  worker, with the engine's lines on the status bar.
+  worker, with the engine's lines on the status bar. Cancel ends the engine's process (an engine in napari's own
+  process cannot be stopped, so Cancel is off for it).
 * Result: the project's tuning runs (newest first), the top five rows of the selected run's ranked.csv (the
   columns the engine writes, the objective named), its best setting and warnings, and Apply, which runs
   ``germquant tune-spots --project DIR --apply tuning/<run>`` through the engine with the plugin version (D42).
@@ -72,6 +76,7 @@ from ._runner import FeatureMissing, RunCancelled, RunnerError, detect_interpret
 RED = QColor(200, 60, 60)
 AMBER = QColor(225, 160, 40)
 GREEN = QColor(70, 150, 90)
+TUNE_LABEL = "tuning the spots (germquant tune-spots)"     # the engine worker's label while a search runs
 
 
 def css(color: QColor | None) -> str:
@@ -144,6 +149,9 @@ class SpotTuningWidget(QWidget):
         self._reading = 0
         self._truth: dict[tuple, object] = {}           # (root, image id, annotator) -> its truth layer
         self._saved: dict[tuple, np.ndarray] = {}       # the same key -> its points as last read or saved
+        # (root, image id) -> {"stamp": the run's stamp, "source": [layers], "results": [layers]}: the run's layers
+        # this dock added, shown once for all the annotators of the image while its run is the same
+        self._run_layers: dict[tuple, dict] = {}
         self._io_jobs: list[dict] = []
         self._lines = _Lines(self)
         self._lines.line.connect(self._on_line)
@@ -224,7 +232,8 @@ class SpotTuningWidget(QWidget):
         self.open_btn.clicked.connect(lambda: self.open_image())
         irow.addWidget(self.open_btn)
         self.projected_check = QCheckBox("placed on a projection (matched in 2D)")
-        self.projected_check.toggled.connect(lambda _on: self._update())
+        self.projected_check.setToolTip("kept for each truth layer; Save writes it for every point of the layer")
+        self.projected_check.toggled.connect(self._on_box)
         irow.addWidget(self.projected_check)
         self.save_btn = QPushButton("Save points")
         self.save_btn.setToolTip("write annotations/<image_id>__points_<annotator>.csv through the engine's writer")
@@ -311,6 +320,18 @@ class SpotTuningWidget(QWidget):
         """No engine call, file job or waiting file job (tests wait on it)."""
         return not self.engine_worker.busy and not self.io_worker.busy and not self._io_jobs
 
+    @property
+    def searching(self) -> bool:
+        """Whether a search (tune-spots) runs in the engine worker."""
+        return self.engine_worker.busy and self.engine_worker.label == TUNE_LABEL
+
+    def _cancellable(self) -> bool:
+        """Whether the engine can stop a search (a subprocess engine; the in-process engine cannot)."""
+        try:
+            return bool(getattr(self.session.runner(), "cancellable", False))
+        except Exception:  # noqa: BLE001 - an engine that cannot be asked cannot be stopped either
+            return False
+
     def _message(self, text: str, color: QColor | None = None) -> None:
         self.last_message = text
         self.message_label.setText(text)
@@ -367,15 +388,32 @@ class SpotTuningWidget(QWidget):
         except Exception:  # noqa: BLE001 - a viewer that is closing
             return None
 
-    def _unsaved(self, key, layer) -> bool:
+    @staticmethod
+    def _box(layer) -> bool:
+        """The "placed on a projection" box of a truth layer, as the user left it (else as its file holds it)."""
+        meta = layer.metadata.get(_tuning.LAYER_KEY) or {}
+        return bool(meta.get("box", meta.get("projected")))
+
+    @staticmethod
+    def _box_changed(layer) -> bool:
+        """The layer holds points and its box differs from what its file holds."""
+        meta = layer.metadata.get(_tuning.LAYER_KEY) or {}
+        return len(layer.data) > 0 and bool(meta.get("box", meta.get("projected"))) != bool(meta.get("projected"))
+
+    def _points_unsaved(self, key, layer) -> bool:
         saved = self._saved.get(key)
         data = np.asarray(layer.data, float)
         if saved is None:
             return len(data) > 0
         return data.shape != saved.shape or not np.allclose(data, saved)
 
+    def _unsaved(self, key, layer) -> bool:
+        """The layer's points or its box are not what its file holds."""
+        return self._points_unsaved(key, layer) or self._box_changed(layer)
+
     def unsaved_images(self) -> list[str]:
-        """The images of the open project whose truth layer holds points that are not in its file."""
+        """The images of the open project whose truth layer holds points, or a "placed on a projection" box, that
+        are not in its file."""
         out = []
         if self.viewer is None or self.root is None:
             return out
@@ -693,30 +731,58 @@ class SpotTuningWidget(QWidget):
             self._message(f"{row.image_id} is already open: its truth points are the layer {layer.name}", None)
             return True
         root = self.root
+        rkey = (os.path.normcase(str(root)), row.image_id)
+        # the run's layers this dock added for another annotator, still in the viewer: the job reads them again only
+        # when the image's run is no longer the one they show (its stamp)
+        entry = self._run_layers.get(rkey) or {}
+        have = {part: entry.get("stamp") for part in ("source", "results") if self._in_viewer(entry.get(part))}
 
         def job(should_stop):
             info = _tuning.run_info(root, row)
-            return _tuning.image_layers(info, annotator)
+            return _tuning.image_layers(info, annotator, have=have)
 
         def done(res):
-            layers, data, note = res
             if not self._owns(root):
                 self._message(f"{row.image_id} was not opened: its project {self._gone()}", AMBER)
                 return
-            added = add_layer_tuples(self.viewer, layers)
-            truth = added[-1]
+            notes = [res["note"]] if res["note"] else []
+            known = self._run_layers.get(rkey)
+            if known is not None and known.get("stamp") != res["stamp"]:
+                # the image was run again since those layers were added: they show its earlier run
+                if self._rename_old([*known.get("source", []), *known.get("results", [])]):
+                    notes.append(f"the layers of an earlier run of {row.image_id} are renamed '(old run)'")
+                known = None
+            if known is None:
+                known = self._run_layers[rkey] = {"stamp": res["stamp"], "source": [], "results": []}
+            src = add_layer_tuples(self.viewer, res["source"])
+            out = add_layer_tuples(self.viewer, res["results"])
+            (truth,) = add_layer_tuples(self.viewer, [res["truth"]])
+            if res["read_source"]:
+                known["source"] = src
+            if res["read_results"]:
+                known["results"] = out
             truth.mode = "add"
             self._truth[key] = truth
-            self._saved[key] = np.asarray(data, float).reshape(-1, 3)
+            self._saved[key] = np.asarray(res["data"], float).reshape(-1, 3)
             truth.events.data.connect(self._on_truth_changed)
-            self.projected_check.setChecked(bool(truth.metadata[_tuning.LAYER_KEY].get("projected")))
             self._select_layer(truth)
-            text = f"opened {row.image_id} on its run's grid ({len(added)} layers)"
+            if res["read_source"] or res["read_results"]:
+                text = f"opened {row.image_id} on its run's grid ({len(src) + len(out) + 1} layers)"
+            else:
+                text = f"opened the truth points of {row.image_id} ({annotator}) on its run's layers in the viewer"
+            note = "; ".join(notes)
             self._message(text + (f"; {note}" if note else ""), AMBER if note else None)
-            self._show_points()
+            self._show_points(sync_box=True)
 
         self._io("open", job, f"opening {row.image_id}", done, lambda e: self._failed(e, f"{row.image_id}: "))
         return True
+
+    def _in_viewer(self, layers) -> bool:
+        """Whether any of ``layers`` is still in the viewer."""
+        try:
+            return any(layer in self.viewer.layers for layer in layers or [])
+        except Exception:  # noqa: BLE001 - a viewer that is closing
+            return False
 
     def _select_layer(self, layer) -> None:
         try:
@@ -731,12 +797,23 @@ class SpotTuningWidget(QWidget):
             pass
 
     def set_projected(self, flag: bool) -> None:
-        """Whether the points of the selected image were placed on a projection (matched in 2D when tuning)."""
+        """Whether the points of the selected image were placed on a projection (matched in 2D when tuning); kept
+        for that image's truth layer until Save writes it."""
         self.projected_check.setChecked(bool(flag))
+        self._on_box(bool(flag))                      # also when the box showed it already (no toggled signal)
+
+    def _on_box(self, on: bool) -> None:
+        """The box changed by the user (or set_projected): it belongs to the selected image's truth layer."""
+        row = self._row()
+        layer = self.truth_layer(row.image_id) if row is not None else None
+        if layer is not None:
+            layer.metadata[_tuning.LAYER_KEY]["box"] = bool(on)
+        self._show_points()
 
     def save_points(self, image_id: str | None = None) -> bool:
         """Write the truth layer of the image (the selected one when None) to its file through the engine's
-        writer, in the file worker. True when the write started."""
+        writer, in the file worker. True when the write started. Not while a search runs: it read the saved files
+        when it started, and its result is what Apply offers."""
         if image_id is not None and not self.select_image(image_id):
             self._message(f"{image_id} is not an image of this project", RED)
             return False
@@ -749,6 +826,10 @@ class SpotTuningWidget(QWidget):
         if problem:
             self._message(problem, RED)
             return False
+        if self.searching:
+            self._message("a search is reading the saved truth points: save when it has finished (the points stay "
+                          "in the layer)", AMBER)
+            return False
         meta = dict(layer.metadata[_tuning.LAYER_KEY])
         if meta.get("other_planes"):
             self._message(_tuning.other_planes_text(meta["image_id"], int(meta["other_planes"]),
@@ -756,7 +837,7 @@ class SpotTuningWidget(QWidget):
             return False
         key = (os.path.normcase(meta["root"]), meta["image_id"], meta["annotator"])
         data = np.array(layer.data, float).reshape(-1, 3)
-        projected = self.projected_check.isChecked()
+        projected = self._box(layer)
 
         def job(should_stop):
             return _tuning.save_truth(meta, data, projected=projected)
@@ -782,23 +863,34 @@ class SpotTuningWidget(QWidget):
 
     def _retire(self, key, layer) -> None:
         """A truth layer whose run changed its grid: no longer the image's layer here (Open image opens the new
-        run), and renamed so it is not taken for it."""
+        run), and renamed so it is not taken for it, with the run's layers this dock added for that same run."""
         self._truth.pop(key, None)
         self._saved.pop(key, None)
-        self._rename_old([layer])
+        olds = [layer]
+        rkey = (key[0], key[1])
+        known = self._run_layers.get(rkey)
+        stamp = (layer.metadata.get(_tuning.LAYER_KEY) or {}).get("run_stamp")
+        if known is not None and stamp is not None and known.get("stamp") == stamp:
+            del self._run_layers[rkey]
+            olds += [*known.get("source", []), *known.get("results", [])]
+        self._rename_old(olds)
 
-    def _rename_old(self, layers) -> None:
-        """Mark ``layers`` (those still in the viewer) as layers of an earlier run of their image."""
+    def _rename_old(self, layers) -> int:
+        """Mark ``layers`` (those still in the viewer) as layers of an earlier run of their image; how many were
+        renamed."""
+        n = 0
         for old in layers:
             try:
                 if old in self.viewer.layers and not old.name.endswith("(old run)"):
                     old.name = f"{old.name} (old run)"
+                    n += 1
             except Exception:  # noqa: BLE001 - a layer that is gone keeps nothing to rename
                 pass
+        return n
 
     def _show_points(self, *, sync_box: bool = False) -> None:
         """The selected image's truth-point line; ``sync_box`` (another image selected) also sets the projected box
-        to what that image's layer was last opened or saved with."""
+        to that image's layer (as the user left it for that layer)."""
         row = self._row()
         layer = self.truth_layer(row.image_id) if row is not None else None
         if row is None:
@@ -809,17 +901,20 @@ class SpotTuningWidget(QWidget):
         else:
             n = len(layer.data)
             key = self._key(row.image_id)
-            if n == 0 and not self._unsaved(key, layer):
+            points_unsaved = self._points_unsaved(key, layer)
+            if n == 0 and not points_unsaved:
                 text = ("Click the spots of each nucleus you annotate on the truth-points layer (it is in add mode); "
                         "every spot of an annotated nucleus counts. Then Save points.")
-            elif self._unsaved(key, layer):
+            elif points_unsaved:
                 text = f"{n} point{'s' if n != 1 else ''}, not saved"
+            elif self._box_changed(layer):
+                text = f"{n} point{'s' if n != 1 else ''} saved; the 'placed on a projection' box changed, not saved"
             else:
                 text = f"{n} point{'s' if n != 1 else ''} saved"
-            if sync_box:
-                self.projected_check.blockSignals(True)
-                self.projected_check.setChecked(bool(layer.metadata[_tuning.LAYER_KEY].get("projected")))
-                self.projected_check.blockSignals(False)
+        if sync_box:
+            self.projected_check.blockSignals(True)
+            self.projected_check.setChecked(self._box(layer) if layer is not None else False)
+            self.projected_check.blockSignals(False)
         self.points_label.setText(text)
         self._update()
 
@@ -831,8 +926,9 @@ class SpotTuningWidget(QWidget):
 
     def set_grid_file(self, path) -> None:
         """Search the grid of this YAML file, or the engine's default for the recipe's backend with None. The file
-        is read in the file worker."""
-        self.grid_file = Path(path) if path else None
+        is read in the file worker. A relative path is taken from the current folder (the count and the engine
+        then read the same file)."""
+        self.grid_file = Path(os.path.abspath(str(path))) if path else None
         self._show_grid()
         backend, grid_file = self.backend, self.grid_file
 
@@ -919,11 +1015,17 @@ class SpotTuningWidget(QWidget):
             else:
                 self._message("the search ran, but no setting could be scored (see the warnings)", AMBER)
 
-        return self._engine_job(job, "tuning the spots (germquant tune-spots)", done,
-                                lambda e: self._failed(e, "tune-spots: "))
+        return self._engine_job(job, TUNE_LABEL, done, lambda e: self._failed(e, "tune-spots: "))
 
     def cancel(self) -> bool:
-        """Stop the search in flight (its engine process ends); False when none runs."""
+        """Stop the search in flight (its engine process ends); False when none runs, and for an engine in this
+        napari environment, which cannot stop a search (it ends on its own)."""
+        if not self.searching:
+            return False
+        if not self._cancellable():
+            self._message("a search in this napari environment cannot be stopped from the dock; it ends on its own",
+                          AMBER)
+            return False
         return self.engine_worker.cancel()
 
     def select_run(self, run_dir) -> bool:
@@ -1036,10 +1138,15 @@ class SpotTuningWidget(QWidget):
             self.open_btn.setEnabled(bool(has and row is not None and row.usable and row.finished and annotator
                                           and self.viewer is not None))
             layer = self.truth_layer(row.image_id) if row is not None else None
-            self.save_btn.setEnabled(bool(layer is not None and annotator and _tuning.points_problem() is None))
+            searching = self.searching
+            self.save_btn.setEnabled(bool(layer is not None and annotator and _tuning.points_problem() is None
+                                          and not searching))
             self.projected_check.setEnabled(layer is not None)
             self.tune_btn.setEnabled(bool(has and not busy and not running))
-            self.cancel_btn.setEnabled(busy and self.engine_worker.label.startswith("tuning"))
+            cancellable = self._cancellable() if searching else True
+            self.cancel_btn.setEnabled(searching and cancellable)
+            self.cancel_btn.setToolTip("end the search's engine process" if cancellable else
+                                       "a search in this napari environment cannot be stopped; it ends on its own")
             view = self.views.get(self.current_run) if self.current_run else None
             self.apply_btn.setEnabled(bool(has and view is not None and view.get("best") and not busy and not running))
         except RuntimeError:                          # the widget is gone (napari closing)

@@ -35,6 +35,7 @@ from _p6_tune import (
 )
 
 from napari_germquant import _settings, _tuning
+from napari_germquant._results import INSTANCE_COLORS
 from napari_germquant._runner import plugin_version
 from napari_germquant._tuning_widget import AMBER, GREEN, SpotTuningWidget, css
 
@@ -142,6 +143,11 @@ def test_opening_an_image_puts_the_source_results_and_a_truth_layer_on_the_runs_
     truth = w.truth_layer("img_a")
     assert truth is not None and truth.name == "img_a truth points (other)"
     assert truth.ndim == 3 and len(truth.data) == 0 and truth.mode == "add" and truth.editable
+    # red: no detection layer of a run has that colour (yellow spots, the extra instances' colours)
+    from napari.utils.colormaps.standardize_color import transform_color
+
+    assert np.allclose(transform_color(truth.current_face_color), [[1.0, 0.0, 0.0, 1.0]])
+    assert _tuning.TRUTH_COLOR not in ("yellow", *INSTANCE_COLORS)
     info = truth.metadata[_tuning.LAYER_KEY]
     assert info["image_id"] == "img_a" and info["annotator"] == "other" and Path(info["root"]) == tproj
     assert Path(info["file"]) == tproj / "annotations" / "img_a__points_other.csv"
@@ -158,7 +164,7 @@ def test_opening_an_image_puts_the_source_results_and_a_truth_layer_on_the_runs_
     assert fake.calls == []
 
 
-def test_tune_runs_through_the_engine_and_shows_the_top_five_of_ranked_csv(qtbot, tproj, fake):
+def test_tune_runs_through_the_engine_and_shows_the_top_five_of_ranked_csv(qtbot, tproj, fake, monkeypatch):
     standard_project(tproj)
     w = _dock(qtbot, runner=fake)
     w.set_annotator("tester")
@@ -193,6 +199,15 @@ def test_tune_runs_through_the_engine_and_shows_the_top_five_of_ranked_csv(qtbot
     assert fake.calls[-1][1]["grid"] == str(grid) and fake.calls[-1][1]["max_runs"] == 12
     w.set_grid_file(None)
     assert "default" in w.grid_label.text()
+    # a relative grid path is the current folder's, for the count and for the engine alike
+    monkeypatch.chdir(tproj)
+    w.set_grid_file("my_grid.yaml")
+    _settle(qtbot, w)
+    assert w.grid_file.is_absolute() and os.path.samefile(w.grid_file, grid)
+    assert w.tune()
+    _settle(qtbot, w)
+    sent = fake.calls[-1][1]["grid"]
+    assert Path(sent).is_absolute() and os.path.samefile(sent, grid)
 
 
 def test_apply_goes_through_the_engine_with_the_plugin_version_and_the_project_reads_again(qtbot, tproj, fake):
@@ -673,3 +688,108 @@ def test_the_label_image_is_decoded_once_while_its_file_stays_the_same(tmp_path,
         assert len(reads) == 2 and int(again.sum()) == 24
     finally:
         _tuning.forget_labels()
+
+
+def test_the_projected_box_is_kept_for_each_truth_layer(make_napari_viewer, qtbot, tproj, fake):
+    standard_project(tproj)
+    viewer = make_napari_viewer()
+    w = _dock(qtbot, viewer, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    for image_id in ("img_a", "img_b"):
+        assert w.open_image(image_id)
+        _settle(qtbot, w)
+    assert w.select_image("img_a") and not w.projected_check.isChecked()
+    w.set_projected(True)
+    assert w.truth_layer("img_a").metadata[_tuning.LAYER_KEY]["box"] is True
+    assert w.select_image("img_b") and not w.projected_check.isChecked()    # img_b's own box
+    assert w.select_image("img_a") and w.projected_check.isChecked()        # img_a's tick was kept
+    assert w.unsaved_images() == ["img_a"]                                 # a changed box is not saved yet
+    assert not w.tune() and "Save the truth points of img_a first" in w.last_message
+    assert w.select_image("img_c") and not w.projected_check.isEnabled()    # no truth layer, no box
+
+
+def test_cancel_is_off_for_an_engine_that_cannot_stop_a_search(qtbot, tproj):
+    standard_project(tproj)
+    fake = FakeTuneRunner()
+    fake.cancellable = False                                           # as the engine in napari's own process
+    fake.gate = threading.Event()
+    w = _dock(qtbot, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    try:
+        assert w.tune()
+        qtbot.waitUntil(fake.started.is_set, timeout=WAIT)
+        assert not w.cancel_btn.isEnabled() and "cannot be stopped" in w.cancel_btn.toolTip()
+        assert not w.cancel() and "cannot be stopped from the dock" in w.last_message
+        assert w.searching                                             # the search goes on
+    finally:
+        fake.release()
+    _settle(qtbot, w)
+    assert w.current_run is not None and "finished" in w.last_message      # it ended on its own
+
+
+def test_save_waits_while_a_search_reads_the_points(make_napari_viewer, qtbot, tproj, fake, monkeypatch):
+    """A search reads the saved truth-point files when it starts, and its result is what Apply offers: Save is
+    off until it has finished, and the points stay in the layer."""
+    standard_project(tproj)
+    monkeypatch.setattr(_tuning, "points_problem", lambda: None)       # a writer in any engine this suite runs on
+    fake.gate = threading.Event()
+    viewer = make_napari_viewer()
+    w = _dock(qtbot, viewer, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    assert w.open_image("img_b")
+    _settle(qtbot, w)
+    assert w.save_btn.isEnabled()
+    try:
+        assert w.tune()
+        qtbot.waitUntil(fake.started.is_set, timeout=WAIT)
+        w.truth_layer("img_b").add(np.array([[1.0, 2.0, 2.4]]))
+        assert not w.save_btn.isEnabled()
+        assert not w.save_points() and "a search is reading the saved truth points" in w.last_message
+        assert w.unsaved_images() == ["img_b"]
+    finally:
+        fake.release()
+    _settle(qtbot, w)
+    assert w.save_btn.isEnabled() and w.current_run is not None
+
+
+def test_a_second_annotator_gets_a_truth_layer_on_the_runs_layers_already_open(make_napari_viewer, qtbot, tproj,
+                                                                                fake):
+    """The run's source and results layers are added once for all the annotators of an image, while its run is
+    the same: a run made again since is read again, and the layers of the earlier run are renamed."""
+    made = standard_project(tproj)
+    viewer = make_napari_viewer()
+    w = _dock(qtbot, viewer, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    assert w.open_image("img_b")
+    _settle(qtbot, w)
+    first = [layer.name for layer in viewer.layers]
+    assert first[-1] == "img_b truth points (tester)" and "img_b nuclei" in first and "img_b [dna]" in first
+    w.set_annotator("other")
+    _settle(qtbot, w)
+    assert w.open_image("img_b")
+    _settle(qtbot, w)
+    assert [layer.name for layer in viewer.layers] == [*first, "img_b truth points (other)"]
+    assert "on its run's layers in the viewer" in w.last_message
+    # the image run again (at stride 2): the next opening reads the new run, the earlier run's layers are renamed
+    write_finished_run(tproj, "img_b", made["sources"]["img_b"], xy_stride=2)
+    w.set_annotator("third")
+    _settle(qtbot, w)
+    assert w.open_image("img_b")
+    _settle(qtbot, w)
+    names = [layer.name for layer in viewer.layers]
+    assert "img_b nuclei (old run)" in names and "img_b [dna] (old run)" in names and "(old run)" in w.last_message
+    assert viewer.layers["img_b nuclei"].data.shape == (6, 16, 24) == viewer.layers["img_b [dna]"].data.shape
+    assert names[-1] == "img_b truth points (third)"
+    # once the user has removed them, the next annotator's opening adds the run's layers again
+    for layer in [lay for lay in viewer.layers if not lay.name.startswith("img_b truth points")]:
+        viewer.layers.remove(layer)
+    w.set_annotator("fourth")
+    _settle(qtbot, w)
+    assert w.open_image("img_b")
+    _settle(qtbot, w)
+    names = [layer.name for layer in viewer.layers]
+    assert "img_b nuclei" in names and "img_b [dna]" in names and names[-1] == "img_b truth points (fourth)"

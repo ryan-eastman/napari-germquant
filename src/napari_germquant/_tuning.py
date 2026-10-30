@@ -60,7 +60,9 @@ MAX_RUNS = 50
 # the metadata key of a truth-point layer: which project, image, annotator and file it belongs to, and the run's
 # grid it was opened on (what Save needs)
 LAYER_KEY = "napari_germquant_tuning"
-TRUTH_COLOR = "magenta"
+# a colour no layer of a run uses for its detections (yellow spots; cyan, magenta, orange and lime for the extra
+# spot instances, _results.INSTANCE_COLORS), so a truth point never looks like a detection
+TRUTH_COLOR = "red"
 BACKEND_WORDS = {"log": ("LoG detection", "LoG detections"), "spotmax": ("SpotMAX run", "SpotMAX runs")}
 # the engine's file names (germquant.tune.points and germquant.tune.spots)
 POINTS_NAME_RE = re.compile(r"(?P<image_id>.+)__points_(?P<annotator>[A-Za-z0-9_-]{1,32})\.csv")
@@ -316,15 +318,19 @@ class RunInfo:
         spots = (self.config or {}).get("spots")
         return str(spots.get("backend") or "spotmax") if isinstance(spots, dict) else None
 
-    def meta(self, annotator: str, file: Path, projected: bool, *, labels_shape=None, other_planes: int = 0) -> dict:
+    def meta(self, annotator: str, file: Path, projected: bool, *, labels_shape=None, other_planes: int = 0,
+             run_stamp=None) -> dict:
         """The truth layer's record (LAYER_KEY): enough to save it again, and to tell at Save whether the run
         still has the grid the layer was opened on (``labels_shape``, the label image's (Z, Y, X)).
-        ``other_planes`` counts the file's points that a one-plane run cannot hold (``read_truth``)."""
+        ``other_planes`` counts the file's points that a one-plane run cannot hold (``read_truth``); ``run_stamp``
+        names the run the layer was opened on (``run_stamp``); ``box``, set by the dock, is the "placed on a
+        projection" box as the user left it for this layer (``projected`` is what the file holds)."""
         return {"root": str(self.root), "image_id": self.image_id, "annotator": annotator, "file": str(file),
                 "result_dir": str(self.result_dir), "table_spacing": [float(s) for s in self.table_spacing],
                 "xy_stride": int(self.xy_stride), "z_range": list(self.z_range) if self.z_range else None,
                 "labels_shape": [int(v) for v in labels_shape] if labels_shape is not None else None,
-                "planar": bool(self.planar), "projected": bool(projected), "other_planes": int(other_planes)}
+                "planar": bool(self.planar), "projected": bool(projected), "other_planes": int(other_planes),
+                "run_stamp": list(run_stamp) if run_stamp is not None else None}
 
 
 def _table_spacing(rs: ResultsSet) -> tuple[float, float, float]:
@@ -374,6 +380,17 @@ def tiff_shape(path) -> tuple[int, int, int]:
 def labels_shape(info: RunInfo) -> tuple[int, int, int]:
     """The (Z, Y, X) shape of the run's label image, from its header."""
     return tiff_shape(labels_file(info.result_dir, info.image_id))
+
+
+def run_stamp(info: RunInfo, shape=None) -> list:
+    """What tells one run of an image from another for the layers it opens with: its stride, z range and label
+    image shape, the label image file's modification time and size (a run made again writes it again) and the
+    source file. A dock shows the run's source and results layers once for all its annotators only while the
+    image's run has the same stamp."""
+    st = os.stat(_long(labels_file(info.result_dir, info.image_id)))
+    shape = labels_shape(info) if shape is None else shape
+    return [int(info.xy_stride), list(info.z_range) if info.z_range else None, [int(v) for v in shape],
+            int(st.st_mtime_ns), int(st.st_size), str(info.source) if info.source is not None else None]
 
 
 # The run's label image, decoded once for the Saves of one image: the engine writes it zlib-compressed, so it
@@ -493,35 +510,46 @@ def read_truth(info: RunInfo, annotator: str, shape=None) -> tuple[np.ndarray, b
 
 
 def truth_layer(info: RunInfo, annotator: str, data: np.ndarray, projected: bool, *, labels_shape=None,
-                other_planes: int = 0) -> tuple:
+                other_planes: int = 0, run_stamp=None) -> tuple:
     """The editable Points layer of the annotator's truth points on the run's frame (no scale: its coordinates
     are the run's micrometres, napari's world coordinates of the run's layers)."""
     size = spot_marker_size_um(info.config, "spots")
     file = points_file(info.root, info.image_id, annotator)
-    record = info.meta(annotator, file, projected, labels_shape=labels_shape, other_planes=other_planes)
+    record = info.meta(annotator, file, projected, labels_shape=labels_shape, other_planes=other_planes,
+                       run_stamp=run_stamp)
     kwargs = {"name": truth_name(info.image_id, annotator), "ndim": 3, "size": size, "face_color": TRUTH_COLOR,
               "border_color": "white", "metadata": {LAYER_KEY: record}}
     return (np.asarray(data, float).reshape(-1, 3), kwargs, "points")
 
 
-def image_layers(info: RunInfo, annotator: str) -> tuple[list, np.ndarray, str]:
+def image_layers(info: RunInfo, annotator: str, *, have=None) -> dict:
     """The layers an image opens with, bottom first: the source image (when its file is there), the run's
-    results and the truth layer. Returns (layer tuples, the truth points it starts with, notes)."""
-    notes = []
-    layers = []
-    try:
-        layers += source_layers(info)
-    except TuningError as e:
-        notes.append(str(e))
-    except Exception as e:  # noqa: BLE001 - an unreadable source never stops the run's own layers
-        notes.append(f"{info.image_id}: the source image {info.source} cannot be read ({type(e).__name__}: {e})")
-    layers += load_results_layers(ResultsSet(info.result_dir, info.image_id), include_source=False)
+    results and the truth layer. ``have`` names the run (``run_stamp``) of the image's source and results layers
+    a dock has in the viewer already, for another annotator ({"source": stamp, "results": stamp}): a part whose
+    stamp is this run's is not read again. Returns {"source": [layer tuples], "results": [...], "truth": layer
+    tuple, "data": the truth points it starts with, "note": notes, "stamp": this run's stamp, "read_source" and
+    "read_results": whether those parts were read}."""
+    have = have or {}
     shape = labels_shape(info)
+    stamp = run_stamp(info, shape)
+    read_source, read_results = have.get("source") != stamp, have.get("results") != stamp
+    notes = []
+    src: list = []
+    if read_source:
+        try:
+            src = source_layers(info)
+        except TuningError as e:
+            notes.append(str(e))
+        except Exception as e:  # noqa: BLE001 - an unreadable source never stops the run's own layers
+            notes.append(f"{info.image_id}: the source image {info.source} cannot be read ({type(e).__name__}: {e})")
+    res = (load_results_layers(ResultsSet(info.result_dir, info.image_id), include_source=False)
+           if read_results else [])
     data, projected, note, other = read_truth(info, annotator, shape)
     if note:
         notes.append(note)
-    layers.append(truth_layer(info, annotator, data, projected, labels_shape=shape, other_planes=other))
-    return layers, data, "; ".join(notes)
+    truth = truth_layer(info, annotator, data, projected, labels_shape=shape, other_planes=other, run_stamp=stamp)
+    return {"source": src, "results": res, "truth": truth, "data": data, "note": "; ".join(notes), "stamp": stamp,
+            "read_source": read_source, "read_results": read_results}
 
 
 def _z_range(value) -> tuple[int, int] | None:

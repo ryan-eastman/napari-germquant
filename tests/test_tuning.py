@@ -161,10 +161,14 @@ def test_truth_points_round_trip_on_the_runs_grid(make_napari_viewer, qtbot, tpr
     # the file's points (z 1.0 um of the file is plane 2, plane 1 of the run) on the run's frame
     assert np.allclose(truth.data, [[0.5, 2.0, 2.4], [0.5, 4.0, 6.8]])
     assert w.unsaved_images() == [] and "2 points saved" in w.points_label.text()
+    w.set_projected(True)                             # the box alone changes the file: unsaved, and kept per layer
+    assert w.unsaved_images() == ["img_a"] and "box changed, not saved" in w.points_label.text()
+    assert w.select_image("img_b") and not w.projected_check.isChecked()
+    assert w.select_image("img_a") and w.projected_check.isChecked()
     truth.add(np.array([[1.0, 3.2, 4.0]]))
-    w.set_projected(True)
     assert w.save_points()
     _settle(qtbot, w)
+    assert w.unsaved_images() == []
     path = tproj / "annotations" / "img_a__points_tester.csv"
     expect = write_points(tmp_path / "expect.csv", np.array(truth.data, float),
                           labels=run_labels(xy_stride=2, z_range=(1, 5)), spacing=(0.5, 0.4, 0.4), xy_stride=2,
@@ -265,11 +269,13 @@ def test_a_run_made_again_on_another_grid_is_not_saved_over(make_napari_viewer, 
     assert "changed since its truth layer was opened" in w.last_message and "xy stride 2 to 1" in w.last_message
     assert ann.read_bytes() == before
     assert w.truth_layer("img_a") is None and old.name == "img_a truth points (tester) (old run)"
+    assert "img_a nuclei (old run)" in [layer.name for layer in viewer.layers]
     assert w.open_image("img_a")                                       # the new run, the file's two points on it
     _settle(qtbot, w)
     new = w.truth_layer("img_a")
     assert new is not old and new.name == "img_a truth points (tester)"
     assert np.allclose(new.data, [[1.0, 2.0, 2.4], [1.0, 4.0, 6.8]])
+    assert viewer.layers["img_a nuclei"].data.shape == (6, 32, 48)
     new.add(np.array([[1.5, 3.2, 4.0]]))
     assert w.save_points()
     _settle(qtbot, w)
