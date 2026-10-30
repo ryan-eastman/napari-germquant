@@ -513,6 +513,30 @@ def test_a_run_started_by_a_project_dock_of_this_napari_blocks_edits(qtbot, tmp_
     _settle(tab, qtbot)
 
 
+def test_a_run_marked_by_the_project_docks_own_module_blocks_edits(qtbot, tmp_path):
+    """Review N11 with P6-PROJECT's real bookkeeping (in this branch since PROJECT's merge): while
+    _project.mark_running holds the project shown, as a run of a Project dock does, the tab takes no edit; after
+    mark_finished it takes one. The stand-in test above covers another project's run and no Project dock."""
+    from napari_germquant import _project
+    from napari_germquant._recipe_widget import RUNNING_TEXT
+
+    def answer(kw):
+        changed = any((kw.get("roles") or {}).values())
+        return preview_record(_bind(), config_hash="bbbbbbbbbbbb" if changed else PACK_HASH, changed=changed)
+
+    fake = FakeRunner(answer)
+    tab = _tab(qtbot, tmp_path, session=FakeSession(fake), reader=lambda root, reference=None: fake_view(tmp_path))
+    _project.mark_running(tmp_path, "run-1")
+    try:
+        tab.choose_channel("dna", "DAPI")
+        assert tab.role_choice("dna") is None and tab.status_label.text() == RUNNING_TEXT
+    finally:
+        _project.mark_finished(tmp_path)
+    tab.choose_channel("dna", "DAPI")
+    _settle(tab, qtbot)
+    assert tab.role_choice("dna") == "DAPI" and tab.apply_roles_btn.isEnabled()
+
+
 def test_a_run_in_progress_and_a_refused_write_leave_the_project_as_it_was(qtbot, tmp_path):
     """While the host says a run of the project goes, the role editor and the form take no edit; a write the
     engine refuses shows its reason, emits nothing and keeps the choices, and the project is read again (a write
