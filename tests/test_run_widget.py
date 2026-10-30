@@ -93,7 +93,7 @@ def test_timelapse_header_blocks_the_run(make_napari_viewer, tmp_path):
 
 def _tables(out: Path, image_id: str = IMAGE_ID) -> dict[str, pd.DataFrame]:
     """Every table of the image, CSV and parquet, without the run_timestamp column (section 9)."""
-    tables = {f.name: pd.read_csv(f, low_memory=False, float_precision="round_trip")
+    tables = {f.name: pd.read_csv(f, low_memory=False, float_precision="round_trip", dtype={"config_hash": str})
               for f in sorted(out.glob(f"{image_id}__*.csv"))}
     tables.update({f.name: pd.read_parquet(f) for f in sorted(out.glob(f"{image_id}__*.parquet"))})
     return {name: df.drop(columns=["run_timestamp"], errors="ignore") for name, df in tables.items()}
