@@ -831,6 +831,24 @@ def train_summary(res: dict, asked_device: str | None = None) -> str:
 
 _SUMMARY_START = re.compile(r"^\S.*: trained on \d+ slice\(s\) from ")
 
+# the engines whose train-nuclei takes the model card fields: --system, --kind and --dataset came with train-curve
+CARD_FIELDS_FEATURE = "train_curve"
+
+
+def card_fields_missing(fields: dict, *, interpreter: str | None = None, info: dict | None = None) -> str:
+    """The message for an engine whose ``train-nuclei`` takes no model card fields (one from before the tranche-5
+    Train B engine, which would stop at the unknown option). ``interpreter`` and ``info`` (its version document) name
+    the engine."""
+    opts = ", ".join(f"--{k}" for k in fields) or "--system, --kind, --dataset"
+    info = info or {}
+    who = (f"The engine at {interpreter} is germquant {info.get('germquant')} (git {str(info.get('git_sha'))[:12]}), "
+           f"whose train-nuclei does not take them." if interpreter else
+           "This napari environment's germquant does not take them.")
+    return (f"The model card fields ({opts}) need the tranche-5 Train B engine (germquant with the "
+            f"{CARD_FIELDS_FEATURE!r} feature, which came with them). {who} Set Object kind to auto and leave System "
+            f"and Dataset empty to train with it, or update that engine checkout (git pull) and reinstall it, or "
+            f"choose another engine.")
+
 
 def engine_train_summary(res: dict, asked_device: str | None = None) -> str:
     """What a training through an engine runner said: the in-process runner's result as train_summary words it,

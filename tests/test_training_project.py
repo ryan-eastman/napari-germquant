@@ -845,3 +845,26 @@ def test_a_stored_engine_whose_check_fails_is_checked_once(qtbot, monkeypatch):
     assert w.idle and _BrokenEngine.checks == 1
     assert "cannot be used" in w.engine_label.text() and "not a germquant engine" in w.engine_label.text()
     assert w.engine_route() == "engine"                     # still the stored choice: never napari silently
+
+
+def test_card_fields_go_only_to_an_engine_that_takes_them(make_napari_viewer, qtbot, tmp_path):
+    """N6: an engine from before the card fields (no train_curve; the plugin CI's pin 361b082 and main f00cb36) would
+    stop at --kind with a usage error. In a project the pack sets the kind, so Train says what to do instead, and
+    with Object kind auto (System and Dataset empty) it trains there as before."""
+    root = write_project(tmp_path / "study", rounds=("r01",))
+    write_pairs(root / "training" / "r01", "img_a", 2)
+    old = FakeTrainRunner(features={"packs", "projects"})
+    viewer, w = _dock(make_napari_viewer, old)
+    w.set_project(root)
+    _settle(qtbot, w)
+    assert w.kind_combo.currentData() == "nucleus"          # the project's pack
+    assert w.train()
+    _settle(qtbot, w)
+    text = w.status_label.text()
+    assert not old.called("train_nuclei") and RED in w.status_label.styleSheet() and "FAILED" not in text
+    assert "--kind" in text and "Object kind to auto" in text and "unrecognized" not in text
+    w.kind_combo.setCurrentIndex(w.kind_combo.findData("auto"))
+    assert w.train()
+    _settle(qtbot, w)
+    kw = old.last("train_nuclei")[1]
+    assert kw["kind"] is None and kw["system"] is None and kw["dataset"] is None and w.last_train is not None

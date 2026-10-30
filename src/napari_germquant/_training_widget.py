@@ -1674,10 +1674,17 @@ class TrainingWidget(QWidget):
 
             def job():
                 runner = self._job_runner(engine=True, recipe=recipe, should_stop=worker.should_stop)
+                fields = settings.card_fields()
+                if fields and T.CARD_FIELDS_FEATURE not in runner.features(should_stop=worker.should_stop):
+                    # an engine from before the card fields would stop at the unknown option (a usage error)
+                    here = isinstance(runner, InProcessRunner)
+                    raise FeatureMissing(T.card_fields_missing(fields, interpreter=None if here else runner.python,
+                                                               info=runner.cached_version()),
+                                         T.CARD_FIELDS_FEATURE)
                 return runner.train_nuclei(str(pairs_dir), str(settings.out), base=settings.base, name=settings.name,
                                            epochs=epochs, split_by=settings.split_by, val_frac=float(settings.val_frac),
                                            seed=int(settings.seed), device=settings.device, say=_say,
-                                           should_stop=worker.should_stop, **settings.card_fields())
+                                           should_stop=worker.should_stop, **fields)
 
             returned = lambda res: self._on_trained_engine(res, settings, pairs_dir, notes)  # noqa: E731
         else:
