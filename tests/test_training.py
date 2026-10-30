@@ -593,6 +593,8 @@ def test_train_use_in_project_and_derive_pack(make_napari_viewer, qtbot, project
     assert Path(w.model_edit.text()) == model and model.is_file() and Path(w.card_edit.text()).is_file()
     card = json.loads(Path(w.card_edit.text()).read_text(encoding="utf-8"))
     assert card["object_kind"] == "nucleus"                      # the pack's object kind, passed as --kind
+    argv = next(a for a in reversed(seams_runner.history) if "train-nuclei" in a)
+    assert argv[argv.index("--kind") + 1] == "nucleus"           # the pack's, not the engine's default
 
     assert w.use_in_project()
     _settled(qtbot, w)
