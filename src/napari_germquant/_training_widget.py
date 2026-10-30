@@ -1443,8 +1443,7 @@ class TrainingWidget(QWidget):
 
         def job():
             # in a project, the recipe's own interpreter on this computer when one is stored, as export and train
-            runner = self._job_runner("import_labels", engine=engine, recipe=recipe if engine else None,
-                                      should_stop=worker.should_stop)
+            runner = self._job_runner("import_labels", engine=engine, recipe=recipe, should_stop=worker.should_stop)
             return runner.import_labels(src, fmt, image, pairs, should_stop=worker.should_stop, **kw)
 
         self._start_step("import", job, label=f"importing labels for {Path(image).name}",
