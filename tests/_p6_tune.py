@@ -412,6 +412,33 @@ class FakeHub(QObject):
         self.running_changed.emit(bool(running))
 
 
+class _Config:
+    """What the dock reads of germquant.project.project_config's config: ``get("spots.backend")``."""
+
+    def __init__(self, backend: str) -> None:
+        self.backend = backend
+
+    def get(self, key: str, default=None):
+        return self.backend if key == "spots.backend" else default
+
+
+def project_module_stand_in(backend: str | None):
+    """A stand-in module for germquant.project (put in sys.modules with monkeypatch.setitem) whose
+    project_config gives a recipe with this spot backend; None makes it fail, as for a project whose pack does
+    not resolve in napari's environment (the dock then takes the backend of the annotated runs)."""
+    import types
+
+    module = types.ModuleType("germquant.project")
+
+    def project_config(root):
+        if backend is None:
+            raise ValueError(f"{root}: the pack test_pack@0.1.0 is not installed in this environment")
+        return _Config(backend)
+
+    module.project_config = project_config
+    return module
+
+
 def standard_project(root, *, stride: int = 2, z_range=(1, 5)) -> dict:
     """A project of five images: img_a finished (at ``stride`` and ``z_range``) with tester's truth points saved,
     img_b finished without points, img_c not run yet, img_x excluded and img_t a time series. Returns the paths."""

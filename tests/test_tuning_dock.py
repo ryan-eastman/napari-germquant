@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -27,6 +28,7 @@ from _p6_tune import (
     FakeHub,
     FakeTuneRunner,
     StaticSession,
+    project_module_stand_in,
     ranked_rows,
     read_manifest,
     standard_project,
@@ -493,7 +495,7 @@ def test_the_project_docks_own_hub_is_followed(qtbot, tproj, fake):
     hub.reload_requested.connect(lambda: reloads.append(1))
     w.set_annotator("tester")
     hub.root = tproj
-    hub._emit(hub.opened, str(tproj))
+    hub.opened.emit(str(tproj))                               # as the Project dock does when it opens a project
     _settle(qtbot, w)
     assert w.root == tproj
     assert w.tune()
@@ -793,3 +795,32 @@ def test_a_second_annotator_gets_a_truth_layer_on_the_runs_layers_already_open(m
     _settle(qtbot, w)
     names = [layer.name for layer in viewer.layers]
     assert "img_b nuclei" in names and "img_b [dna]" in names and names[-1] == "img_b truth points (fourth)"
+
+
+def test_images_with_truth_points_of_several_annotators_are_named(qtbot, tproj, fake):
+    """A search scores one annotator per image and the engine refuses an image with two: the dock says which."""
+    standard_project(tproj)
+    (tproj / "annotations" / "img_a__points_other.csv").write_text(
+        "point_id,z_um,y_um,x_um,zi,yi,xi,object_id,projected\n0,1.0,2.0,2.4,2,10,12,1,false\n", encoding="ascii")
+    w = _dock(qtbot, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    assert w.row("img_a").annotators == ["other", "tester"] and "also annotated by other" in w.row("img_a").text
+    assert "img_a: truth points of several annotators in annotations/" in w.notice_label.text()
+    assert "refuses them" in w.notice_label.text() and not w.notice_label.isHidden()
+
+
+def test_the_recipes_spot_backend_comes_before_the_runs(qtbot, tproj, fake, monkeypatch):
+    """The engine tunes the project recipe's spot backend: when napari's germquant resolves the recipe, the dock
+    takes that backend, and the annotated runs' only when it cannot."""
+    standard_project(tproj)                                            # its runs were made with the log backend
+    monkeypatch.setitem(sys.modules, "germquant.project", project_module_stand_in("spotmax"))
+    w = _dock(qtbot, runner=fake)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    assert (w.backend, w.backend_source) == ("spotmax", "the project's recipe")
+    assert "the backend from" not in w.count_label.text()
+    monkeypatch.setitem(sys.modules, "germquant.project", project_module_stand_in(None))
+    w.refresh()
+    _settle(qtbot, w)
+    assert (w.backend, w.backend_source) == ("log", "the annotated runs")

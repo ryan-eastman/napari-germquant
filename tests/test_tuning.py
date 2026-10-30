@@ -27,6 +27,7 @@ from _p6_tune import (
     StaticSession,
     FakeHub,
     image_entry,
+    project_module_stand_in,
     read_manifest,
     run_labels,
     standard_project,
@@ -282,7 +283,7 @@ def test_a_run_made_again_on_another_grid_is_not_saved_over(make_napari_viewer, 
     assert read_points(ann)["zi"].tolist() == [2, 2, 3] and w.unsaved_images() == []
 
 
-def test_the_count_line_names_the_detections_the_grid_means(qtbot, tproj):
+def test_the_count_line_names_the_detections_the_grid_means(qtbot, tproj, monkeypatch):
     """What a search means before it starts (germquant.tune.grid.n_runs): the default grid of the runs' backend or
     a grid file, on the images that have truth points and a finished run, against Max runs."""
     need_features("tune_spots")
@@ -317,6 +318,13 @@ def test_the_count_line_names_the_detections_the_grid_means(qtbot, tproj):
     w.refresh()
     _settle(qtbot, w)
     assert "2 SpotMAX runs on 2 annotated images" in w.count_label.text()
+    assert "(the backend from the annotated runs)" in w.count_label.text()   # the pack does not resolve here
+    # the project's recipe decides when napari's germquant resolves it (the engine tunes the recipe's backend)
+    monkeypatch.setitem(sys.modules, "germquant.project", project_module_stand_in("log"))
+    w.refresh()
+    _settle(qtbot, w)
+    assert "12 LoG detections on 2 annotated images" in w.count_label.text()
+    assert "the backend from" not in w.count_label.text()
 
 
 def test_saving_points_needs_the_engine_writer_in_this_environment(make_napari_viewer, qtbot, tproj, monkeypatch):
