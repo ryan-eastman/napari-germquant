@@ -175,6 +175,25 @@ def test_project_mode_follows_the_hub_and_the_round_folders(make_napari_viewer, 
     assert Path(w.pairs_edit.text()) == root / "training" / "r01"
 
 
+def test_a_new_round_made_elsewhere_is_listed_at_the_next_reading(make_napari_viewer, qtbot, tmp_path):
+    """Every reading of the Project dock reads the project here again; the engine lists the rounds again only when
+    the round folders on disk are not the ones it listed (a round made in a terminal, say)."""
+    root = write_project(tmp_path / "study", rounds=("r01",))
+    hub, runner = FakeHub(), FakeTrainRunner()
+    viewer, w = _dock(make_napari_viewer, runner, hub)
+    hub.open(root)
+    _settle(qtbot, w)
+    assert w.rounds == ["r01"] and len(runner.called("project_rounds")) == 1
+    hub.changed.emit()
+    _settle(qtbot, w)
+    assert len(runner.called("project_rounds")) == 1           # nothing changed: no engine call
+    (root / "training" / "r02").mkdir()                         # `germquant project rounds STUDY --new`
+    hub.changed.emit()
+    _settle(qtbot, w)
+    assert len(runner.called("project_rounds")) == 2 and w.rounds == ["r01", "r02"]
+    assert w.round_combo.currentText() == "r01"                 # the round chosen stays chosen
+
+
 def test_a_project_opened_here_survives_the_hub_closing_another(make_napari_viewer, qtbot, tmp_path):
     root = write_project(tmp_path / "mine")
     hub, runner = FakeHub(), FakeTrainRunner()
@@ -461,18 +480,21 @@ def test_in_a_project_the_import_takes_its_images_and_the_round(make_napari_view
 # ---- the starting weights, Use in project and Derive pack -------------------------------------------------------
 
 def test_starting_weights_offer_the_packs_and_the_projects_models(make_napari_viewer, qtbot, tmp_path):
-    root = write_project(tmp_path / "study", recipe="with_model", pack_models=("tinynet@f5055f8a",), rounds=("r01",))
+    root = write_project(tmp_path / "study", recipe="with_model", pack_models=("tinynet@f5055f8a",), rounds=("r01",),
+                         object_kind="cell")
     model, _card = write_model(root / "training" / "r01" / "models" / "m1")
     runner = FakeTrainRunner()
     viewer, w = _dock(make_napari_viewer, runner)
     before = _texts(w.base_combo)
+    assert w.kind_combo.currentData() == "auto"
     w.set_project(root)
     _settle(qtbot, w)
     texts = _texts(w.base_combo)
-    assert texts[0] == "tinynet@f5055f8a" and texts[1] == str(model)
+    assert texts[0] == "tinynet@f5055f8a" and texts[1] == str(model) and w.base_combo.currentIndex() == 0
     assert texts[2:4] == ["cpsam", "none"]
+    assert w.kind_combo.currentData() == "cell"           # the pack's object kind goes on the card (--kind)
     w.close_project()
-    assert _texts(w.base_combo) == before
+    assert _texts(w.base_combo) == before and w.kind_combo.currentData() == "auto"
 
 
 def test_use_in_project_and_derive_pack_go_through_the_engine(make_napari_viewer, qtbot, tmp_path, monkeypatch):
