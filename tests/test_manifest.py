@@ -24,7 +24,8 @@ def test_manifest_is_valid_and_matches_pyproject():
         assert cmd.id.startswith(mf.name + "."), cmd.id
         module, attr = cmd.python_name.split(":")
         assert callable(getattr(importlib.import_module(module), attr)), cmd.python_name
-    assert {w.display_name for w in mf.contributions.widgets} == {"Run", "Results", "Training", "Time-lapse"}
+    assert {w.display_name for w in mf.contributions.widgets} == {"Run", "Results", "Training", "Time-lapse",
+                                                                  "Project", "Spot tuning"}
 
 
 def test_reader_patterns_equal_the_engine_suffixes():
@@ -52,3 +53,20 @@ def test_every_dock_opens_through_napari(make_napari_viewer):
     for name in ("Run", "Results", "Training", "Time-lapse"):
         _dock, widget = viewer.window.add_plugin_dock_widget("napari-germquant", name)
         assert getattr(widget.viewer, "__wrapped__", widget.viewer) is viewer, name
+
+
+def test_the_project_dock_opens_through_napari(make_napari_viewer):
+    """The Project dock (tranche 5 Train B) from the Plugins menu route, with the viewer injected as napari's proxy."""
+    viewer = make_napari_viewer()
+    _dock, widget = viewer.window.add_plugin_dock_widget("napari-germquant", "Project")
+    assert getattr(widget.viewer, "__wrapped__", widget.viewer) is viewer
+    assert widget.tabs.count() >= 3 and widget.root is None
+
+
+def test_the_spot_tuning_dock_opens_through_napari(make_napari_viewer):
+    """The Spot tuning dock (tranche 5 Train B) from the Plugins menu route, with the viewer injected as napari's
+    proxy."""
+    viewer = make_napari_viewer()
+    _dock, widget = viewer.window.add_plugin_dock_widget("napari-germquant", "Spot tuning")
+    assert getattr(widget.viewer, "__wrapped__", widget.viewer) is viewer
+    assert widget.root is None and widget.tune_btn.text() == "Tune"
