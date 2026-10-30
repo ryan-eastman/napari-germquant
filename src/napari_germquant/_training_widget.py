@@ -136,22 +136,18 @@ def _same(a, b) -> bool:
 
 def _viewer_hub(viewer):
     """The Project dock's hub of ``viewer`` (napari_germquant._project_widget.project_hub, unit P6-PROJECT), or
-    None without a viewer or without that dock in this plugin."""
+    None without a viewer."""
     if viewer is None:
         return None
-    try:
-        from ._project_widget import project_hub
-    except ImportError:
-        return None
+    from ._project_widget import project_hub
+
     return project_hub(viewer)
 
 
 def _run_in_progress(root) -> bool:
-    """Whether a dock of this napari runs the project now (the Project dock's registry, when it is in the plugin)."""
-    try:
-        from ._project import run_in_progress
-    except ImportError:
-        return False
+    """Whether a dock of this napari runs the project now (the Project dock's registry)."""
+    from ._project import run_in_progress
+
     return bool(run_in_progress(root))
 
 

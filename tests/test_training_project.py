@@ -196,8 +196,8 @@ def test_project_mode_follows_the_hub_and_the_round_folders(make_napari_viewer, 
 def test_the_project_docks_own_hub_is_followed(make_napari_viewer, qtbot, tmp_path):
     """The Project dock's real hub (unit P6-PROJECT), which a dock opened on the same viewer finds by itself: it
     runs from P6-INT's merge of that unit into feat/t5-p6 on (a sibling plugin module, not an engine feature)."""
-    hubs = pytest.importorskip("napari_germquant._project_widget",
-                               reason="the Project dock (unit P6-PROJECT) is not in this branch yet")
+    from napari_germquant import _project_widget as hubs
+
     root = write_project(tmp_path / "study", rounds=("r01",))
     viewer = make_napari_viewer()
     hub = hubs.project_hub(viewer)

@@ -824,17 +824,15 @@ def apply_warnings(rec) -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------------
-# runs in progress (the Project dock's registry, when that dock is in this plugin)
+# runs in progress (the Project dock's registry)
 # ---------------------------------------------------------------------------------------------------
 
 
 def run_in_progress(root) -> bool:
     """Whether a dock of this napari runs this project now (napari_germquant._project.run_in_progress, unit
     P6-PROJECT): a search and an Apply wait until it has finished."""
-    try:
-        from ._project import run_in_progress as running
-    except ImportError:
-        return False
+    from ._project import run_in_progress as running
+
     try:
         return bool(running(root))
     except Exception:  # noqa: BLE001 - the registry is a hint; the hub's running flag is the other

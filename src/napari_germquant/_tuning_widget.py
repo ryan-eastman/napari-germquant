@@ -97,13 +97,11 @@ def _error_text(exc: BaseException) -> str:
 
 def _viewer_hub(viewer):
     """The Project dock's hub of ``viewer`` (napari_germquant._project_widget.project_hub, unit P6-PROJECT), or None
-    without a viewer or without that dock in this plugin."""
+    without a viewer."""
     if viewer is None:
         return None
-    try:
-        from ._project_widget import project_hub
-    except ImportError:
-        return None
+    from ._project_widget import project_hub
+
     return project_hub(viewer)
 
 

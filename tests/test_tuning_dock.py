@@ -481,8 +481,8 @@ class _StubViewer:
 def test_the_project_docks_own_hub_is_followed(qtbot, tproj, fake):
     """With the Project dock in the same plugin (unit P6-PROJECT, merged into feat/t5-p6 before this unit, plan
     5.1), the tuning dock takes the viewer's own hub, napari_germquant._project_widget.project_hub."""
-    widget_module = pytest.importorskip("napari_germquant._project_widget",
-                                        reason="the Project dock (unit P6-PROJECT) is not in this branch yet")
+    from napari_germquant import _project_widget as widget_module
+
     standard_project(tproj)
     w0 = _dock(qtbot, runner=fake)
     assert w0.hub is None                                     # no viewer, no hub
