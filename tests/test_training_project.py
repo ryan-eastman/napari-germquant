@@ -85,7 +85,15 @@ def test_an_engine_chosen_in_another_dock_is_shown_before_the_next_step(make_nap
 
     from napari_germquant._runner import InProcessRunner
 
+    here: list = []
+
+    def export_slices(source, pairs_dir, settings):
+        here.append(settings)
+        write_pairs(pairs_dir, "a", 2)
+        return T.read_manifest_csv(pairs_dir)
+
     monkeypatch.setattr(InProcessRunner, "export_training", export_training)
+    monkeypatch.setattr(T, "export_slices", export_slices)
     viewer = make_napari_viewer()
     w = TrainingWidget(viewer)
     assert w.engine_route() == "napari" and "No engine chosen" in w.engine_label.text()
@@ -94,10 +102,17 @@ def test_an_engine_chosen_in_another_dock_is_shown_before_the_next_step(make_nap
     w.set_pairs_dir(tmp_path / "pairs")
     _settle(qtbot, w)
     assert w.export()
+    assert "No engine chosen" not in w.engine_label.text()           # said before the step runs
     _settle(qtbot, w)
     assert w.engine_route() == "engine" and len(seen) == 1           # the engine runner's export, not the dock's
     assert "No engine chosen" not in w.engine_label.text() and "in process" in w.engine_label.text()
     assert len(w.pairs) == 2
+    # the choice removed again: the next step runs here, and the engine line says so before it starts
+    _settings.set_engine_choice(None)
+    assert w.export(overwrite_corrections=True)
+    assert w.engine_route() == "napari" and "No engine chosen" in w.engine_label.text()
+    _settle(qtbot, w)
+    assert len(seen) == 1 and len(here) == 1 and w.last_error is None, w.status_label.text()
 
 
 def test_a_step_that_returns_after_another_project_opened_leaves_its_folders(make_napari_viewer, qtbot, tmp_path):

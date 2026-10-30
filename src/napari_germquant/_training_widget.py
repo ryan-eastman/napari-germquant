@@ -713,6 +713,7 @@ class TrainingWidget(QWidget):
 
     def _on_session_changed(self) -> None:
         self._known_choice = _settings.engine_choice()
+        self._show_engine()                           # at once: the engine stored now, or "checking ..."
         if self._engine_chosen():
             self._check_engine()
         else:
