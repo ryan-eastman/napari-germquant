@@ -45,10 +45,12 @@ next one (r01, r02 and so on). Then also:
   <project>/packs``): the pack listing with the project then shows the derived pack.
 
 Every project write goes through the engine (decision D39): the chosen engine, or napari's own germquant command
-when none is chosen. The GUI thread never waits on the engine or a slow file system: the steps run in one thread
-worker, the readings (the runs' geometry, the project, an image's channels) in another, the engine check and the
-round listing in a third. A reading or a listing that returns after its project was closed, or after a newer one
-was asked for, changes nothing.
+when none is chosen. The GUI thread never waits on the engine, and a project event (a reading of the Project
+dock, a round listing, a round chosen) reads no project file there, since a project can sit on a slow share: the
+steps run in one thread worker, the readings (the runs' geometry, the project with the model files it names, a
+round's pairs, an image's channels) in another, the engine check and the round listing in a third. A reading or a
+listing that returns after its project was closed, or after a newer one was asked for, changes nothing. A button
+of P4's (Open training folder, Export, Train, Save) still reads its own folder when pressed, as before.
 
 Everything the dock decides is in ``_training`` (no Qt); this module is layout, signals and the layers.
 """
@@ -240,6 +242,7 @@ class TrainingWidget(QWidget):
         self._reading = 0                              # one more at every project reading asked for, and at Close
         self._reading_root: Path | None = None         # the folder of the newest reading still in flight
         self._rounds_req = 0                           # one more at every round listing asked for, and at New round
+        self._round_req = 0                            # one more at every reading of a round's pairs, and at an open
         self._hub_reading: int | None = None           # the reading of the Project dock's project still in flight
         self._device_list = "napari"                   # whose devices the device list shows: napari or engine
         self._geometry_req = 0
@@ -967,8 +970,9 @@ class TrainingWidget(QWidget):
             self._apply_round(name)
 
     def _apply_round(self, name: str) -> None:
-        """The round's folders: its pairs (the training folder) and models/<round>_nuclei (the model folder); its
-        pairs are shown when it has any and the slice shown has no unsaved edits."""
+        """The round's folders: its pairs (the training folder) and models/<round>_nuclei (the model folder). Its
+        pairs are read in the reading worker (a project can sit on a slow share, where the GUI thread must not wait:
+        plugin_specs.md 2 rule 4 and F14) and shown when they come back, unless the slice shown has unsaved edits."""
         project = self.project
         if project is None:
             return
@@ -979,17 +983,52 @@ class TrainingWidget(QWidget):
         if same and self._pairs_dir is not None and _same(self._pairs_dir, pairs):
             return
         if self.is_dirty():
-            self._status("the slice shown has unsaved edits: save or revert them, then press Open training folder to "
-                         f"see the pairs of round {name}", AMBER)
+            self._unsaved_round(name)
             return
-        if (pairs / "manifest.csv").is_file() or (pairs / "image").is_dir():
-            self.open_pairs(unsaved="discard")
-        else:
+        self._round_req += 1
+        req, root = self._round_req, project.root
+        self._files.submit("round", lambda: T.read_round_pairs(pairs), label=f"reading the pairs of round {name}",
+                           returned=lambda got: self._on_round_pairs(got, req, name, root),
+                           errored=lambda e: self._on_round_pairs(None, req, name, root, problem=e))
+
+    def _unsaved_round(self, name: str) -> None:
+        self._status("the slice shown has unsaved edits: save or revert them, then press Open training folder to see "
+                     f"the pairs of round {name}", AMBER)
+
+    def _on_round_pairs(self, got: T.RoundPairs | None, req: int, name: str, root: Path,
+                        problem: BaseException | None = None) -> None:
+        """A round's pairs, read: shown unless another round, folder or project was chosen meanwhile (or the pairs
+        were opened another way), or the slice shown got unsaved edits."""
+        pairs = self.project.round_dir(name) if self.project is not None else None
+        if req != self._round_req or pairs is None or not _same(self.project.root, root) or \
+                not _same(self._clean(self.pairs_edit.text()), pairs):
+            return
+        if self.is_dirty():
+            self._unsaved_round(name)
+            return
+        if problem is not None:
+            self._status(f"cannot read the pairs of {pairs}: {type(problem).__name__}: {problem}", RED)
+            return
+        if not got.found:
             self._pairs, self._index, self._pairs_dir, self._loaded_labels = [], -1, pairs, None
             self._valid = {}
             self.pair_label.setText(f"no slice pairs in round {name} yet: export or import some")
             self._update_corrected_label()
             self._update_buttons()
+            return
+        self._pairs_dir, self._pairs, self._valid = pairs, list(got.pairs), dict(got.valid)
+        self._index, self._loaded_labels = -1, None
+        if not self._pairs:
+            self.pair_label.setText(f"no slice pairs in {pairs} (image/*.tif with labels/*.tif)")
+            self._update_corrected_label()
+            self._update_buttons()
+            return
+        if isinstance(got.first, BaseException):
+            self._status(f"cannot read {self._pairs[0].name}: {type(got.first).__name__}: {got.first}", RED)
+            self._update_corrected_label()
+            self._update_buttons()
+            return
+        self._show_pair(0, *got.first)
 
     def new_round(self, name: str | None = None) -> bool:
         """``germquant project rounds --new [NAME]`` through the engine: the engine names it (r01, r02 and so on)
@@ -1435,6 +1474,7 @@ class TrainingWidget(QWidget):
         """Load the pair list of a training folder (default: the Training folder field) and show the first pair."""
         if self._index >= 0 and not self._resolve_unsaved(unsaved):
             return len(self._pairs)
+        self._round_req += 1                           # a round's pairs still being read are older than these
         if path is not None:
             self.set_pairs_dir(path)
         text = self._clean(self.pairs_edit.text())
@@ -1512,6 +1552,12 @@ class TrainingWidget(QWidget):
         except Exception as e:  # noqa: BLE001 - one unreadable pair must not lock the dock
             self._status(f"cannot read {pair.name}: {type(e).__name__}: {e}", RED)
             return False
+        self._show_pair(index, image, labels)
+        return True
+
+    def _show_pair(self, index: int, image: np.ndarray, labels: np.ndarray) -> None:
+        """Show pair ``index`` of the list, read already."""
+        pair = self._pairs[index]
         self._index = index
         self._loaded_labels = labels.copy()
         self._current_image = image
@@ -1519,7 +1565,6 @@ class TrainingWidget(QWidget):
         self._show_layers(pair, image, labels)
         self._update_pair_label()
         self._update_buttons()
-        return True
 
     def next_pair(self, unsaved: str = "ask") -> bool:
         return self.go_to(self._index + 1, unsaved) if self._index < len(self._pairs) - 1 else False

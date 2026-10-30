@@ -931,3 +931,42 @@ def test_cancel_follows_the_interpreter_that_runs_the_step(qtbot, tmp_path):
         runner.gates["train_nuclei"].set()
         _settle(qtbot, w)
     assert seen == [True, False]
+
+
+def test_project_events_read_no_project_file_on_the_gui_thread(qtbot, tmp_path, monkeypatch):
+    """N4 (plugin_specs.md 2 rule 4, F14): a project can sit on a slow share, so what a project event reads (the
+    project with the model files its manifest names, a round's pairs and their corrections, the first pair shown)
+    is read in the dock's reading worker, never on the GUI thread."""
+    root = write_project(tmp_path / "study", rounds=("r01",),
+                         models=[{"key": "segmentation.nuclei.cellpose_model", "ref": "training/r01/models/m1/m1"}])
+    model, _card = write_model(root / "training" / "r01" / "models" / "m1")
+    write_pairs(root / "training" / "r01", "img_a", 2)
+    on_gui: list[str] = []
+
+    def watch(name):
+        real = getattr(T, name)
+
+        def wrapped(*a, **k):
+            if threading.current_thread() is threading.main_thread():
+                on_gui.append(name)
+            return real(*a, **k)
+
+        monkeypatch.setattr(T, name, wrapped)
+
+    for name in ("long_path", "load_pair_list", "valid_corrections", "read_pair"):
+        watch(name)
+    hub = FakeHub()
+    w = TrainingWidget(None, session=StaticSession(FakeTrainRunner()), hub=hub)
+    hub.open(root)
+    _settle(qtbot, w)
+    assert w.rounds == ["r01"] and len(w.pairs) == 2 and w.index == 0     # the round's pairs, shown
+    assert str(model) in [w.base_combo.itemText(i) for i in range(w.base_combo.count())]
+    hub.changed.emit()
+    _settle(qtbot, w)
+    assert w.new_round()
+    _settle(qtbot, w)
+    assert w.round_combo.currentText() == "r02" and w.pairs == [] and "no slice pairs in round r02" in w.pair_label.text()
+    assert w.select_round("r01")
+    _settle(qtbot, w)
+    assert len(w.pairs) == 2 and w.index == 0
+    assert on_gui == []

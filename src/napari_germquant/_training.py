@@ -325,6 +325,7 @@ class TrainingProject:
     pack_models: list[str]
     model_files: list[Path]
     round_folders: list[str] = dataclasses.field(default_factory=list)   # training/<round>/ on disk when read
+    used_model_files: list[Path] = dataclasses.field(default_factory=list)   # the manifest's models found on disk
 
     @property
     def pinned(self) -> str:
@@ -426,23 +427,32 @@ def read_project(root: str | Path) -> TrainingProject:
     models = [dict(x) for x in m.get("models") or [] if isinstance(x, dict)]
     return TrainingProject(root=root, name=str(m.get("name") or root.name), pack_id=pack_id, pack_version=version,
                            recipe=recipe, images=images, models=models, object_kind=kind, pack_models=needs,
-                           model_files=project_model_files(root), round_folders=round_names(root))
+                           model_files=project_model_files(root), round_folders=round_names(root),
+                           used_model_files=used_model_files(root, models))
+
+
+def used_model_files(root: str | Path, models: list[dict]) -> list[Path]:
+    """The model files the manifest's models name (``ref``, a path in the project or any path) that exist."""
+    out = []
+    for entry in models:
+        ref = entry.get("ref")
+        if isinstance(ref, str) and ref:
+            p = _image_path(Path(root), ref)
+            if os.path.isfile(long_path(p)):
+                out.append(p)
+    return out
 
 
 def project_base_choices(project: TrainingProject | None) -> list[str]:
     """Starting weights to offer: in a project the models its pack recipe needs (cpsam_v2@0f1cc3f7, as the model
-    store pins them), then the models trained in the project (their files) and those it uses; then Cellpose's
-    stock model, a random start and the registered names (base_choices)."""
+    store pins them), then the models trained in the project (their files) and those it uses, as read with the
+    project (no file is looked at here: the dock calls this on its GUI thread); then Cellpose's stock model, a
+    random start and the registered names (base_choices)."""
     out: list[str] = []
     if project is not None:
         out += list(project.pack_models)
         out += [str(p) for p in project.model_files]
-        for entry in project.models:
-            ref = entry.get("ref")
-            if isinstance(ref, str) and ref:
-                p = _image_path(project.root, ref)
-                if os.path.isfile(long_path(p)):
-                    out.append(str(p))
+        out += [str(p) for p in project.used_model_files]
     try:
         out += base_choices()
     except Exception:  # noqa: BLE001 - an unreadable registry still leaves the two built-in choices
@@ -586,6 +596,33 @@ def read_pair(pair: Pair) -> tuple[np.ndarray, np.ndarray]:
     image = np.asarray(tifffile.imread(long_path(pair.image)))
     labels = np.asarray(tifffile.imread(long_path(pair.labels))).astype(np.int32, copy=False)
     return image, labels
+
+
+@dataclasses.dataclass
+class RoundPairs:
+    """A round's training folder as the dock shows it, read in a thread worker (a project can sit on a slow share):
+    ``pairs`` (load_pair_list), ``valid`` (valid_corrections) and ``first``, the first pair's (image, labels), or
+    the exception reading it raised; ``found`` False when the round has no pairs yet (no manifest.csv, no image/)."""
+    pairs_dir: Path
+    found: bool
+    pairs: list[Pair] = dataclasses.field(default_factory=list)
+    valid: dict = dataclasses.field(default_factory=dict)
+    first: tuple | BaseException | None = None
+
+
+def read_round_pairs(pairs_dir: str | Path) -> RoundPairs:
+    """What the dock reads to show a round's pairs (RoundPairs); a manifest that cannot be read raises."""
+    pairs_dir = Path(pairs_dir)
+    if not ((pairs_dir / "manifest.csv").is_file() or (pairs_dir / "image").is_dir()):
+        return RoundPairs(pairs_dir, found=False)
+    plist = load_pair_list(pairs_dir)
+    first: tuple | BaseException | None = None
+    if plist:
+        try:
+            first = read_pair(plist[0])
+        except Exception as e:  # noqa: BLE001 - one unreadable pair is shown as such, the list still opens
+            first = e
+    return RoundPairs(pairs_dir, found=True, pairs=plist, valid=valid_corrections(pairs_dir), first=first)
 
 
 def n_labels(labels: np.ndarray) -> int:
