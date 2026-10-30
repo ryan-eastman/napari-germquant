@@ -675,3 +675,57 @@ def test_an_engine_chosen_just_before_train_chooses_its_device_and_can_be_cancel
     assert w.engine_route() == "engine" and _items(w.device_combo) == ["auto", "cuda", "cpu"]
     assert asked == "auto"                                 # the engine's own choice, never napari's list
     assert cancel_on and cancel_after                      # Cancel on for the engine process
+
+
+def test_a_typed_base_model_survives_a_reading_of_the_project(make_napari_viewer, qtbot, tmp_path):
+    """S2: a starting-weights path typed into the editable list stays at the next reading of the same project
+    (every reading of the Project dock comes here), and Train starts from it, not from the pack's model."""
+    root = write_project(tmp_path / "study", recipe="with_model", pack_models=("tinynet@f5055f8a",), rounds=("r01",))
+    write_pairs(root / "training" / "r01", "img_a", 2)
+    mine, _card = write_model(tmp_path / "elsewhere" / "my_model")
+    hub, runner = FakeHub(), FakeTrainRunner()
+    viewer, w = _dock(make_napari_viewer, runner, hub)
+    hub.open(root)
+    _settle(qtbot, w)
+    assert w.base_combo.currentText() == "tinynet@f5055f8a"
+    w.base_combo.setCurrentText(str(mine))                  # typed (or pasted), as the tooltip says
+    hub.changed.emit()                                      # the Project dock read its project again
+    _settle(qtbot, w)
+    assert w.base_combo.currentText() == str(mine)
+    w.base_combo.setCurrentIndex(w.base_combo.findText("cpsam"))   # an item chosen stays chosen too
+    hub.changed.emit()
+    _settle(qtbot, w)
+    assert w.base_combo.currentText() == "cpsam"
+    w.base_combo.setCurrentText(str(mine))
+    assert w.train()
+    _settle(qtbot, w)
+    assert runner.last("train_nuclei")[1]["base"] == str(mine)
+    hub.close()                                             # no project: the first of the plain choices
+    assert w.base_combo.currentIndex() == 0 and w.base_combo.currentText() == "cpsam"
+
+
+def test_a_typed_import_image_survives_a_reading_of_the_project(make_napari_viewer, qtbot, tmp_path):
+    """S2: in project mode an import image browsed outside the project's list stays at the next reading of the
+    same project, and Import pairs the labels with it, not with the project's first image."""
+    root = write_project(tmp_path / "study", images=[("img_a", "images/img_a.ome.tif"),
+                                                       ("img_b", "images/img_b.ome.tif")], rounds=("r01",))
+    other = tmp_path / "elsewhere" / "img_c.ome.tif"
+    other.parent.mkdir()
+    other.write_bytes(b"x")
+    hub, runner = FakeHub(), FakeTrainRunner()
+    viewer, w = _dock(make_napari_viewer, runner, hub)
+    hub.open(root)
+    _settle(qtbot, w)
+    w.set_labels_file(tmp_path / "masks.tif")
+    w.set_import_image(other)
+    _settle(qtbot, w)
+    hub.changed.emit()
+    _settle(qtbot, w)
+    assert w.image_combo.currentText() == str(other)
+    assert w.import_labels()
+    _settle(qtbot, w)
+    assert runner.last("import_labels")[0][2] == str(other)
+    w.image_combo.setCurrentIndex(1)                        # a project image chosen stays chosen
+    hub.changed.emit()
+    _settle(qtbot, w)
+    assert w.image_combo.currentText() == "img_b"

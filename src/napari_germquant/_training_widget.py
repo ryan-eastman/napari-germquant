@@ -836,7 +836,7 @@ class TrainingWidget(QWidget):
             self._read_geometry()
             if project.object_kind in T.OBJECT_KINDS:
                 self.kind_combo.setCurrentIndex(self.kind_combo.findData(project.object_kind))
-        self._fill_images()
+        self._fill_images(keep_typed=same)
         self._fill_bases(select_first=not same)
         self._show_project()
         self._update_buttons()
@@ -998,9 +998,10 @@ class TrainingWidget(QWidget):
             self._show_project()
         self._status(f"made the training round {created}: {rec.get('path')}", GREEN)
 
-    def _fill_images(self) -> None:
+    def _fill_images(self, keep_typed: bool = False) -> None:
         """The project's images in the import's image list (the id, with the path as its data). A reading of the
-        same project keeps the image chosen; without a project the path of the image chosen stays typed."""
+        same project (``keep_typed``) keeps the image chosen, also a path typed or browsed; another project starts
+        from its first image; without a project the path of the image chosen stays typed."""
         text = self.image_combo.currentText()
         idx = self.image_combo.findText(text)
         chosen = self.image_combo.itemData(idx) if idx >= 0 else None
@@ -1010,22 +1011,30 @@ class TrainingWidget(QWidget):
             self.image_combo.addItem(img.image_id, str(img.path))
         if self.project is not None and self.project.images:
             keep = self.image_combo.findText(text)
-            self.image_combo.setCurrentIndex(keep if keep >= 0 else 0)
+            if keep < 0 and keep_typed and text.strip() and chosen is None:
+                self.image_combo.setEditText(text)    # a path typed or browsed: kept at a reading
+            else:
+                self.image_combo.setCurrentIndex(keep if keep >= 0 else 0)
         else:
             self.image_combo.setEditText(str(chosen) if chosen else (text if self.project is None else ""))
         self.image_combo.blockSignals(False)
         self._read_channels()
 
     def _fill_bases(self, select_first: bool) -> None:
+        """The starting weights of the project (or of no project). ``select_first`` (another project, or none):
+        the first of them; else the weights chosen stay chosen, also a model path typed."""
         current = self.base_combo.currentText()
         items = T.project_base_choices(self.project)
         self.base_combo.blockSignals(True)
         self.base_combo.clear()
         self.base_combo.addItems(items)
-        if select_first or current not in items:
+        keep = self.base_combo.findText(current)
+        if select_first or not current.strip():
             self.base_combo.setCurrentIndex(0)
+        elif keep >= 0:
+            self.base_combo.setCurrentIndex(keep)
         else:
-            self.base_combo.setCurrentText(current)
+            self.base_combo.setEditText(current)      # a model path typed: kept at a reading
         self.base_combo.blockSignals(False)
 
     def _on_hub_opened(self, root: str) -> None:
