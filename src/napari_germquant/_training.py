@@ -530,6 +530,20 @@ def import_command(src, fmt: str, image, pairs_dir, **options) -> str:
     return "germquant " + " ".join(_quote(a) for a in import_argv(src, fmt, image, pairs_dir, **options))
 
 
+def use_model_command(root, model: str, card: str | None = None) -> str:
+    """``germquant project use-model`` as the dock calls it (``--card`` only when a card is named; the plugin's
+    own --plugin-version stamp left out)."""
+    argv = ["project", "use-model", str(root), "--model", str(model)] + (["--card", str(card)] if card else [])
+    return "germquant " + " ".join(_quote(a) for a in argv)
+
+
+def derive_command(from_ref: str, recipe: str, model, card, out) -> str:
+    """``germquant pack derive`` as the dock calls it."""
+    argv = ["pack", "derive", "--from", str(from_ref), "--recipe", str(recipe), "--model", str(model), "--card",
+            str(card), "--out", str(out)]
+    return "germquant " + " ".join(_quote(a) for a in argv)
+
+
 def import_summary(record: dict) -> str:
     """What an import did, from the engine's record (import_labels / ``import-labels --json``)."""
     channel = record.get("channel_index")

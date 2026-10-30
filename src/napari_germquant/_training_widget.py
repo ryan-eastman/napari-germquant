@@ -1887,17 +1887,18 @@ class TrainingWidget(QWidget):
         self._start_step("use", lambda: self._job_runner("projects", engine=engine, should_stop=worker.should_stop)
                          .project_use_model(root, rel, card=card_rel, plugin_version=plugin_version(),
                                             should_stop=worker.should_stop),
-                         label="using the model in the project", returned=lambda rec: self._on_used(rec, root, rel),
-                         what="use in project", engine=False)
+                         label="using the model in the project",
+                         returned=lambda rec: self._on_used(rec, root, rel, card_rel), what="use in project",
+                         engine=False)
         return True
 
-    def _on_used(self, rec: dict, root: Path, rel: str) -> None:
+    def _on_used(self, rec: dict, root: Path, rel: str, card_rel: str | None = None) -> None:
         self.last_use = rec
         validated = (rec.get("validated") or {}).get("value") if isinstance(rec.get("validated"), dict) else None
         state = "validated: false" if not validated else "validated: true"
         self._status(f"the project's recipe now names {rel} (segmentation.nuclei.cellpose_model): config_hash "
                      f"{rec.get('config_hash')} ({state}). The project's finished images are stale until they are run "
-                     f"again.\nsame as: germquant project use-model {root} --model {rel}", GREEN)
+                     f"again.\nsame as: {T.use_model_command(root, rel, card_rel)}", GREEN)
         hub = self.hub
         if hub is not None and _same(getattr(hub, "root", None), root):
             hub.request_reload()
@@ -1955,8 +1956,7 @@ class TrainingWidget(QWidget):
             lines.append(f"not listed with the project: {problem}")
         else:
             lines.append("the engine's pack listing with this project does not show it")
-        lines.append(f"same as: germquant pack derive --from {from_ref} --recipe {recipe} --model {model} --card "
-                     f"{card} --out {out}")
+        lines.append(f"same as: {T.derive_command(from_ref, recipe, model, card, out)}")
         self._status("\n".join(lines), GREEN if entry is not None else AMBER)
 
     # ------------------------------------------------------------------ worker plumbing

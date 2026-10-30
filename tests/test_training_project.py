@@ -574,6 +574,9 @@ def test_use_in_project_and_derive_pack_go_through_the_engine(make_napari_viewer
     text = w.status_label.text()
     assert NEW_HASH in text and "validated: false" in text and "stale" in text
     assert hub.reloads == 1 and w.last_use["config_hash"] == NEW_HASH
+    # the same-as line is the command the dock ran, the card included (review N9)
+    assert (f"same as: germquant project use-model {root} --model training/r01/models/r01_nuclei/r01_nuclei --card "
+            f"training/r01/models/r01_nuclei/r01_nuclei.card.json") in text
 
     # never while a run of the project goes (the Project dock's run)
     hub.running = True
@@ -599,6 +602,8 @@ def test_use_in_project_and_derive_pack_go_through_the_engine(make_napari_viewer
     assert runner.last("list_packs")[1] == {"project": root}
     text = w.status_label.text()
     assert DERIVED_ID in text and "listed" in text and w.last_derive["id"] == DERIVED_ID
+    assert (f"same as: germquant pack derive --from test_pack@0.1.0 --recipe with_model --model {model} --card {card} "
+            f"--out {root / 'packs'}") in text
 
 
 def test_derive_and_use_say_what_the_engine_refused(make_napari_viewer, qtbot, tmp_path):
