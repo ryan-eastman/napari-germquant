@@ -1374,8 +1374,10 @@ class TrainingWidget(QWidget):
         self.channel_combo.addItem(CHANNEL_DEFAULT, "")
         if takes:
             for i, name in enumerate(self._channels):
-                unique = self._channels.count(name) == 1 and name != ""
-                self.channel_combo.addItem(f"{i}: {name}", name if unique else str(i))
+                # by its index: a name two channels share, and a name of digits only (a laser line such as 561),
+                # which `import-labels --channel` (and the in-process runner) read as an index
+                by_name = self._channels.count(name) == 1 and name != "" and not name.strip().isdigit()
+                self.channel_combo.addItem(f"{i}: {name}", name if by_name else str(i))
             idx = self.channel_combo.findData(current) if current else 0
             self.channel_combo.setCurrentIndex(max(0, idx))
         self.channel_combo.blockSignals(False)
