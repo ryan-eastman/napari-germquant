@@ -10,10 +10,14 @@
 * ``engine_edit(root, *args)``: ``python -m germquant.project edit ROOT ARGS --json`` in a child process, the
   engine's own answer to compare the tab with;
 * ``FakeSession`` and ``FakeRunner``: an engine session and runner that answer ``project_edit`` with canned
-  records, and ``fake_view(...)``: a RecipeView built by hand, for the widget tests that need no engine.
+  records, and ``fake_view(...)``: a RecipeView built by hand, for the widget tests that need no engine;
+* ``FakePostRunner`` and ``post_rows()``: a fake runner that also lists post-stages (two listing rows shaped like
+  `python -m germquant.post_stages list --json`, one like the engine's fixture post-stage) and writes
+  post_stages.yaml, for the post-stage section's widget tests.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -158,10 +162,10 @@ def preview_record(bindings: dict, problems=(), *, config_hash="aaaaaaaaaaaa", c
 
 def fake_view(root: Path, *, tunables=(), others=(), roles=None, channels=("DAPI", "foci"), images=None,
               reference=None, config_hash="02bb83cf74f9", validated=None, warnings=(), digest="d0", saved=None,
-              manifest=None):
+              manifest=None, post=None):
     """A RecipeView of a project on the test pack's basic recipe, built by hand (``manifest``: the manifest as
-    read, by default just the saved stamp)."""
-    from napari_germquant._params import RecipeView, Role, Tunable
+    read, by default just the saved stamp; ``post``: the post-stage list in force, by default none)."""
+    from napari_germquant._params import PostList, RecipeView, Role, Tunable
 
     if roles is None:
         roles = [Role("dna", "DNA", True, ("DAPI", "Hoechst", "DNA"), 0, None),
@@ -177,4 +181,77 @@ def fake_view(root: Path, *, tunables=(), others=(), roles=None, channels=("DAPI
                       tunables=tun, others=list(others), roles=list(roles), match_by="name", images=images,
                       reference=reference or (images[0]["id"] if images else None), channels=list(channels),
                       channels_error=None, warnings=list(warnings), digest=digest, saved=saved,
-                      manifest=dict(manifest) if manifest is not None else ({"saved": saved} if saved else {}))
+                      manifest=dict(manifest) if manifest is not None else ({"saved": saved} if saved else {}),
+                      post=post if post is not None else PostList())
+
+
+# ---------------------------------------------------------------------------------------------------
+# the post-stage section's fakes
+# ---------------------------------------------------------------------------------------------------
+
+FIXTURE = "fixture_nuclei"            # the name of the engine's fixture post-stage (germquant.post_stages.testing)
+RING = "ring_intensity"               # the worked example of the engine's docs/POST_STAGES.md
+
+
+def post_rows() -> list[dict]:
+    """Two rows of a post-stage listing (`python -m germquant.post_stages list --json`, PLAN 9.1 and 9.4 #9), sorted
+    by name as the engine sorts them: one shaped like the engine's fixture post-stage (a float, an int, a choice and
+    a bool parameter) and the worked example of docs/POST_STAGES.md (a float with a unit, a word)."""
+    return [
+        {"name": FIXTURE, "version": "1.0.0", "dist": "germquant-fixture-post-stage",
+         "title": "Fixture: per-nucleus voxels, volume, foci statistic and spot count",
+         "reads": {"roles": ["foci"], "tables": ["nuclei", "spots"], "labels": True, "image": True},
+         "writes": {"per_nucleus": ["nucleus_id", "n_voxels", "volume_um3", "foci_value", "foci_value_scaled",
+                                    "n_spots"]},
+         "params": [{"key": "factor", "type": "float", "default": 1.0, "min": 0.1, "max": 10.0,
+                     "label": "Scale factor of foci_value"},
+                    {"key": "min_voxels", "type": "int", "default": 0, "min": 0, "max": 1000000000,
+                     "label": "Smallest nucleus (voxels)"},
+                    {"key": "statistic", "type": "choice", "default": "mean", "choices": ["mean", "max"],
+                     "label": "Foci statistic"},
+                    {"key": "fail", "type": "bool", "default": False, "label": "Fail on purpose (tests)"}],
+         "source": "entry point germquant_fixture_post_stage:measure"},
+        {"name": RING, "version": "0.1.0", "dist": "germquant-ring-intensity",
+         "title": "Foci intensity in a shell around each nucleus",
+         "reads": {"roles": ["foci"], "tables": [], "labels": True, "image": True},
+         "writes": {"rings": ["nucleus_id", "ring_voxels", "ring_mean", "inside_mean"]},
+         "params": [{"key": "radius_um", "type": "float", "default": 1.0, "min": 0.1, "max": 5.0, "unit": "um",
+                     "label": "Shell width"},
+                    {"key": "note", "type": "str", "default": "none"}],
+         "source": "entry point germquant_ring_intensity:measure"},
+    ]
+
+
+class FakePostRunner(FakeRunner):
+    """A FakeRunner that also has the runner's two post-stage methods: ``list_post_stages`` answers ``rows`` (or
+    raises ``list_error``); ``write_post_stages(root, entries)`` writes the entries into <root>/post_stages.yaml as
+    YAML (or raises ``write_error``) and answers {"path", "entries"}, the two keys both runners' records hold.
+    ``post_calls`` keeps every call ("list", or ("write", entries)); ``calls`` stays project_edit's only.
+    ``post_gate`` (a threading.Event), when set up, holds each write until it is set."""
+
+    def __init__(self, answer, rows=None):
+        super().__init__(answer)
+        self.rows = post_rows() if rows is None else list(rows)
+        self.list_error: BaseException | None = None
+        self.write_error: BaseException | None = None
+        self.post_calls: list = []
+        self.post_gate: threading.Event | None = None
+
+    def list_post_stages(self, *, should_stop=None) -> list:
+        self.post_calls.append("list")
+        if self.list_error is not None:
+            raise self.list_error
+        return copy.deepcopy(self.rows)
+
+    def write_post_stages(self, root, entries, *, should_stop=None) -> dict:
+        import yaml
+
+        self.post_calls.append(("write", copy.deepcopy(list(entries))))
+        gate = self.post_gate
+        if gate is not None:
+            gate.wait(30)
+        if self.write_error is not None:
+            raise self.write_error
+        path = Path(root) / "post_stages.yaml"
+        path.write_bytes(yaml.safe_dump(list(entries), sort_keys=True, allow_unicode=False).encode("ascii"))
+        return {"path": str(path), "entries": copy.deepcopy(list(entries))}
