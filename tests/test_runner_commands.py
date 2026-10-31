@@ -342,7 +342,8 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
     assert isinstance(calls[-1][1][0], _FakeProject) and calls[-1][1][0].root == Path(P)
     assert r.project_collect(P) == {"tables": []}
     out = r.project_export_commands(P, shell="ps1", out=project_env.root / "cmds.ps1")
-    assert out["text"] == "germquant project run X\n" and (project_env.root / "cmds.ps1").read_text() == out["text"]
+    assert out["text"] == "germquant project run X\n"
+    assert (project_env.root / "cmds.ps1").read_bytes() == b"\xef\xbb\xbf" + out["text"].encode("ascii")   # ps1: a BOM
     assert [f.name for f in project_env.root.iterdir() if f.name.endswith(".part")] == []    # written atomically
     seen: list[dict] = []
     res = r.project_run(P, images=["a"], resume=False, device="cpu", shard="1/2", run_id=RID, progress=seen.extend)
@@ -902,6 +903,19 @@ def test_an_in_process_export_that_cannot_write_its_file_is_refused(tmp_path, mo
     with pytest.raises(EngineRefused, match="^REFUSED: ") as e:
         InProcessRunner().project_export_commands(tmp_path / "proj", shell="ps1", out=out)
     assert isinstance(e.value.__cause__, FileNotFoundError) and not out.parent.exists()
+
+
+def test_an_in_process_export_writes_the_commands_bytes(tmp_path, monkeypatch):
+    """`project export-commands --out FILE` writes ps1 with a UTF-8 byte-order mark (Windows PowerShell 5.1 reads a
+    script without one in the ANSI code page, so a project folder named with a letter outside ASCII would be
+    misread) and sh without one (cli_projects._export_commands): in process too (reviews/P6_package_fixes_delta.md
+    N1)."""
+    _engine_errors(monkeypatch)
+    _fake_api(monkeypatch, raising={})
+    for shell, head in (("ps1", b"\xef\xbb\xbf"), ("sh", b"")):
+        out = tmp_path / f"cmds.{shell}"
+        rec = InProcessRunner().project_export_commands(tmp_path / "proj", shell=shell, out=out)
+        assert out.read_bytes() == head + b"germquant project run X\n" and rec["text"] == "germquant project run X\n"
 
 
 def test_a_project_file_that_is_not_yaml_is_refused_alike_through_both_runners(project_env):

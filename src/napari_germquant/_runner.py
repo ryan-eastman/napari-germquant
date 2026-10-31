@@ -1307,7 +1307,10 @@ class InProcessRunner(EngineRunner):
         text = self._api_call(self._api("export_commands"), self._open(root), shell=shell, shards=shards,
                               refusals=_projects_refusal)
         if out is not None:              # the command writes --out in its handler, so a failed write is refused
-            self._api_call(_write_atomic, out, str(text).encode("utf-8"), refusals=_projects_refusal)
+            # the command's bytes: Windows PowerShell 5.1 reads a script without a byte-order mark in the ANSI
+            # code page, so ps1 gets one (cli_projects._export_commands)
+            data = (b"\xef\xbb\xbf" if shell == "ps1" else b"") + str(text).encode("utf-8")
+            self._api_call(_write_atomic, out, data, refusals=_projects_refusal)
         return {"text": str(text), "out": str(out) if out is not None else None}
 
     def import_labels(self, src, fmt, image, pairs, *, allow_pickle=False, frame=None, channel=None,
