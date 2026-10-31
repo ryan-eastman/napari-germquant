@@ -27,7 +27,9 @@ The section names the list a run uses now (the project's post_stages.yaml, else 
 recipe, else none) and what in it a run would refuse. Apply post-stages writes the project's post_stages.yaml
 through that runner (``python -m germquant.post_stages write``, which validates the entries there): each post-stage
 switched on, with its parameters off their defaults. post_stages.yaml is not part of config_hash, so the hash,
-validated and the recipe files stay as they are, and the tab says so.
+validated and the recipe files stay as they are, and the tab says so. A listing is made for one environment: when
+this computer stores (or clears) the recipe's own interpreter after it, the tab lists again when it is shown, and
+an Apply asked for before that lists again instead of writing.
 
 Where it runs: the tab reads the project in this napari environment (``_params.read_view``) and sends every
 dry run and write to the engine runner of the viewer's engine session (``_engine_session``), in a thread worker,
@@ -70,7 +72,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from . import _params
+from . import _params, _settings
 from ._engine_session import session_for
 from ._params import MISSING, RESET
 from ._qt_common import WorkerRunner
@@ -97,6 +99,8 @@ NO_POST_RUNNER_TEXT = "this engine runner cannot list post-stages"
 POST_DUE_TEXT = "The post-stages of the engine environment are listed when this tab is shown."
 POST_LISTING_TEXT = "Listing the post-stages of the engine environment ..."
 NO_POSTS_TEXT = "The engine environment offers no post-stages (a post-stage is an installed package: docs/POST_STAGES.md)."
+POST_ENV_TEXT = ("the project's recipe now runs in another environment on this computer: its post-stages are listed "
+                 "again; Apply once they are shown")
 INT_LIMIT = 2 ** 31 - 1
 FLOAT_LIMIT = 1.0e12
 
@@ -229,6 +233,9 @@ class RecipeTab(QWidget):
         self._post_pending: dict[str, dict] = {}
         self._want_posts: dict | None = None
         self._posts_due = False                     # a listing asked for while the tab could not ask (hidden)
+        # the recipe interpreter the listing asked for was made in (None: the engine; MISSING: no listing yet)
+        self._posts_env_asked: object = MISSING
+        self._posts_env_listed: object = MISSING
         self.last_post_record: dict | None = None
         self.post_rows: dict[str, PostRow] = {}
         self.worker = WorkerRunner(napari_viewer, self)
@@ -263,6 +270,7 @@ class RecipeTab(QWidget):
         self.last_record = None
         self._posts, self._posts_root, self.post_error, self._post_pending = None, None, None, {}
         self._want_posts, self._posts_due, self.last_post_record = None, False, None
+        self._posts_env_asked = self._posts_env_listed = MISSING
         self._rebuild()
         if self._root is None:
             self._status("", None)
@@ -1129,6 +1137,20 @@ class RecipeTab(QWidget):
             return {}, []
         return _params.post_state(self._posts, self._view.post)
 
+    def _posts_env(self):
+        """The interpreter this computer stores for the project's pack recipe, None for the engine: the environment
+        session.runner_for gives the recipe now (where its runs and post-stages go). The engine's own changes come
+        through the session's changed signal; a recipe interpreter stored or cleared (the Project dock's Run tab,
+        the Run dock) signals nothing."""
+        if self._view is None:
+            return None
+        pin = self._view.manifest.get("pack") or {}
+        return _settings.recipe_interpreter(pin.get("id"), pin.get("recipe") or self._view.recipe)
+
+    def _posts_stale(self) -> bool:
+        """Whether the listing shown was made in another environment than the one the recipe runs in now."""
+        return self._posts_env_listed is not MISSING and self._posts_env() != self._posts_env_listed
+
     def _post_stage(self, name: str) -> _params.PostStage:
         if self._view is None:
             raise ValueError("no project is shown")
@@ -1342,6 +1364,10 @@ class RecipeTab(QWidget):
             self._status(f"no post-stage list: {self.post_error or 'the engine environment is not asked yet'}",
                          AMBER)
             return False
+        if self._posts_stale():                 # listed in another environment than the one that runs the recipe
+            self._request_posts()
+            self._status(POST_ENV_TEXT, AMBER)
+            return False
         if not self.post_changed:
             self._status("no post-stage change to apply", AMBER)
             return False
@@ -1397,6 +1423,7 @@ class RecipeTab(QWidget):
             return
         self._posts_due = False
         pin = self._view.manifest.get("pack") or {}
+        self._posts_env_asked = self._posts_env()
         self._want_posts = {"pack": pin.get("id"), "recipe": pin.get("recipe") or self._view.recipe}
         self._show_post_state()
         self._pump()
@@ -1586,6 +1613,7 @@ class RecipeTab(QWidget):
             listed = set(self.post_stage_names())
             self._post_pending = {k: v for k, v in self._post_pending.items() if k in listed}
         self._posts_root = self._root
+        self._posts_env_listed = self._posts_env_asked
         self._syncing = True
         try:
             self._rebuild_posts()
@@ -1774,8 +1802,8 @@ class RecipeProjectTab(RecipeTab):
         super().showEvent(event)
         if self._view is not None and self.last_error is None and not self.engine_error:
             self._after_role_change()          # the role preview that waited while the tab was hidden
-            if self._posts_due:
-                self._request_posts()          # and the post-stage listing
+            if self._posts_due or self._posts_stale():
+                self._request_posts()          # and the post-stage listing, of the environment the recipe runs in
 
     def project_changed(self, state) -> None:
         root = getattr(state, "root", None) if state is not None else None
