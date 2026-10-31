@@ -11,7 +11,7 @@ from pathlib import Path
 
 from types import SimpleNamespace
 
-from _p6_recipe import FakeRunner, FakeSession, fake_view, preview_record
+from _p6_recipe import FIXTURE, RING, FakePostRunner, FakeRunner, FakeSession, fake_view, preview_record
 from qtpy.QtWidgets import QWidget
 
 from napari_germquant import _engine, _params
@@ -249,3 +249,28 @@ def test_the_tab_follows_the_project_docks_tab_protocol(qtbot, tmp_path):
     assert len(fake.calls) == n + 3 and tab.preview_states() == {"img1": {"dna": "name", "foci": "name"}}
     tab.project_changed(None)
     assert tab.root is None and tab.view is None
+
+
+def test_a_hidden_tab_lists_the_post_stages_once_it_is_shown(qtbot, tmp_path):
+    """The post-stage list is the engine environment's: a hidden tab asks for it only once it is shown (as for its
+    role preview), a reading of the project after a write elsewhere does not ask again, and an explicit reload
+    does."""
+    fake = FakePostRunner(lambda kw: preview_record(_bindings(), changed=False))
+    dock = _Dock(FakeSession(fake))
+    qtbot.addWidget(dock)
+    tab = RecipeProjectTab(dock)
+    tab._reader = lambda root, reference=None: fake_view(root, saved={"at": "t0"})
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t0"}}))
+    _settle(tab, qtbot)
+    assert fake.post_calls == [] and tab.post_rows == {}
+    assert "listed when this tab is shown" in tab.post_label.text()
+    dock.show()
+    _settle(tab, qtbot)
+    assert fake.post_calls == ["list"] and tab.post_stage_names() == [FIXTURE, RING]
+    tab._reader = lambda root, reference=None: fake_view(root, saved={"at": "t1"}, digest="d1")
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t1"}}))
+    _settle(tab, qtbot)
+    assert tab.view.saved == {"at": "t1"} and fake.post_calls == ["list"]
+    tab.reload()
+    _settle(tab, qtbot)
+    assert fake.post_calls == ["list", "list"]

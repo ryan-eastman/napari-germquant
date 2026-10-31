@@ -1,35 +1,65 @@
 """The parameter form of the Recipe tab (tranche 5 Train B, unit P6-RECIPE; design 7.3 and 8.5, plugin_specs 4.3,
-P6 acceptance 5): built only from the pack recipe's tunables, one widget per declared type with its unit and
-range, the project's value next to the pack's, Reset per row; keys set outside the form (tuning, Use in project,
-a hand edit) are shown read only; Apply writes through `project edit` (the engine runner, D39), which validates
-by origin, and every Apply shows the new config_hash; with every edit reset the project hashes as the pack
-recipe again (I7).
+P6 acceptance 5 and 10): built only from the pack recipe's tunables, one widget per declared type with its unit
+and range, the project's value next to the pack's, Reset per row; keys set outside the form (tuning, Use in
+project, a hand edit) are shown read only; Apply writes through `project edit` (the engine runner, D39), which
+validates by origin, and every Apply shows the new config_hash; with every edit reset the project hashes as the
+pack recipe again (I7).
 
-The acceptance tests run the engine's project commands, so they need the projects feature (need_features); the
-widget tests and the rule tests further down run against any engine."""
+The post-stages (acceptance 10): the form lists the post-stages the engine environment offers, each with its
+declared parameters, a switch and parameter widgets; Apply writes post_stages.yaml through the engine runner
+(`python -m germquant.post_stages write`, D39), which leaves config_hash and validated as they are.
+
+The acceptance tests run the engine's project commands, so they need the projects feature, and the post-stage one
+the post_stages feature too (need_features); the widget tests and the rule tests further down run against any
+engine."""
 from __future__ import annotations
 
+import json
 import math
+import os
+import shutil
+import sys
 import threading
+from pathlib import Path
 
+import pandas as pd
 import pytest
 import yaml
-from _p6_recipe import FakeRunner, FakeSession, engine_edit, fake_view, preview_record, recipe_files
+from _p6_recipe import (
+    FIXTURE,
+    RING,
+    FakePostRunner,
+    FakeRunner,
+    FakeSession,
+    engine_edit,
+    fake_view,
+    post_rows,
+    preview_record,
+    recipe_files,
+)
 from conftest import need_features
 from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QSpinBox
 
-from napari_germquant import _settings
+from napari_germquant import _engine, _settings
 from napari_germquant._params import (
     MISSING,
     RESET,
+    PostList,
     Tunable,
+    entries_text,
     form_change,
     hash_note,
+    post_entries,
+    post_list,
+    post_list_changed,
+    post_stages_from_listing,
+    post_state,
+    read_post_entries,
     recipe_edits,
     validated_badge,
 )
-from napari_germquant._recipe_widget import RecipeTab
-from napari_germquant._runner import EngineRefused, InProcessRunner
+from napari_germquant._recipe_widget import RUNNING_TEXT, WRITING_TEXT, RecipeTab
+from napari_germquant._runner import EngineRefused, FeatureMissing, InProcessRunner, SubprocessRunner
 
 PACK_HASH = "02bb83cf74f9"           # test_pack@0.1.0/basic, unedited
 MIN_VOL, MIN_SNR = "segmentation.nuclei.min_volume_um3", "spots.log.min_snr"
@@ -227,6 +257,108 @@ def test_reset_returns_to_the_pack_hash(project_env, qtbot):
     _settle(tab, qtbot)
     assert tab.config_hash == switched != PACK_HASH
     assert tab.hash_label.text() == f"config_hash {switched} (the pack recipe, with the stage switch spots off)"
+
+
+# ---------------------------------------------------------------------------------------------------
+# acceptance 10: the post-stages (need the projects and post_stages features)
+# ---------------------------------------------------------------------------------------------------
+
+ENTRIES = [{"name": FIXTURE, "params": {"factor": 2.5, "statistic": "max"}}]
+UNCHANGED = f"config_hash {PACK_HASH} unchanged (post_stages.yaml is not part of config_hash)"
+
+
+def _switch_the_fixture_on(tab, qtbot) -> None:
+    """Through the form: the fixture post-stage on, its factor 2.5 and its statistic max; then Apply."""
+    tab.set_post_stage(FIXTURE, True)
+    tab.set_post_param(FIXTURE, "factor", 2.5)
+    tab.set_post_param(FIXTURE, "statistic", "max")
+    assert tab.post_entries() == ENTRIES and tab.post_changed and tab.apply_post_btn.isEnabled()
+    assert tab.post_hash_label.text() == f"with these post-stages: {UNCHANGED}"
+    assert tab.apply_post_stages()
+    _settle(tab, qtbot)
+    assert tab.last_error is None, tab.status_label.text()
+
+
+def test_post_stage_switch_keeps_the_hash_and_matches_headless(project_env, qtbot, tmp_path, monkeypatch,
+                                                                 request):
+    """P6 acceptance 10 (design 8.5 and 7.3, plugin_specs 4.3; I12 to I14; D39). The engine's fixture post-stage is
+    installed as an on-disk distribution (germquant.post_stages.testing.write_fixture_distribution, I14) on the
+    engine's PYTHONPATH and on this process's sys.path. The form lists it through the engine runner with its
+    declared parameters, typed like tunables; switching it on with two parameters changed writes post_stages.yaml
+    through `python -m germquant.post_stages write` (the subprocess runner: the engine environment validates,
+    D39), byte for byte the engine's canonical file, and leaves config_hash, validated, the manifest and the recipe
+    files as they were, on the tab and in the engine's own answer. The in-process runner lists the same and writes
+    the same bytes. The dock's run of the project (the subprocess runner's project run, as the Project dock's Run
+    all) and a headless `germquant project run` of a copy give the same post table, made with the form's
+    parameters."""
+    need_features("projects", "post_stages")
+    from germquant import cli
+    from germquant.post_stages import dump_post_stages
+    from germquant.post_stages.testing import FIXTURE_PACKAGE, FIXTURE_TABLE, write_fixture_distribution
+
+    dist = write_fixture_distribution(tmp_path / "post_dist")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(p for p in (str(dist), os.environ.get("PYTHONPATH")) if p))
+    monkeypatch.syspath_prepend(str(dist))                       # this process: in process, and the headless run
+    request.addfinalizer(lambda: sys.modules.pop(FIXTURE_PACKAGE, None))
+    _settings.set_engine_choice(sys.executable)                  # the engine: this interpreter, in its own process
+    engine = SubprocessRunner(sys.executable)
+    root = project_env.new_dir("gui")
+    engine.project_new(root, "test_pack@0.1.0", images=project_env.image)
+    twin = project_env.new_dir("twin")
+    shutil.copytree(root, twin)                                  # for the in-process half
+    manifest = (root / "germquant_project.yaml").read_bytes()
+
+    tab = _tab(qtbot, root)
+    assert tab.last_error is None and tab.post_error is None, tab.post_label.text()
+    assert tab.config_hash == PACK_HASH and tab.post_stage_names() == [FIXTURE]
+    row = tab.post_rows[FIXTURE]
+    assert not row.switch.isChecked() and list(row.params) == ["factor", "min_voxels", "statistic", "fail"]
+    factor = row.params["factor"].widget
+    assert isinstance(factor, QDoubleSpinBox) and (factor.minimum(), factor.maximum(), factor.value()) == (0.1, 10.0,
+                                                                                                           1.0)
+    assert isinstance(row.params["min_voxels"].widget, QSpinBox) and isinstance(row.params["fail"].widget, QCheckBox)
+    choice = row.params["statistic"].widget
+    assert [choice.itemData(i) for i in range(choice.count())] == ["mean", "max"]
+    assert tab.post_label.text().startswith("In force: none") and not tab.apply_post_btn.isEnabled()
+    hash_line = tab.hash_label.text()
+    written = []
+    tab.post_written.connect(written.append)
+    _switch_the_fixture_on(tab, qtbot)
+    text = (root / "post_stages.yaml").read_bytes()
+    assert text == dump_post_stages(ENTRIES).encode("ascii")                 # the engine's own file
+    assert [Path(w["path"]) for w in written] == [root / "post_stages.yaml"]
+    assert (root / "germquant_project.yaml").read_bytes() == manifest        # no recipe edit (design 7.3)
+    assert recipe_files(root) == {"recipe.yaml": None, "channel_map.yaml": None}
+    assert tab.config_hash == PACK_HASH == engine_edit(root, "--dry-run")["config_hash"]
+    assert tab.hash_label.text() == hash_line and "not validated (provisional pack)" in tab.badge_label.text()
+    assert UNCHANGED in tab.status_label.text()
+    assert tab.post_switch(FIXTURE) and tab.post_value(FIXTURE, "factor") == 2.5     # the file, read back
+    assert tab.post_value(FIXTURE, "statistic") == "max" and not tab.apply_post_btn.isEnabled()
+    assert tab.post_label.text().startswith("In force: the project's post_stages.yaml: fixture_nuclei (factor 2.5, "
+                                            "statistic max)")
+
+    _settings.set_engine_choice(_settings.INPROCESS)                          # in process: the same file
+    tab2 = _tab(qtbot, twin)
+    assert tab2.post_error is None and tab2.post_stage_names() == [FIXTURE], tab2.post_label.text()
+    _switch_the_fixture_on(tab2, qtbot)
+    assert (twin / "post_stages.yaml").read_bytes() == text
+
+    headless = project_env.new_dir("cli")
+    shutil.copytree(root, headless)                                           # switched on, never run
+    res = engine.project_run(root)                                            # the Project dock's Run all
+    assert res["state"] == "done", res.get("message")
+    assert cli.main(["project", "run", str(headless)]) == 0
+    image_id = "test_pack_synthetic"
+    table = f"{image_id}__post_{FIXTURE}_{FIXTURE_TABLE}.csv"
+    dock, cmd = (p / "results" / image_id for p in (root, headless))
+    ta, tb = (pd.read_csv(d / table, float_precision="round_trip") for d in (dock, cmd))
+    pd.testing.assert_frame_equal(ta, tb, check_exact=True)
+    assert len(ta) > 0
+    pd.testing.assert_series_equal(ta["foci_value_scaled"], ta["foci_value"] * 2.5, check_names=False)
+    for d in (dock, cmd):
+        stage = json.loads((d / f"{image_id}__post.json").read_text(encoding="utf-8"))["stages"][FIXTURE]
+        assert stage["done"] and stage["error"] is None and stage["tables"] == [table]
+        assert stage["params"] == {"factor": 2.5, "min_voxels": 0, "statistic": "max", "fail": False}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -463,6 +595,198 @@ def test_a_refused_form_preview_keeps_apply_off(qtbot, tmp_path):
     _settle(tab, qtbot)
 
 
+# ---- the post-stages, against a fake engine that lists two and writes post_stages.yaml into the folder ----
+
+BINDS = {"img1": {"dna": {"channel": "DAPI", "how": "name"}, "foci": {"channel": "foci", "how": "name"}}}
+
+
+def _post_tab(qtbot, tmp_path, *, rows=None, post=None):
+    """A tab on a fake engine that lists ``rows`` (post_rows() by default) and writes post_stages.yaml into
+    ``tmp_path``; the view's list in force is read from that folder, as read_view reads it, unless ``post`` is
+    given."""
+    fake = FakePostRunner(lambda kw: preview_record(BINDS, config_hash=PACK_HASH, changed=False), rows=rows)
+
+    def reader(root, reference=None):
+        return fake_view(root, post=post if post is not None else post_list(root))
+
+    return _tab(qtbot, tmp_path, session=FakeSession(fake), reader=reader), fake
+
+
+def _writes(fake) -> list:
+    return [c[1] for c in fake.post_calls if isinstance(c, tuple)]
+
+
+def test_the_post_stages_are_listed_switched_and_written_through_the_engine(qtbot, tmp_path):
+    """The post-stages the engine lists, each a switch with its declared parameters as typed widgets (units,
+    ranges, labels, defaults); a switched-off post-stage's parameters wait. Apply writes, through the engine, each
+    post-stage switched on with the parameters off their defaults (as recipe.yaml holds only the edits); the tab
+    reads the file back, and config_hash, the role preview and the form are left as they were. Every post-stage
+    off is an empty list (which also replaces a pack's list)."""
+    tab, fake = _post_tab(qtbot, tmp_path)
+    assert fake.post_calls == ["list"] and tab.post_error is None and tab.post_stage_names() == [FIXTURE, RING]
+    fx, ring = tab.post_rows[FIXTURE], tab.post_rows[RING]
+    assert fx.switch.text() == "fixture_nuclei 1.0.0 (germquant-fixture-post-stage)"
+    assert fx.title_label.text() == "Fixture: per-nucleus voxels, volume, foci statistic and spot count"
+    assert list(fx.params) == ["factor", "min_voxels", "statistic", "fail"] and list(ring.params) == ["radius_um",
+                                                                                                       "note"]
+    radius = ring.params["radius_um"]
+    assert isinstance(radius.widget, QDoubleSpinBox) and radius.widget.suffix() == " um"
+    assert (radius.widget.minimum(), radius.widget.maximum(), radius.widget.value()) == (0.1, 5.0, 1.0)
+    assert radius.label.text() == "Shell width" and radius.pack_label.text() == "default 1.0"
+    assert isinstance(ring.params["note"].widget, QLineEdit) and ring.params["note"].widget.text() == "none"
+    assert ring.params["note"].label.text() == "note"                   # no label declared: the key
+    assert not radius.widget.isEnabled() and not fx.params["factor"].widget.isEnabled()   # off: they wait
+    assert tab.post_label.text().startswith("In force: none")
+    assert tab.post_entries() == [] and not tab.post_changed and not tab.apply_post_btn.isEnabled()
+    assert tab.post_hash_label.text() == ""
+
+    tab.set_post_stage(RING, True)
+    assert radius.widget.isEnabled() and tab.post_entries() == [{"name": RING, "params": {}}]
+    assert tab.apply_post_btn.isEnabled() and tab.post_hash_label.text() == f"with these post-stages: {UNCHANGED}"
+    tab.set_post_param(RING, "radius_um", 0.8)
+    note = ring.params["note"].widget
+    note.setText("x")
+    note.editingFinished.emit()                                         # the widget's own change
+    assert tab.post_entries() == [{"name": RING, "params": {"radius_um": 0.8, "note": "x"}}]
+    assert ring.params["note"].note_label.text() == "changed: x at Apply"
+    tab.reset_post_param(RING, "note")
+    assert note.text() == "none" and tab.post_entries() == [{"name": RING, "params": {"radius_um": 0.8}}]
+    with pytest.raises(ValueError, match="must be at most 5"):
+        tab.set_post_param(RING, "radius_um", 7.0)
+    with pytest.raises(ValueError, match="declares no parameter width"):
+        tab.set_post_param(RING, "width", 1.0)
+    with pytest.raises(ValueError, match="not offered by the engine environment"):
+        tab.set_post_stage("absent_stage", True)
+    _settle(tab, qtbot)
+    n = len(fake.calls)
+    written = []
+    tab.post_written.connect(written.append)
+    applied = []
+    tab.applied.connect(applied.append)
+    assert tab.apply_post_stages()
+    _settle(tab, qtbot)
+    path = tmp_path / "post_stages.yaml"
+    assert _writes(fake) == [[{"name": RING, "params": {"radius_um": 0.8}}]]
+    assert [Path(w["path"]) for w in written] == [path] and applied == []
+    assert len(fake.calls) == n                         # no project edit, no dry run: the file is not hashed
+    assert tab.config_hash == PACK_HASH and tab.post_switch(RING) and tab.post_value(RING, "radius_um") == 0.8
+    assert not tab.post_changed and not tab.apply_post_btn.isEnabled()
+    assert tab.status_label.text() == f"wrote {path}: ring_intensity (radius_um 0.8); {UNCHANGED}"
+    assert tab.post_label.text().startswith("In force: the project's post_stages.yaml: ring_intensity (radius_um "
+                                            "0.8)")
+    tab.set_post_stage(RING, False)                                     # every post-stage off
+    assert tab.post_entries() == [] and tab.post_changed
+    assert tab.apply_post_stages()
+    _settle(tab, qtbot)
+    assert _writes(fake)[-1] == [] and yaml.safe_load(path.read_text(encoding="ascii")) == []
+    assert tab.post_label.text().startswith("In force: the project's post_stages.yaml: every post-stage off")
+    assert fake.post_calls.count("list") == 1           # the engine environment's list: a write does not ask again
+    tab.reload()
+    _settle(tab, qtbot)
+    assert fake.post_calls.count("list") == 2           # an explicit reload does
+
+
+def test_post_stage_edits_wait_for_a_run_and_a_write(qtbot, tmp_path):
+    """No post-stage edit while a run of the project goes or a write is queued or running, as for the other recipe
+    edits: the switches and widgets are off, every edit call is refused with the reason, and a widget's own change
+    is put back. A post-stage write keeps the role choices and form values not applied yet."""
+    tab, fake = _post_tab(qtbot, tmp_path)
+    tab.set_running(True)
+    fx = tab.post_rows[FIXTURE]
+    assert not fx.switch.isEnabled() and not tab.apply_post_btn.isEnabled()
+    tab.set_post_stage(FIXTURE, True)
+    assert not tab.post_switch(FIXTURE) and tab.status_label.text() == RUNNING_TEXT
+    fx.switch.setChecked(True)                                          # the switch's own signal: put back
+    assert not fx.switch.isChecked() and not tab.post_switch(FIXTURE)
+    assert not tab.apply_post_stages()
+    tab.set_running(False)
+    tab.set_post_stage(FIXTURE, True)
+    tab.choose_channel("dna", "DAPI")                                   # chosen before the write, not applied
+    _settle(tab, qtbot)
+    fake.post_gate = threading.Event()                                  # hold the write
+    assert tab.apply_post_stages()
+    qtbot.waitUntil(lambda: len(_writes(fake)) == 1, timeout=30_000)
+    assert not fx.switch.isEnabled() and not fx.params["factor"].widget.isEnabled()
+    assert not tab.role_combos["dna"].isEnabled()
+    tab.set_post_param(FIXTURE, "factor", 3.0)
+    assert tab.post_value(FIXTURE, "factor") == 1.0 and tab.status_label.text() == WRITING_TEXT
+    fx.params["factor"].widget.setValue(4.0)                            # the widget's own signal: put back
+    assert fx.params["factor"].widget.value() == 1.0 and tab.post_value(FIXTURE, "factor") == 1.0
+    fake.post_gate.set()
+    fake.post_gate = None
+    _settle(tab, qtbot)
+    assert _writes(fake) == [[{"name": FIXTURE, "params": {}}]]
+    assert tab.post_switch(FIXTURE) and tab.post_rows[FIXTURE].switch.isEnabled()
+    assert tab.role_choice("dna") == "DAPI" and tab.role_combos["dna"].currentData() == "DAPI"
+
+
+def test_a_list_in_force_the_engine_cannot_run_is_named(qtbot, tmp_path):
+    """The project's post_stages.yaml, written by hand: a value outside its range, a float for an int, an undeclared
+    parameter, a post-stage the engine environment does not offer, and one listed twice. Each is named, with what
+    Apply writes instead (the engine refuses a run of the file as it is); the form shows the defaults, and Apply
+    writes the list without what cannot run. A pack's own list is in force until the project has its own."""
+    (tmp_path / "post_stages.yaml").write_bytes(b"- name: fixture_nuclei\n  params: {factor: 20.0, min_voxels: 3.0,"
+                                                b" width: 2}\n- name: absent_stage\n- name: fixture_nuclei\n")
+    tab, fake = _post_tab(qtbot, tmp_path)
+    where = "the project's post_stages.yaml"
+    assert tab.post_problems == [
+        f"{where}: fixture_nuclei: parameter factor must be at most 10.0, got 20.0: the form shows the default 1.0, "
+        f"which Apply writes",
+        f"{where}: fixture_nuclei: parameter min_voxels must be an integer, got 3.0: the form shows the default 0, "
+        f"which Apply writes",
+        f"{where}: fixture_nuclei declares no parameter width: Apply leaves it out",
+        f"{where} switches on absent_stage, which the engine environment does not offer: a run of the project is "
+        f"refused while the list names it, and Apply writes the list without it",
+        f"{where} lists fixture_nuclei more than once: Apply writes it once"]
+    assert tab.post_problems_label.text() == "\n".join(f"warning: {p}" for p in tab.post_problems)
+    assert tab.post_switch(FIXTURE) and tab.post_value(FIXTURE, "factor") == 1.0
+    assert tab.post_entries() == [{"name": FIXTURE, "params": {}}] and tab.post_changed
+    assert tab.apply_post_stages()
+    _settle(tab, qtbot)
+    assert _writes(fake) == [[{"name": FIXTURE, "params": {}}]] and tab.post_problems == []
+
+    pack = tmp_path / "pack" / "post_stages"
+    pack.mkdir(parents=True)
+    (pack / "basic.yaml").write_bytes(b"- name: ring_intensity\n  params: {radius_um: 0.5}\n")
+    shipped = post_list(tmp_path / "nothing_here", tmp_path / "pack", "basic")
+    tab2, fake2 = _post_tab(qtbot, tmp_path, post=shipped)
+    assert tab2.post_label.text().startswith("In force: the pack's post_stages/basic.yaml: ring_intensity "
+                                             "(radius_um 0.5)")
+    assert tab2.post_switch(RING) and tab2.post_value(RING, "radius_um") == 0.5 and not tab2.post_changed
+    tab2.set_post_param(RING, "radius_um", 0.6)
+    assert tab2.post_hash_label.text() == (f"with these post-stages: {UNCHANGED}. The project's own post_stages.yaml "
+                                           f"then replaces the pack's post_stages/basic.yaml.")
+
+
+def test_without_post_stages_the_section_says_why_and_the_rest_works(qtbot, tmp_path):
+    """An engine runner that cannot list post-stages, or an engine without the post_stages feature (its one
+    message): the section says why and shows the list in force, read only; the role editor and the form work as
+    before."""
+    view = fake_view(tmp_path, tunables=[({"key": "a.float", "type": "float", "min": 0, "max": 9}, 1.0, 1.0, None)],
+                     post=PostList("project", tmp_path / "post_stages.yaml",
+                                   ({"name": FIXTURE, "params": {"factor": 2.5}},)))
+    fake = FakeRunner(lambda kw: preview_record(BINDS, config_hash="eeeeeeeeeeee" if kw.get("edits") else PACK_HASH,
+                                                changed=False))                           # no post-stage methods
+    tab = _tab(qtbot, tmp_path, session=FakeSession(fake), reader=lambda root, reference=None: view)
+    assert tab.post_error == "this engine runner cannot list post-stages" and tab.post_rows == {}
+    assert tab.post_label.text() == ("In force: the project's post_stages.yaml: fixture_nuclei (factor 2.5).\n"
+                                     "No post-stage list: this engine runner cannot list post-stages")
+    assert not tab.apply_post_btn.isEnabled() and not tab.apply_post_stages()
+    with pytest.raises(ValueError, match="no post-stage list"):
+        tab.set_post_stage(FIXTURE, False)
+    tab.set_value("a.float", 2.0)
+    _settle(tab, qtbot)
+    assert tab.form_hash == "eeeeeeeeeeee" and tab.apply_form_btn.isEnabled() and tab.role_combos["dna"].isEnabled()
+
+    message = _engine.feature_missing_message("post_stages", info={"germquant": "0.2.0.dev0", "git_sha": "x" * 40},
+                                              interpreter=sys.executable)
+    fake2 = FakePostRunner(lambda kw: preview_record(BINDS, config_hash=PACK_HASH, changed=False))
+    fake2.list_error = FeatureMissing(message, "post_stages")
+    tab2 = _tab(qtbot, tmp_path, session=FakeSession(fake2), reader=lambda root, reference=None: view)
+    assert tab2.post_error == message and "Post-stages need the tranche-5 Train B engine" in tab2.post_label.text()
+    assert tab2.role_combos["dna"].isEnabled() and tab2.last_error is None and tab2.engine_error is None
+
+
 # ---------------------------------------------------------------------------------------------------
 # the rules (no Qt, no engine)
 # ---------------------------------------------------------------------------------------------------
@@ -549,3 +873,56 @@ def test_form_change_and_the_badge():
     assert validated_badge({"value": False, "why": "not validated: the record fails its check"})[0] == \
         "not validated (the record fails its check)"
     assert validated_badge(None) == ("validated: unknown", "warn")
+
+
+def test_the_post_stage_rules(tmp_path):
+    """post_stages.yaml as the engine reads it (UTF-8 with or without a byte-order mark, YAML, an empty file an empty
+    list, a list of {name, params}); the list in force (the project's own, else the pack's for the recipe, else
+    none); what Apply writes (the listing's order, only the parameters off their defaults); and when that is a
+    change (by the values a run gets, not by the order or a default written out)."""
+    p = tmp_path / "a.yaml"
+    p.write_bytes(b"\xef\xbb\xbf- name: ring_intensity\n  params: {radius_um: 1}\n")
+    assert read_post_entries(p) == ([{"name": RING, "params": {"radius_um": 1}}], None)
+    for text in (b"", b"[]\n", b"# a comment only\n"):
+        p.write_bytes(text)
+        assert read_post_entries(p) == ([], None)
+    for text, why in ((b"- name: [\n", "cannot be read as YAML (line "), (b"name: x\n", "must be a list"),
+                      (b"- params: {}\n", "entry 0 has no name"), (b"- {name: x, other: 1}\n", "unknown key"),
+                      (b"- {name: x, params: [1]}\n", "params must be a mapping"), (b"\xff\xfe", "not UTF-8 text")):
+        p.write_bytes(text)
+        entries, problem = read_post_entries(p)
+        assert entries is None and why in problem, (text, problem)
+
+    pack, proj = tmp_path / "pack", tmp_path / "proj"
+    (pack / "post_stages").mkdir(parents=True)
+    proj.mkdir()
+    (pack / "post_stages" / "basic.yaml").write_bytes(b"- name: ring_intensity\n")
+    assert post_list(proj, pack, "other") == PostList()
+    shipped = post_list(proj, pack, "basic")
+    assert (shipped.origin, shipped.path, shipped.entries) == ("pack", pack / "post_stages" / "basic.yaml",
+                                                               ({"name": RING, "params": {}},))
+    (proj / "post_stages.yaml").write_bytes(b"[]\n")
+    own = post_list(proj, pack, "basic")
+    assert (own.origin, own.path, own.entries, own.problem) == ("project", proj / "post_stages.yaml", (), None)
+    assert own.summary() == "the project's post_stages.yaml: every post-stage off"
+
+    stages = post_stages_from_listing(post_rows())
+    assert [s.name for s in stages] == [FIXTURE, RING] and stages[0].defaults == {"factor": 1.0, "min_voxels": 0,
+                                                                                    "statistic": "mean", "fail": False}
+    want = post_entries(stages, {RING: True, FIXTURE: True}, {FIXTURE: {"factor": 1.0, "statistic": "max"},
+                                                             RING: {"radius_um": 0.8}})
+    assert want == [{"name": FIXTURE, "params": {"statistic": "max"}}, {"name": RING, "params": {"radius_um": 0.8}}]
+    assert entries_text(want) == "fixture_nuclei (statistic max); ring_intensity (radius_um 0.8)"
+    assert entries_text([{"name": RING, "params": {}}]) == "ring_intensity (its defaults)" and \
+        entries_text([]) == "every post-stage off"
+    same = PostList("project", proj / "post_stages.yaml", ({"name": RING, "params": {"radius_um": 0.8, "note": "none"}},
+                                                           {"name": FIXTURE, "params": {"statistic": "max", "factor": 1}}))
+    assert post_state(stages, same)[1] == [] and not post_list_changed(stages, same, want)
+    assert post_list_changed(stages, same, want[:1]) and post_list_changed(stages, PostList(), want)
+    assert not post_list_changed(stages, PostList(), []) and not post_list_changed(stages, own, [])
+    broken = PostList("project", proj / "post_stages.yaml", (), "it cannot be read as YAML (line 1)")
+    assert post_list_changed(stages, broken, [])                        # Apply writes a list a run can read
+    state, problems = post_state(stages, broken)
+    assert not state[FIXTURE]["on"] and problems == [
+        "the project's post_stages.yaml cannot be read (it cannot be read as YAML (line 1)): a run of the project is "
+        "refused while it is so, and Apply writes a new post_stages.yaml"]
