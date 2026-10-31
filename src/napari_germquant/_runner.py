@@ -47,11 +47,13 @@ for the streamed lines. Through the subprocess runner:
   and a REFUSED line, which is EngineRefused too.
 
 The in-process runner calls the same commands through germquant.api (and germquant.segment.training for the
-training commands), passing the project explicitly (napari's thread workers start with no pack context). The
-six project writes (new, add, edit, use-model, rounds, unlock) and ``pack derive`` are the exception: they run
-the torch-free entry of this napari environment's own Python as a child process, the same germquant, so each
-write is the command's own (an edit is one planned write under the project lock, with the command's refusals
-and record), not a second implementation of it here.
+training commands), passing the project explicitly (napari's thread workers start with no pack context). An
+error of such a call is a refusal (EngineRefused) or a failure (RunnerError) as that call's command answers it,
+by each command's own rule (``_projects_refusal`` and the rules after it). The six project writes (new, add,
+edit, use-model, rounds, unlock) and ``pack derive`` are the exception: they run the torch-free entry of this
+napari environment's own Python as a child process, the same germquant, so each write is the command's own (an
+edit is one planned write under the project lock, with the command's refusals and record), not a second
+implementation of it here.
 
 The engine version string cannot tell a Train B engine (it stays 0.2.0.dev0), so the runners gate on the
 ``features`` list of ``python -m germquant.packs --version --json`` (an engine from before the list has packs and
@@ -920,7 +922,9 @@ def _command_name(argv: list[str]) -> str:
 
 
 def _refusal_types() -> tuple:
-    """The errors the project command line turns into a refusal (exit 2)."""
+    """The errors the project command line turns into a refusal (exit 2), a YAML error aside: ValueError (which
+    ProjectError is), OSError and PackInstallError. ``_api_call``'s default, which the two post-stage methods
+    still take (their own rule is RECIPE's post-stage pass, after merge #4)."""
     types_: list = [ValueError, OSError]
     try:
         from germquant.packs import PackInstallError
@@ -929,6 +933,97 @@ def _refusal_types() -> tuple:
     except ImportError:
         pass
     return tuple(types_)
+
+
+# ---- what each command refuses (reviews/P6_package.md N1) ----
+# An engine command turns some errors of the call it makes into a refusal (exit 2: refused before anything ran or
+# was written, one REFUSED: or ERROR: line) and lets every other error fail it (exit 1: an ERROR: line or a
+# traceback). The in-process runner makes the same call, so it answers as that command does: each rule below
+# takes the error and gives the reason a refusal shows, or None for a failure (a RunnerError naming the error).
+# As the commands are built at 39a0a84: cli_projects.dispatch, cli_training._import_labels and _train_curve, and
+# cli_tune.dispatch.
+
+
+def _engine_classes(*names: str) -> tuple:
+    """The exception classes ``module:Class`` this germquant has (an engine part way through the train may lack
+    one, and a rule must not fail on that while it reads an error)."""
+    found = []
+    for name in names:
+        module, _, attr = name.partition(":")
+        try:
+            found.append(getattr(importlib.import_module(module), attr))
+        except (ImportError, AttributeError):
+            continue
+    return tuple(found)
+
+
+def _yaml_reason(e) -> str:
+    """A YAML error in one line, as the engine gives it (germquant.project.recipe.yaml_reason): what is wrong and
+    where, line and column counted from 1."""
+    problem, mark = getattr(e, "problem", None), getattr(e, "problem_mark", None)
+    if problem and mark is not None:
+        return f"{problem}, line {mark.line + 1} column {mark.column + 1}"
+    lines = str(e).strip().splitlines()
+    return lines[0] if lines else type(e).__name__
+
+
+def _projects_refusal(e: BaseException) -> str | None:
+    """`germquant project run|status|collect|export-commands` (cli_projects.dispatch; a run only before its
+    start): ValueError (ProjectError), OSError and PackInstallError are refused, and a project file that is not
+    YAML (a recipe.yaml or channel_map.yaml edited by hand), with the engine's reason and way back."""
+    import yaml
+
+    if isinstance(e, yaml.YAMLError):
+        return (f"a YAML file of the project does not load ({_yaml_reason(e)}): if recipe.yaml or channel_map.yaml "
+                f"was edited by hand, fix it, or go back to the pack recipe with `germquant project edit DIR "
+                f"--revert`")
+    return str(e) if isinstance(e, _refusal_types()) else None
+
+
+def _import_labels_refusal(e: BaseException) -> str | None:
+    """`germquant import-labels` (cli_training._import_labels): ValueError, FileNotFoundError and ImportError are
+    refused (a bad file, image or option, a test-split image, a missing reader: nothing written); any other
+    OSError fails (a write that stopped part way), as everything else does."""
+    return str(e) if isinstance(e, (ValueError, FileNotFoundError, ImportError)) else None
+
+
+def _train_curve_refusal(e: BaseException) -> str | None:
+    """`germquant train-curve` (cli_training._train_curve): ValueError, FileNotFoundError and ModelPinError (the
+    RuntimeError of a base model whose pin does not hold) are refused; anything else fails, an OSError and any
+    other RuntimeError included (the command's traceback, exit 1)."""
+    refused = (ValueError, FileNotFoundError, *_engine_classes("germquant.models_registry:ModelPinError"))
+    return str(e) if isinstance(e, refused) else None
+
+
+def _tune_open_refusal(e: BaseException) -> str | None:
+    """`germquant tune-spots`, both forms (cli_tune.dispatch): any error opening the project refuses it."""
+    return str(e)
+
+
+def _tune_refusal(e: BaseException) -> str | None:
+    """`germquant tune-spots`, the search (cli_tune.dispatch): TuneRefused and FileNotFoundError are refused;
+    anything else fails (a detection that failed once the search ran)."""
+    refused = (*_engine_classes("germquant.tune:TuneRefused"), FileNotFoundError)
+    return str(e) if isinstance(e, refused) else None
+
+
+def _tune_apply_refusal(e: BaseException) -> str | None:
+    """`germquant tune-spots --apply` (cli_tune.dispatch): TuneRefused, FileNotFoundError and ValueError are
+    refused, except a ProjectError raised from an OSError, a write of germquant.project that stopped part way
+    (its message names what was written): that fails, so the dock knows the project may have changed (9.4 #7),
+    as anything else does."""
+    if isinstance(e, _engine_classes("germquant.project:ProjectError")) and isinstance(e.__cause__, OSError):
+        return None
+    refused = (*_engine_classes("germquant.tune:TuneRefused"), FileNotFoundError, ValueError)
+    return str(e) if isinstance(e, refused) else None
+
+
+def _refused(refusals, e: BaseException) -> str | None:
+    """The reason ``refusals`` gives for refusing ``e``: a rule above, or the error classes refused; None when it
+    does not refuse ``e``."""
+    if isinstance(refusals, tuple):
+        return str(e) if isinstance(e, refusals) else None
+    return refusals(e)
 
 
 def _check_edit(revert, edits, unset, roles) -> None:
@@ -1075,10 +1170,12 @@ class InProcessRunner(EngineRunner):
                               f"checkout, or choose an engine interpreter")
         return fn
 
-    def _open(self, root):
+    def _open(self, root, refusals=None):
         """api.open_project(root); a folder that is no project (or cannot be read) is EngineRefused, as the
-        commands refuse it with exit 2."""
-        return self._api_call(self._api("open_project"), root)
+        commands refuse it with exit 2: by the project commands' rule, or ``refusals`` (tune-spots refuses any
+        error opening the project)."""
+        return self._api_call(self._api("open_project"), root,
+                              refusals=_projects_refusal if refusals is None else refusals)
 
     def _child(self) -> SubprocessRunner:
         """This napari environment's own Python as an engine process: the same germquant, through its torch-free
@@ -1093,17 +1190,19 @@ class InProcessRunner(EngineRunner):
 
     def _api_call(self, func, *args, refusals=None, **kwargs):
         """``func(*args, **kwargs)``; a refusal becomes EngineRefused, any other error a RunnerError naming the
-        call. ``refusals``: what the engine's command line turns into exit 2 (by default as the project commands
-        do: ValueError, which ProjectError is, OSError and PackInstallError); ``()`` for none."""
+        call. ``refusals``: what the command that makes this call turns into exit 2, its rule (``_projects_refusal``
+        and the others: the reason a refusal gives, or None) or the error classes; by default the project
+        commands' classes (``_refusal_types``); ``()`` for none."""
         if refusals is None:
             refusals = _refusal_types()
         try:
             return func(*args, **kwargs)
         except RunnerError:
             raise
-        except refusals as e:
-            raise EngineRefused(f"REFUSED: {e}", output=str(e)) from e
         except Exception as e:  # noqa: BLE001 - one message for the dock, the cause chained
+            reason = _refused(refusals, e)
+            if reason is not None:
+                raise EngineRefused(f"REFUSED: {reason}", output=reason) from e
             raise RunnerError(f"{getattr(func, '__name__', 'the call')} failed: {type(e).__name__}: {e}") from e
 
     def _start(self, should_stop, *features: str) -> None:
@@ -1152,9 +1251,10 @@ class InProcessRunner(EngineRunner):
         """api.run_project with via gui-inprocess and the run id; its progress callback (whatever it passes)
         reads the engine's log, so ``progress`` gets the same events as through the subprocess runner. As the
         command answers: a refusal before the run started (no run_start in its log: a folder that is no project,
-        a model digest mismatch, a series it cannot run) is state refused, as exit 2; any other error is a
-        RunnerError with the run, its log and its events attached. The run stops between images when
-        ``should_stop`` answers True, then RunCancelled, unless the run had finished every image."""
+        a model digest mismatch, a series it cannot run, a project file that is not YAML; ``_projects_refusal``)
+        is state refused, as exit 2; any other error is a RunnerError with the run, its log and its events
+        attached. The run stops between images when ``should_stop`` answers True, then RunCancelled, unless the
+        run had finished every image."""
         self._start(should_stop, "projects")
         run_id = check_run_id(run_id or new_run_id())
         tail = LogTail(project_log_path(root, run_id))
@@ -1178,13 +1278,11 @@ class InProcessRunner(EngineRunner):
                               run_id=run_id, should_stop=should_stop)
         except RunnerError:
             raise
-        except _refusal_types() as e:
-            tick()
-            if not any(ev.get("event") == "run_start" for ev in events):
-                return project_run_result(run_id, tail.path, events, 2, [f"REFUSED: {e}"])
-            raise with_run(RunnerError(f"run_project failed: {type(e).__name__}: {e}")) from e
         except Exception as e:  # noqa: BLE001 - one message for the dock, the cause chained
             tick()
+            reason = _projects_refusal(e)
+            if reason is not None and not any(ev.get("event") == "run_start" for ev in events):
+                return project_run_result(run_id, tail.path, events, 2, [f"REFUSED: {reason}"])
             raise with_run(RunnerError(f"run_project failed: {type(e).__name__}: {e}")) from e
         tick()
         res = res if isinstance(res, dict) else {}
@@ -1198,17 +1296,18 @@ class InProcessRunner(EngineRunner):
 
     def project_status(self, root, *, should_stop=None) -> dict:
         self._start(should_stop, "projects")
-        return _jsonable(self._api_call(self._api("project_status"), self._open(root)))
+        return _jsonable(self._api_call(self._api("project_status"), self._open(root), refusals=_projects_refusal))
 
     def project_collect(self, root, *, should_stop=None) -> dict:
         self._start(should_stop, "projects")
-        return _jsonable(self._api_call(self._api("collect_project"), self._open(root)))
+        return _jsonable(self._api_call(self._api("collect_project"), self._open(root), refusals=_projects_refusal))
 
     def project_export_commands(self, root, *, shell="sh", shards=None, out=None, should_stop=None) -> dict:
         self._start(should_stop, "projects")
-        text = self._api_call(self._api("export_commands"), self._open(root), shell=shell, shards=shards)
-        if out is not None:
-            _write_atomic(out, str(text).encode("utf-8"))
+        text = self._api_call(self._api("export_commands"), self._open(root), shell=shell, shards=shards,
+                              refusals=_projects_refusal)
+        if out is not None:              # the command writes --out in its handler, so a failed write is refused
+            self._api_call(_write_atomic, out, str(text).encode("utf-8"), refusals=_projects_refusal)
         return {"text": str(text), "out": str(out) if out is not None else None}
 
     def import_labels(self, src, fmt, image, pairs, *, allow_pickle=False, frame=None, channel=None,
@@ -1225,7 +1324,8 @@ class InProcessRunner(EngineRunner):
             if isinstance(channel, str) and re.fullmatch(r"[0-9]+", channel.strip()):
                 channel = int(channel.strip())
             kw["channel"] = channel
-        return _jsonable(self._api_call(self._api("import_labels"), src, fmt, image, pairs, **kw))
+        return _jsonable(self._api_call(self._api("import_labels"), src, fmt, image, pairs,
+                                        refusals=_import_labels_refusal, **kw))
 
     def export_training(self, results, out, *, orientations=None, slices_per_image=None, seed=None,
                         zone_column=None, min_labels=None, max_gb=None, say=None, should_stop=None) -> dict:
@@ -1300,7 +1400,7 @@ class InProcessRunner(EngineRunner):
         if keep_models is not None:
             kw["keep_models"] = keep_models
         with device_env(device or self.device):
-            return _jsonable(self._api_call(fn, pairs, out, **kw))
+            return _jsonable(self._api_call(fn, pairs, out, refusals=_train_curve_refusal, **kw))
 
     def pack_derive(self, from_ref, recipe, model, card, out, *, new_id=None, should_stop=None) -> dict:
         """The API names no derive function, so this runs the torch-free ``-m germquant.packs derive`` of this
@@ -1311,10 +1411,10 @@ class InProcessRunner(EngineRunner):
     def tune_spots(self, project, *, points=None, grid=None, max_runs=None, out=None, say=None,
                    should_stop=None) -> dict:
         self._start(should_stop, "tune_spots")
-        res = self._api_call(self._api("tune_spots"), self._open(project), points=str(points or "annotations"),
-                             grid=str(grid) if grid is not None else None,
+        res = self._api_call(self._api("tune_spots"), self._open(project, _tune_open_refusal),
+                             points=str(points or "annotations"), grid=str(grid) if grid is not None else None,
                              out=str(out) if out is not None else None,
-                             max_runs=int(max_runs) if max_runs is not None else 50)
+                             max_runs=int(max_runs) if max_runs is not None else 50, refusals=_tune_refusal)
         return _jsonable(res)
 
     def tune_apply(self, project, run_dir, *, plugin_version=None, should_stop=None) -> dict:
@@ -1328,8 +1428,8 @@ class InProcessRunner(EngineRunner):
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", TuningWarning)
-            h = self._api_call(self._api("apply_tuning"), self._open(project), str(run_dir),
-                               plugin_version=plugin_version or _plugin_version())
+            h = self._api_call(self._api("apply_tuning"), self._open(project, _tune_open_refusal), str(run_dir),
+                               plugin_version=plugin_version or _plugin_version(), refusals=_tune_apply_refusal)
         for w in caught:                     # anything else is shown as it would have been (as cli_tune does)
             if not issubclass(w.category, TuningWarning):
                 warnings.showwarning(w.message, w.category, w.filename, w.lineno)

@@ -3,8 +3,9 @@ plan): one method per command, each building the command line the engine documen
 tests/_p6_runner.py answer with what they were given), the torch-free entries used where they exist, the
 plugin version stamped on every project write, ``project=`` on the pack calls, the device list of the runtime
 probe, the refusal forms of the Train B commands, and the in-process runner: the same commands through
-germquant.api, but its project writes through the torch-free command of this environment (and, on an engine
-with projects, both runners writing the same project files, and an Apply's record with the engine's warning)."""
+germquant.api, each error a refusal or a failure as that command answers it, but its project writes through the
+torch-free command of this environment (and, on an engine with projects, both runners writing the same project
+files, an Apply's record with the engine's warning, and the same refusal of a project file that is not YAML)."""
 from __future__ import annotations
 
 import inspect
@@ -729,3 +730,203 @@ def test_an_apply_gives_the_engines_tuning_warning_through_both_runners(project_
     assert sub == {"config_hash": inproc["config_hash"], "run_dir": f"tuning/{rid}", "warnings": inproc["warnings"]}
     (note,) = inproc["warnings"]                       # the run, the config it was made with and the recipe's now
     assert rid in note and made_with in note and start["inprocess"][2] in note
+
+
+# ---- each in-process call refuses what its command refuses (reviews/P6_package.md N1) ----
+
+DISK_FULL = "No space left on device"
+# what `germquant project ...` says of a project file that is not YAML (cli_projects.dispatch), for the error
+# _yaml_error raises
+YAML_REFUSAL = ("a YAML file of the project does not load (expected ',' or ']', but got '<stream end>', line 2 "
+                "column 1): if recipe.yaml or channel_map.yaml was edited by hand, fix it, or go back to the pack "
+                "recipe with `germquant project edit DIR --revert`")
+
+
+def _yaml_error() -> Exception:
+    """The error PyYAML raises for a hand edit gone wrong: a list left open on line 1."""
+    import yaml
+
+    try:
+        yaml.safe_load("spots: [unclosed\n")
+    except yaml.YAMLError as e:
+        return e
+    raise AssertionError("the text read as YAML")
+
+
+def _part_way(E) -> Exception:
+    """germquant.project's ProjectError for a write that stopped part way: raised from the OSError (9.4 #7)."""
+    e = E.ProjectError("the write stopped part way: recipe.yaml was written, germquant_project.yaml was not")
+    e.__cause__ = OSError(28, DISK_FULL)
+    return e
+
+
+def _engine_errors(monkeypatch) -> types.SimpleNamespace:
+    """The engine's exception classes the commands name: germquant.tune's TuneRefused (and TuningWarning, which an
+    Apply records), germquant.project's ProjectError, germquant.models_registry's ModelPinError; on an engine
+    before P5 (the CI pin), stand-in modules with classes of the same bases."""
+    from germquant.models_registry import ModelPinError
+
+    try:
+        from germquant.tune import TuneRefused
+    except ImportError:
+        tune = types.ModuleType("germquant.tune")
+        tune.TuneRefused = TuneRefused = type("TuneRefused", (ValueError,), {})
+        tune.TuningWarning = type("TuningWarning", (UserWarning,), {})
+        monkeypatch.setitem(sys.modules, "germquant.tune", tune)
+    try:
+        from germquant.project import ProjectError
+    except ImportError:
+        project = types.ModuleType("germquant.project")
+        project.ProjectError = ProjectError = type("ProjectError", (ValueError,), {})
+        monkeypatch.setitem(sys.modules, "germquant.project", project)
+    return types.SimpleNamespace(TuneRefused=TuneRefused, ProjectError=ProjectError, ModelPinError=ModelPinError)
+
+
+def _fake_api(monkeypatch, raising: dict) -> None:
+    """germquant.api's project, import and tuning functions and segment.training.train_curve as fakes that answer,
+    or raise the error ``raising`` gives for their name; this environment has every Train B feature."""
+    from germquant.segment import training as T
+
+    def fake(name, value):
+        def f(*a, **k):
+            if name in raising:
+                raise raising[name]
+            return value(*a, **k) if callable(value) else value
+        f.__name__ = name
+        return f
+
+    answers = {"open_project": _FakeProject, "project_status": {"format": 1, "images": []},
+               "collect_project": {"tables": []}, "export_commands": "germquant project run X\n",
+               "run_project": {"exit_code": 0}, "import_labels": {"pairs": 2},
+               "tune_spots": {"run_dir": "tuning/t1", "best": None, "ranked": []}, "apply_tuning": "fedcba987654"}
+    for name, value in answers.items():
+        monkeypatch.setattr(api, name, fake(name, value), raising=False)
+    monkeypatch.setattr(T, "train_curve", fake("train_curve", {"models": []}), raising=False)
+    monkeypatch.setattr(InProcessRunner, "features", lambda self, should_stop=None: frozenset(_engine.FEATURES))
+
+
+IN_PROCESS_CALLS = {
+    "import-labels": lambda r, P: r.import_labels("seg.npz", "cellacdc-npz", "img.tif", "pairs"),
+    "train-curve": lambda r, P: r.train_curve("pairs", "curve", sizes=[1, "all"], repeats=1, seed=0, base="none"),
+    "tune-spots": lambda r, P: r.tune_spots(P),
+    "tune-spots --apply": lambda r, P: r.tune_apply(P, "tuning/t1"),
+    "project run": lambda r, P: r.project_run(P, run_id=RID),
+    "project status": lambda r, P: r.project_status(P),
+    "project collect": lambda r, P: r.project_collect(P),
+    "project export-commands": lambda r, P: r.project_export_commands(P),
+}
+
+# (the command, the API function that raises, the error, what the command answers), as the commands are built at
+# 39a0a84: cli_training._import_labels and _train_curve, cli_tune.dispatch and cli_projects.dispatch
+ANSWERS = [
+    # import-labels: ValueError, FileNotFoundError and ImportError are refused; any other OSError fails
+    ("import-labels", "import_labels", lambda E: ValueError("a test-split image"), "refused"),
+    ("import-labels", "import_labels", lambda E: FileNotFoundError("labels file not found: seg.npz"), "refused"),
+    ("import-labels", "import_labels", lambda E: ModuleNotFoundError("No module named 'bioio_ome_tiff'"), "refused"),
+    ("import-labels", "import_labels", lambda E: OSError(28, DISK_FULL), "failed"),
+    ("import-labels", "import_labels", lambda E: PermissionError(13, "Permission denied"), "failed"),
+    # train-curve: ValueError, FileNotFoundError and ModelPinError (a RuntimeError) are refused; anything else fails
+    ("train-curve", "train_curve", lambda E: ValueError("the pairs form a single series group"), "refused"),
+    ("train-curve", "train_curve", lambda E: FileNotFoundError("no manifest.csv in pairs"), "refused"),
+    ("train-curve", "train_curve", lambda E: E.ModelPinError("cpsam_v2@00000000 is not a pinned model"), "refused"),
+    ("train-curve", "train_curve", lambda E: OSError(28, DISK_FULL), "failed"),
+    ("train-curve", "train_curve", lambda E: RuntimeError("CUDA out of memory"), "failed"),
+    # tune-spots, the search: TuneRefused and FileNotFoundError are refused, and any error opening the project;
+    # anything else fails (a detection that failed once the search ran)
+    ("tune-spots", "tune_spots", lambda E: E.TuneRefused("a split named test is refused"), "refused"),
+    ("tune-spots", "tune_spots", lambda E: FileNotFoundError("no annotations/ folder"), "refused"),
+    ("tune-spots", "tune_spots", lambda E: ValueError("a detection failed"), "failed"),
+    ("tune-spots", "tune_spots", lambda E: OSError(28, DISK_FULL), "failed"),
+    ("tune-spots", "open_project", lambda E: TypeError("the manifest's images are not a list"), "refused"),
+    # tune-spots --apply: TuneRefused, FileNotFoundError and ValueError are refused, and any error opening the
+    # project, but a write that stopped part way fails, as anything else does
+    ("tune-spots --apply", "apply_tuning", lambda E: E.TuneRefused("keys outside the run's grid"), "refused"),
+    ("tune-spots --apply", "apply_tuning", lambda E: FileNotFoundError("no best.yaml in tuning/t1"), "refused"),
+    ("tune-spots --apply", "apply_tuning", lambda E: E.ProjectError("the project is locked by LAB-PC pid 42"),
+     "refused"),
+    ("tune-spots --apply", "apply_tuning", _part_way, "failed"),
+    ("tune-spots --apply", "apply_tuning", lambda E: OSError(28, DISK_FULL), "failed"),
+    ("tune-spots --apply", "open_project", lambda E: TypeError("the manifest's images are not a list"), "refused"),
+    # the project commands: ValueError (ProjectError), OSError and PackInstallError are refused, and a project file
+    # that is not YAML, with the engine's reason and way back; anything else fails
+    ("project run", "run_project", lambda E: _yaml_error(), "refused"),
+    ("project run", "run_project", lambda E: ValueError("model digest mismatch for cpsam_v2@0f1cc3f7"), "refused"),
+    ("project run", "run_project", lambda E: RuntimeError("boom"), "failed"),
+    ("project status", "project_status", lambda E: _yaml_error(), "refused"),
+    ("project status", "project_status", lambda E: OSError("the share went away"), "refused"),
+    ("project status", "open_project", lambda E: TypeError("the manifest's images are not a list"), "failed"),
+    ("project collect", "collect_project", lambda E: _yaml_error(), "refused"),
+    ("project collect", "collect_project", lambda E: RuntimeError("boom"), "failed"),
+    ("project export-commands", "export_commands", lambda E: _yaml_error(), "refused"),
+]
+
+
+@pytest.mark.parametrize(("command", "raiser", "error", "answer"), ANSWERS,
+                         ids=[f"{i:02d}-{c.replace(' ', '_')}-{a}" for i, (c, _r, _e, a) in enumerate(ANSWERS)])
+def test_each_in_process_call_refuses_what_its_command_refuses(command, raiser, error, answer, tmp_path,
+                                                                 monkeypatch):
+    """In process, an error of the API call is a refusal (EngineRefused, and for a project run the refused state)
+    when the engine's command refuses it (exit 2: nothing ran or was written), else a failure (a RunnerError
+    naming the error), as the command fails (exit 1), so the dock says what the command line would say: each
+    command's own rule, not the project commands' for every call (reviews/P6_package.md N1)."""
+    import yaml
+
+    E = _engine_errors(monkeypatch)
+    exc = error(E)
+    _fake_api(monkeypatch, raising={raiser: exc})
+    call = IN_PROCESS_CALLS[command]
+    r, P = InProcessRunner(), tmp_path / "proj"
+    if answer == "failed":
+        with pytest.raises(RunnerError) as e:
+            call(r, P)
+        assert not isinstance(e.value, EngineRefused), str(e.value)
+        assert f"{type(exc).__name__}: {exc}" in str(e.value) and e.value.__cause__ is exc
+        return
+    reason = YAML_REFUSAL if isinstance(exc, yaml.YAMLError) else str(exc)
+    if command == "project run":
+        res = call(r, P)
+        assert (res["state"], res["exit_code"], res["events"], res["message"]) == ("refused", 2, [],
+                                                                                    f"REFUSED: {reason}")
+        return
+    with pytest.raises(EngineRefused) as e:
+        call(r, P)
+    assert str(e.value) == f"REFUSED: {reason}" and e.value.output == reason and e.value.__cause__ is exc
+
+
+def test_an_in_process_export_that_cannot_write_its_file_is_refused(tmp_path, monkeypatch):
+    """`project export-commands --out FILE` refuses a FILE it cannot write (exit 2: cli_projects.dispatch refuses
+    an OSError of its handler, the write included), so in process too, and no part file is left."""
+    _engine_errors(monkeypatch)
+    _fake_api(monkeypatch, raising={})
+    out = tmp_path / "no such folder" / "cmds.ps1"
+    with pytest.raises(EngineRefused, match="^REFUSED: ") as e:
+        InProcessRunner().project_export_commands(tmp_path / "proj", shell="ps1", out=out)
+    assert isinstance(e.value.__cause__, FileNotFoundError) and not out.parent.exists()
+
+
+def test_a_project_file_that_is_not_yaml_is_refused_alike_through_both_runners(project_env):
+    """A recipe.yaml broken by hand: `project run` and `project collect` refuse the project (exit 2) with one
+    REFUSED line, the engine's reason and way back (cli_projects.dispatch); the in-process runner gives that line
+    for a run (the refused state) and refuses collect and export-commands with it, where it used to fail with the
+    YAML parser's own error (reviews/P6_package.md N1). Nothing runs."""
+    need_features("projects")
+    root = project_env.new_dir()
+    api.new_project(root, "test_pack@0.1.0", images=[project_env.image])
+    api.write_recipe(api.open_project(root), edits={"spots.log.min_snr": 2.5})
+    recipe = root / "recipe.yaml"
+    recipe.write_bytes(recipe.read_bytes() + b"spots: [unclosed\n")
+    sub, inproc = SubprocessRunner(sys.executable), InProcessRunner()
+    ran = sub.project_run(root, device="cpu")
+    assert (ran["state"], ran["exit_code"], ran["events"]) == ("refused", 2, [])
+    (line,) = [ln for ln in ran["message"].splitlines() if ln.startswith("REFUSED: ")]
+    assert line.startswith("REFUSED: a YAML file of the project does not load (") and line.endswith(" --revert`")
+    with pytest.raises(EngineRefused) as e:
+        sub.project_collect(root)
+    assert str(e.value).splitlines()[1:] == [line]
+    res = inproc.project_run(root, device="cpu")
+    assert (res["state"], res["exit_code"], res["events"], res["message"]) == ("refused", 2, [], line)
+    for call in (inproc.project_collect, inproc.project_export_commands):
+        with pytest.raises(EngineRefused) as e:
+            call(root)
+        assert str(e.value) == line, call.__name__
+    assert list(root.glob("runs/*.jsonl")) == []
