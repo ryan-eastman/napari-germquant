@@ -58,11 +58,12 @@ env:
   CUDA_VISIBLE_DEVICES: "-1"
   ENGINE_REPOSITORY: ryan-eastman/C_elegans_germline_masking_and_spot_counting
   # train B of tranche 5, open: the pushed head of the engine's integration branch feat/t5-train-b, as a full sha,
-  # moved after every engine merge (Train B plan, section 5.4). Now 82099b8: merge #2 (P2c, labels from files) and
-  # the engine CI's move of its macOS job to macos-15 (decision D54), so the engine code is fb6cf1a's. Before it,
-  # fb6cf1a (merge #2), 361b082 (merge #1, P2b, single-plane images) and main's pin b90ebdf ("Merge pull request
+  # moved after every engine merge (Train B plan, section 5.4). Now 78af711: merge #3 (P5: projects, batch formats,
+  # the sample sheet, the training and tuning engine), whose version document lists nine features. Before it,
+  # 82099b8 (merge #2 and the engine CI's move of its macOS job to macos-15, decision D54), fb6cf1a (merge #2, P2c,
+  # labels from files), 361b082 (merge #1, P2b, single-plane images) and main's pin b90ebdf ("Merge pull request
   # #12", tranche-5 train A, merged).
-  ENGINE_COMMIT: 82099b8fe1cb41da6e355b6f9dcac52e9b12769f
+  ENGINE_COMMIT: 78af711e6c16fc9a53ee46f413182f879d890b88
 
 jobs:
   test:
