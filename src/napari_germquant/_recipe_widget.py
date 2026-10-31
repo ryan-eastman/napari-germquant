@@ -40,9 +40,9 @@ and while one of its writes is queued or running (the write's answer replaces th
 The host: the Project dock (unit P6-PROJECT) shows the tab through one line of its EXTRA_TABS,
 ``("Recipe", "napari_germquant._recipe_widget:RecipeProjectTab")``. RecipeProjectTab follows the dock's tab
 protocol (``project_changed(state)``, ``running_changed(running)``), asks the dock to read the project again
-after each recipe write (a post-stage write changes nothing the dock shows), and leaves the role preview and the
-post-stage listing until it is shown. The tab also works alone (``set_project``, ``set_running``,
-``set_reference_image``).
+after each write (a post-stage write too: the engine's project status reads the project's post-stage list, so a
+series every run refuses for post-stages reads so there), and leaves the role preview and the post-stage listing
+until it is shown. The tab also works alone (``set_project``, ``set_running``, ``set_reference_image``).
 """
 from __future__ import annotations
 
@@ -1787,13 +1787,16 @@ class RecipeProjectTab(RecipeTab):
     viewer and engine session; after each write it asks the dock to read the project again (``dock.reload``), so
     the header and the status board follow the new config_hash. While the tab is hidden (another tab of the dock
     is shown) it follows the dock's readings, but the role preview, a dry run that reads every image's header,
-    and the post-stage listing wait until it is shown. A post-stage write does not ask the dock to read the project
-    again: nothing the dock shows changes with post_stages.yaml."""
+    and the post-stage listing wait until it is shown. A post-stage write asks the dock to read the project again
+    too: the engine's project status reads the project's post-stage list (a series every run refuses for
+    post-stages reads so), though config_hash and the manifest stay as they are. Shown again after the recipe's
+    own interpreter was stored or cleared, the tab lists the post-stages of the environment the recipe now runs in."""
 
     def __init__(self, dock) -> None:
         super().__init__(getattr(dock, "viewer", None), dock, session=getattr(dock, "session", None))
         self.dock = dock
         self.applied.connect(self._reload_dock)
+        self.post_written.connect(self._reload_dock)
 
     def _previews_now(self) -> bool:
         return self.isVisible()
