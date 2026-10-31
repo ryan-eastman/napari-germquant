@@ -37,6 +37,8 @@ The manifest's `display_name: germquant` is what the napari menus show; it can s
 | `src/napari_germquant/_settings.py`, `tests/conftest.py` | the environment variable `NAPARI_GERMQUANT_SETTINGS` (a private settings file) |
 | `tests/*.py` | `from napari_germquant import ...` |
 | `tests/conftest.py`, `tests/test_reader.py` | the opt-in environment variable `NAPARI_GERMQUANT_NAS_TEST` |
+| `tests/conftest.py` | the environment variable `NAPARI_GERMQUANT_REQUIRE_FEATURES` (`REQUIRE_FEATURES_ENV`): the engine features whose gated tests fail instead of skipping |
+| `tests/_p6_runner.py` | the environment variable `NAPARI_GERMQUANT_SEAMS` (`SEAMS_ENV`): the engine seams (JSON, `module.attr` to `module:attr`) the tests' wrapper interpreter replaces before it runs an engine command |
 
 ## Renaming
 
