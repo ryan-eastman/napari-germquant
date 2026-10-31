@@ -275,6 +275,48 @@ def test_a_sheet_keyed_by_file_is_read_as_runs_read_it_and_keeps_its_key(tmp_pat
         P.SampleTable.from_project(root, read_manifest(root))
 
 
+def test_a_sheet_keyed_by_file_read_from_another_folder_keeps_its_files_when_saved(tmp_path, monkeypatch):
+    """reviews/P6_package_fixes_delta.md S1. Save writes the sheet as <root>/samples.csv. A file cell whose folder
+    part is relative names its file from the sheet's own folder (here meta/, the file the manifest names), so a
+    sheet read from there is written with that part from the root: every row still names its file, and a run
+    still gives each image its row. A file name alone and an absolute path are written as they were. The part
+    stays relative (from the root), a file on another drive than the root's is written as its absolute path, and
+    a sheet read from the root is written with every cell as read."""
+    need_features("sample_sheet")
+    engine = P.sheet_module()
+    imgs, root = tmp_path / "imgs", tmp_path / "study"
+    write_manifest(root, samples="meta/lab.csv", images=[
+        image_entry(imgs / "x.ome.tif", "x"), image_entry(imgs / "y.ome.tif", "y"), image_entry(imgs / "z.nd2", "z")])
+    (root / "meta").mkdir()
+    (root / "meta" / "lab.csv").write_bytes(b"file,genotype\r\n..\\..\\imgs\\x.ome.tif,CB4856\r\n"
+                                            + f"{imgs / 'y.ome.tif'},N2\r\nz.nd2,JK574\r\n".encode("ascii"))
+    t = P.SampleTable.from_project(root, read_manifest(root))
+    assert t.warnings == [] and {i: t.row(i)["genotype"] for i in t.ids} == {"x": "CB4856", "y": "N2", "z": "JK574"}
+    recs = t.records()
+    assert [r["file"] for r in recs][1:] == [str(imgs / "y.ome.tif"), "z.nd2"]
+    engine.write_sample_sheet(root / P.SAMPLES_NAME, recs)                 # what the dock's Save writes
+    again = engine.read_sample_sheet(root / P.SAMPLES_NAME)
+    for iid, name in (("x", "x.ome.tif"), ("y", "y.ome.tif"), ("z", "z.nd2")):
+        assert again.row(iid, imgs / name).fields == {"genotype": t.row(iid)["genotype"]}, iid
+    # the folder part stays relative, now from the root, so the project folder can still move with its images
+    assert recs[0]["file"] == os.path.join("..", "imgs", "x.ome.tif")
+
+    def another_drive(path, start=None):
+        raise ValueError("path is on mount 'D:', start on mount 'C:'")
+
+    with monkeypatch.context() as m:                     # another drive than the root's: os.path.relpath refuses
+        m.setattr(P.os.path, "relpath", another_drive)
+        assert t.records()[0]["file"] == str(imgs / "x.ome.tif")
+    # a sheet read from the root (the manifest names samples.csv, as after a Save) is written with its cells as
+    # read, a slash or a backslash between folders alike: nothing is rewritten from the root
+    (root / P.SAMPLES_NAME).write_bytes(b"file,genotype\r\n../imgs/x.ome.tif,CB4856\r\n..\\imgs\\y.ome.tif,N2\r\n"
+                                        b"z.nd2,JK574\r\n")
+    write_manifest(root, images=read_manifest(root)["images"], samples=P.SAMPLES_NAME)
+    t2 = P.SampleTable.from_project(root, read_manifest(root))
+    assert t2.warnings == [] and [r["file"] for r in t2.records()] == ["../imgs/x.ome.tif", "..\\imgs\\y.ome.tif",
+                                                                       "z.nd2"]
+
+
 def test_a_run_in_progress_is_known_to_every_dock(tmp_path):
     root = tmp_path / "study"
     assert not P.run_in_progress(root) and P.running_run_id(root) is None
