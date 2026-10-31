@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -213,10 +214,65 @@ def test_the_sample_table_prefills_from_file_names_and_keeps_extra_columns(tmp_p
     assert t2.not_in_sheet() == [worm] and not t2.dirty and t2.changed_ids() == [worm]
     t2.set(field, "lane", "4")
     assert t2.changed_ids() == [worm, field]
-    # a cp1252 sheet (Excel's plain CSV) reads too, with the warning the engine gives
+    # a cp1252 sheet (Excel's plain CSV) reads too, with the warning the engine gives, said once (in the tab's
+    # notes): the engine's reader does not issue it again as a Python warning, which napari would show as well
     (root / "samples.csv").write_bytes("image_id,genotype\r\nfield_07,caf\xe9\r\n".encode("cp1252"))
-    t3 = P.SampleTable.from_project(root, read_manifest(root), regex=WORM_REGEX, defaults=WORM_DEFAULTS)
+    with warnings.catch_warnings(record=True) as issued:
+        warnings.simplefilter("always")
+        t3 = P.SampleTable.from_project(root, read_manifest(root), regex=WORM_REGEX, defaults=WORM_DEFAULTS)
     assert t3.row(field)["genotype"] == "caf" + chr(0xE9) and "cp1252" in " ".join(t3.warnings)
+    assert not [w for w in issued if "cp1252" in str(w.message)]
+
+
+def test_a_sheet_keyed_by_file_is_read_as_runs_read_it_and_keeps_its_key(tmp_path, monkeypatch):
+    """reviews/P6_package.md N2. With the engine's sample sheet (P5-SHEET) the table is read_sample_sheet's: a
+    backslash in a file key is a folder separator on every system (PLAN 9.4 #13), and a row keyed by a path names
+    that one file, as SampleSheet.row(image_id, path) gives a run its row. A sheet keyed by file keeps its key and
+    its cells in what Save writes (write_sample_sheet keys a sheet by image_id whenever it has that column). With
+    a germquant before it (the CI pin) the dock's own reading stays."""
+    root = tmp_path / "study"
+    elsewhere = tmp_path / "elsewhere"
+    write_manifest(root, samples="samples.csv", images=[
+        image_entry("sub/x.ome.tif", "x"), image_entry(tmp_path / "y.nd2", "y"), image_entry(elsewhere / "z.nd2", "z"),
+        image_entry(tmp_path / "w.nd2", "w")])
+    # keyed by file as Excel writes it on Windows (CRLF, a backslash between folders); w has no row, and z's names
+    # the file other/z.nd2 of the sheet's folder, not the project's image z
+    (root / "samples.csv").write_bytes(b"file,genotype,lane\r\nsub\\x.ome.tif,CB4856,3\r\ny.nd2,N2,4\r\n"
+                                       b"other\\z.nd2,JK574,5\r\n")
+    with monkeypatch.context() as m:
+        m.setattr(P, "sheet_module", lambda: None)            # the CI pin's germquant: no sample sheet
+        old = P.SampleTable.from_project(root, read_manifest(root))
+        assert old.columns == [*P.DESIGN_COLUMNS, "file", "lane"]
+        assert old.row("y")["genotype"] == "N2" and old.row("w")["genotype"] == ""
+    need_features("sample_sheet")
+    engine = P.sheet_module()
+    t = P.SampleTable.from_project(root, read_manifest(root))
+    assert t.row("x")["genotype"] == "CB4856" and t.row("x")["file"] == "sub\\x.ome.tif" and t.row("x")["lane"] == "3"
+    assert t.row("y")["genotype"] == "N2" and t.not_in_sheet() == ["w"]
+    # what Save gives the engine's writer: the sheet's key first and no image_id column (it would become the key)
+    recs = t.records()
+    assert [list(r)[:2] for r in recs] == [["file", "genotype"]] * 4 and all("image_id" not in r for r in recs)
+    assert [r["file"] for r in recs] == ["sub\\x.ome.tif", "y.nd2", "other\\z.nd2", "w.nd2"]   # w: its file name
+    assert t.key == "file" and t.columns[:2] == ["image_id", "file"] and t.columns[-1] == "lane"
+    # z's row is shown as written, and named as one a run does not give z (it names another file)
+    (note,) = [n for n in t.warnings if "other\\z.nd2" in n]
+    assert str(elsewhere / "z.nd2") in note and "no row" in note
+    assert not [n for n in t.warnings if "x.ome.tif" in n or "y.nd2" in n]
+    # the key column names the image's file: the table never edits it
+    with pytest.raises(ValueError, match="file"):
+        t.set("x", "file", "x.ome.tif")
+    t.set("y", "genotype", "CB4856")
+    engine.write_sample_sheet(root / "samples.csv", t.records())
+    again = engine.read_sample_sheet(root / "samples.csv")
+    assert again.key == "file" and again.image_ids == ["x", "y", "z", "w"] and again.extra_columns == ["lane"]
+    assert again.row("x", root / "sub" / "x.ome.tif").row_sha256 is not None      # still the row of that one file
+    assert again.row("y").fields == {"genotype": "CB4856"}
+    t2 = P.SampleTable.from_project(root, read_manifest(root))
+    assert t2.key == "file" and t2.records() == t.records() and t2.not_in_sheet() == [] and t2.changed_ids() == []
+    # a sheet the engine refuses (two rows name y) is refused here too, so nothing is read, or written, over it
+    (root / "samples.csv").write_bytes(b"file,genotype\r\ny.nd2,N2\r\nsub\\y.nd2,CB4856\r\n")
+    with pytest.raises(engine.SampleSheetError, match="twice"):
+        P.SampleTable.from_project(root, read_manifest(root))
 
 
 def test_a_run_in_progress_is_known_to_every_dock(tmp_path):

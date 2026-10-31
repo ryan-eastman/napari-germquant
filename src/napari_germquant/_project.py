@@ -26,8 +26,10 @@ project file.
   ``--no-<stage>``, and ``--unset`` of a stage key the project had turned off).
 * ``SampleTable`` is the Samples tab: one row per image, the design columns of design 7.4 plus any extra column,
   read from the project's sheet or prefilled from the file name with the recipe's metadata.filename_regex
-  (germquant's parse_sample, only where the rule matches). The sheet itself is written by the engine's own writer,
-  germquant.io.sample_sheet.write_sample_sheet (ASCII, LF, atomic), and recorded with ``project edit --samples``.
+  (germquant's parse_sample, only where the rule matches). The sheet is read as runs read it, by the engine's
+  read_sample_sheet, when napari's germquant has it (with a germquant before it, by the dock's own ``read_sheet``),
+  and written by the engine's own writer, germquant.io.sample_sheet.write_sample_sheet (ASCII, LF, atomic), keyed
+  as it was (image_id, or file), then recorded with ``project edit --samples``.
 * ``mark_running`` and ``run_in_progress`` tell every dock (Training's Use in project, Spot tuning's Apply, the
   Recipe tab) that a run of a project is in progress, so no recipe edit starts under it.
 """
@@ -44,7 +46,8 @@ import math
 import os
 import re
 import threading
-from pathlib import Path, PurePosixPath
+import warnings
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import yaml
 
@@ -57,6 +60,8 @@ SAMPLES_NAME = "samples.csv"
 SERIES_RECORD_SUFFIX = "__series.json"
 # the design columns of a sample sheet (design 7.4), in the order the tab shows them
 DESIGN_COLUMNS = ("image_id", "genotype", "sex", "germ_cell", "treatment", "replicate", "acquisition_date")
+# the columns a sample sheet keys its rows by (germquant.io.sample_sheet.KEY_COLUMNS): image_id, else file
+KEY_COLUMNS = ("image_id", "file")
 # an extra column's name: what a CSV header and a batch table column can both carry
 COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # the stale reasons of the status record (PLAN 9.3 reason_code), in words, for a row without the engine's own
@@ -636,7 +641,8 @@ def recipe_config(root, manifest: dict):
 
 def read_sheet(path) -> tuple[list[str], list[dict], list[str]]:
     """``(columns, rows, warnings)`` of a sample sheet CSV, read as the engine reads it: UTF-8 with or without a
-    byte-order mark, else cp1252 with a warning (Excel's plain CSV); cells stripped."""
+    byte-order mark, else cp1252 with a warning (Excel's plain CSV); cells stripped. The dock's own reading, for a
+    germquant before the engine's sample sheet (``sheet_reader``)."""
     warnings = []
     with open(_long(path), "rb") as fh:
         data = fh.read()
@@ -677,15 +683,19 @@ def _prefill(image_id: str, path, regex: str | None, defaults: dict | None) -> d
 
 class SampleTable:
     """The Samples tab's table (module docstring). ``ids`` follow the manifest's images; ``columns`` are the
-    design columns, then any extra column (from the sheet, or added). ``saved`` holds the sheet's rows as read
-    ({image_id: row}) or None when the project has no sheet; ``dirty`` is set by the user's edits since then;
+    design columns, then any extra column (from the sheet, or added); ``key`` is the column the sheet keys its rows
+    by, image_id or file (a sheet keyed by file shows its file column second). ``saved`` holds the sheet's rows as
+    read ({image_id: row}) or None when the project has no sheet; ``dirty`` is set by the user's edits since then;
     ``changed_ids`` names the images whose row differs from the saved sheet (a new row included): saving
     restales exactly those."""
 
     def __init__(self, ids: list[str], columns: list[str], rows: dict[str, dict], saved: dict | None,
-                 warnings: list[str] | None = None) -> None:
+                 warnings: list[str] | None = None, *, key: str = "image_id") -> None:
+        if key not in KEY_COLUMNS:
+            raise ValueError(f"a sample sheet is keyed by image_id or file, not {key!r}")
         self.ids = list(ids)
         self.columns = list(columns)
+        self.key = key
         self._rows = {i: dict(rows[i]) for i in self.ids}
         self.saved = None if saved is None else {i: dict(r) for i, r in saved.items()}
         self.warnings = list(warnings or [])
@@ -694,25 +704,41 @@ class SampleTable:
     @classmethod
     def from_project(cls, root, manifest: dict, *, regex: str | None = None, defaults: dict | None = None) -> SampleTable:
         """The table of a project: its sheet (the file the manifest's ``samples`` names, else samples.csv when it
-        is there) for the images it holds, the file-name prefill for the others."""
+        is there) for the images it holds, the file-name prefill for the others.
+
+        With the engine's sample sheet in napari's germquant (``sheet_reader``) the sheet is read as runs read it,
+        by read_sample_sheet: its image ids (a backslash in a file key is a folder separator on every system, PLAN
+        9.4 #13), its rows, its warnings, and its key, which Save keeps (``records``); a row that names another
+        file than the project's image of its id is named in the warnings. A sheet the engine refuses raises its
+        SampleSheetError, so the Samples tab names it and nothing is written over the file. With a germquant
+        before it the dock reads the sheet itself (``read_sheet``)."""
         root = Path(root)
         entries = [e for e in manifest.get("images") or [] if isinstance(e, dict)]
         ids = [str(e.get("id")) for e in entries]
         name = manifest.get("samples") or SAMPLES_NAME
-        columns, saved, warnings = list(DESIGN_COLUMNS), None, []
+        columns, saved, warnings, key = list(DESIGN_COLUMNS), None, [], "image_id"
         sheet = root / str(name)
         if os.path.isfile(_long(sheet)):
-            cols, rows, warnings = read_sheet(sheet)
+            reader = sheet_reader()
+            if reader is not None:
+                parsed = read_engine_sheet(reader, sheet)
+                key, cols, warnings = parsed.key, list(parsed.columns), list(parsed.warnings)
+                saved = {str(i): {**r, "image_id": str(i)} for i, r in zip(parsed.image_ids, parsed.rows)}
+                warnings += rows_of_other_files(parsed, root, entries)
+            else:
+                cols, rows, warnings = read_sheet(sheet)
+                from germquant import api
+
+                saved = {}
+                for r in rows:
+                    iid = r.get("image_id") or (api.image_stem(Path(r["file"])) if r.get("file") else "")
+                    if iid:
+                        saved[str(iid)] = {**r, "image_id": str(iid)}
             if not manifest.get("samples"):
                 warnings.append(f"{name} is in the project folder but the manifest does not name it, so runs do not use "
                                 f"it: Save records it")
-            from germquant import api
-
-            saved = {}
-            for r in rows:
-                iid = r.get("image_id") or (api.image_stem(Path(r["file"])) if r.get("file") else "")
-                if iid:
-                    saved[str(iid)] = {**r, "image_id": str(iid)}
+            if key == "file":
+                columns.insert(1, "file")
             columns += [c for c in cols if c not in columns]
         rows = {}
         for e, iid in zip(entries, ids):
@@ -720,15 +746,22 @@ class SampleTable:
                 rows[iid] = {c: saved[iid].get(c, "") for c in columns}
             else:
                 pre = _prefill(iid, resolve_image(root, e.get("path", "")), regex, defaults)
+                if key == "file":                        # a new row names its image by the file's name
+                    pre["file"] = PureWindowsPath(str(e.get("path", ""))).name
                 rows[iid] = {c: pre.get(c, "") for c in columns}
-        return cls(ids, columns, rows, saved, warnings)
+        return cls(ids, columns, rows, saved, warnings, key=key)
 
     def row(self, image_id: str) -> dict:
         return dict(self._rows[image_id])
 
     def records(self) -> list[dict]:
-        """Every row, in the manifest's order, with every column: what write_sample_sheet is given."""
-        return [{c: self._rows[i].get(c, "") for c in self.columns} for i in self.ids]
+        """Every row, in the manifest's order, with every column: what write_sample_sheet is given. A sheet keyed by
+        file keeps its key: file comes first and image_id is left out (write_sample_sheet keys a sheet by image_id
+        whenever it has that column), each file cell as the sheet had it, so a path there still names that file."""
+        cols = self.columns
+        if self.key == "file":
+            cols = ["file", *(c for c in self.columns if c not in KEY_COLUMNS)]
+        return [{c: self._rows[i].get(c, "") for c in cols} for i in self.ids]
 
     def not_in_sheet(self) -> list[str]:
         return [i for i in self.ids if self.saved is None or i not in self.saved]
@@ -742,14 +775,18 @@ class SampleTable:
         return out
 
     def set(self, image_id: str, column: str, value) -> None:
-        """Set one cell (stripped). The image_id column names the image and is not edited; the sheet is written as
-        ASCII, so a non-ASCII value is refused here, naming its cell."""
+        """Set one cell (stripped). The image_id column names the image and is not edited, nor is the file column
+        of a sheet keyed by file; the sheet is written as ASCII, so a non-ASCII value is refused here, naming its
+        cell."""
         if image_id not in self._rows:
             raise KeyError(f"no image {image_id!r} in the project")
         if column not in self.columns:
             raise KeyError(f"no column {column!r} (add it first)")
         if column == "image_id":
             raise ValueError("the image_id column names the image and cannot be edited")
+        if column == self.key:
+            raise ValueError(f"the {column} column is this sheet's key, which names the image's file, and cannot be "
+                             f"edited here: to name another file, edit the sheet itself")
         text = "" if value is None else str(value).strip()
         if not text.isascii():
             raise ValueError(f"{image_id}, column {column}: the sample sheet is written as ASCII, and {text!r} is not "
@@ -783,6 +820,43 @@ def sheet_module():
     except ImportError:
         return None
     return sample_sheet if hasattr(sample_sheet, "write_sample_sheet") else None
+
+
+def sheet_reader():
+    """The ``sheet_module`` that also reads sheets as runs read them (read_sample_sheet), or None: napari's
+    germquant then predates the engine's sample sheet, and the dock reads the sheet itself (``read_sheet``)."""
+    module = sheet_module()
+    return module if module is not None and callable(getattr(module, "read_sample_sheet", None)) else None
+
+
+def read_engine_sheet(reader, path):
+    """``reader.read_sample_sheet(path)``, the engine's SampleSheet (``reader``: germquant.io.sample_sheet), with its
+    warnings kept in ``.warnings`` only: the SampleSheetWarning each is also issued as is held back while it reads,
+    as run_project holds them back, so the tab says each once (warnings.catch_warnings: a filter of the whole
+    process for that moment). Raises what read_sample_sheet raises: SampleSheetError for a sheet it refuses,
+    OSError for a file it cannot open."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", getattr(reader, "SampleSheetWarning", UserWarning))
+        return reader.read_sample_sheet(path)
+
+
+def rows_of_other_files(sheet, root, entries) -> list[str]:
+    """The warnings for the rows of ``sheet`` (an engine SampleSheet) that a run does not give the project's image
+    of their id: a row keyed by a path (a file cell with a folder part, relative to the sheet's folder) names that
+    one file, and a run asks SampleSheet.row(image_id, path) with the path it reads."""
+    held = dict(zip(sheet.image_ids, sheet.rows))
+    out = []
+    for e in entries:
+        iid = str(e.get("id"))
+        if iid not in held:
+            continue
+        path = resolve_image(root, e.get("path", ""))
+        if sheet.row(iid, path).row_sha256 is None:
+            out.append(f"{iid}: the sheet's row names the file {held[iid].get(sheet.key, '')}, not this project's image "
+                       f"{path}, so a run gives {iid} no row (its design columns then come from the file name); a "
+                       f"folder in a file cell is relative to the sheet's folder, and a file name alone names the "
+                       f"image by its id")
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------

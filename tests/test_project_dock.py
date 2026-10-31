@@ -520,6 +520,44 @@ def test_the_samples_tab_prefills_edits_and_saves_through_the_engines_writer(qtb
     assert not w.unsaved
 
 
+def test_a_sheet_keyed_by_file_keeps_its_key_when_the_dock_saves_it(qtbot, tmp_path):
+    """reviews/P6_package.md N2 through the dock, with the engine's own reader and writer: the Samples tab shows a
+    sheet keyed by file (written on Windows: a backslash between folders) as runs read it, its key column is never
+    edited, and Save writes it keyed by file with its cells as they were, then records it (`project edit
+    --samples`, D39). A sheet the engine refuses is named in the tab and never written over."""
+    need_features("sample_sheet")
+    w, fake = _dock(qtbot)
+    root = tmp_path / "study"
+    write_manifest(root, images=[image_entry("sub/x.ome.tif", "x"), image_entry(tmp_path / "y.nd2", "y")],
+                   run={"device": "auto", "runner": "subprocess", "interpreters": {"basic": {"python": sys.executable}}})
+    (root / "samples.csv").write_bytes(b"file,genotype,lane\r\nsub\\x.ome.tif,CB4856,3\r\ny.nd2,N2,4\r\n")
+    w.open_project(root)
+    settle(w, qtbot)
+    assert w.state.sheet_problem is None and w.samples.row("x")["genotype"] == "CB4856"
+    w.set_sample("y", "genotype", "JK574")
+    assert w.save()
+    settle(w, qtbot)
+    assert w.last_error is None, w.last_error
+    assert (root / "samples.csv").read_bytes() == (b"file,genotype,sex,germ_cell,treatment,replicate,acquisition_date,"
+                                                   b"lane\nsub\\x.ome.tif,CB4856,,,,,,3\ny.nd2,JK574,,,,,,4\n")
+    assert fake.called("project_edit")[-1]["samples"] == "samples.csv" and read_manifest(root)["samples"] == "samples.csv"
+    assert _cells(w.samples_table, 1) == ["sub\\x.ome.tif", "y.nd2"] and not w.samples.dirty
+    with pytest.raises(ValueError, match="file"):
+        w.set_sample("x", "file", "x.ome.tif")
+    w.samples_table.item(0, 1).setText("x.ome.tif")            # typed into the table: the cell goes back
+    assert _cells(w.samples_table, 1)[0] == "sub\\x.ome.tif" and "sheet's key" in w.status_label.text()
+    assert not w.samples.dirty
+    # a sheet the engine refuses (two rows name y): the tab says why, and Save never writes over it
+    bad = b"file,genotype\r\ny.nd2,N2\r\nsub\\y.nd2,CB4856\r\n"
+    (root / "samples.csv").write_bytes(bad)
+    w.reload()
+    settle(w, qtbot)
+    assert w.samples is None and "twice" in w.samples_note.text() and not w.save_sheet_btn.isEnabled()
+    w.save(sheet=True)
+    settle(w, qtbot)
+    assert (root / "samples.csv").read_bytes() == bad
+
+
 def test_device_and_interpreter_records_that_differ_from_this_computer_are_shown(qtbot, tmp_path):
     w, fake = _dock(qtbot)
     root = _make_project(tmp_path, run={"device": "cuda", "runner": "inprocess",
@@ -927,6 +965,7 @@ def test_codeless_project_from_the_test_pack(make_napari_viewer, qtbot, served_m
     settle(w, qtbot)
     assert tab.last_error is None, tab.status_label.text()
     assert w.status["config_hash"] == tab.config_hash
+    assert tab.view.tunable(served_model_pack.tunable).value == pytest.approx(0.4)   # recipe.yaml's, read again
     assert w.last_error is None, w.last_error
     assert w.status["config_hash"] != before and w.badge_label.text() == "validated: false (edited)"
     assert _board(w) == [(image_id, "stale")] and w.rows[0].reason_code == "config_hash"
