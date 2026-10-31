@@ -671,6 +671,7 @@ def test_the_post_stages_are_listed_switched_and_written_through_the_engine(qtbo
     assert len(fake.calls) == n                         # no project edit, no dry run: the file is not hashed
     assert tab.config_hash == PACK_HASH and tab.post_switch(RING) and tab.post_value(RING, "radius_um") == 0.8
     assert not tab.post_changed and not tab.apply_post_btn.isEnabled()
+    assert tab.post_rows[RING].params["radius_um"].note_label.text() == ""          # applied: no change left
     assert tab.status_label.text() == f"wrote {path}: ring_intensity (radius_um 0.8); {UNCHANGED}"
     assert tab.post_label.text().startswith("In force: the project's post_stages.yaml: ring_intensity (radius_um "
                                             "0.8)")
@@ -756,6 +757,35 @@ def test_a_list_in_force_the_engine_cannot_run_is_named(qtbot, tmp_path):
     tab2.set_post_param(RING, "radius_um", 0.6)
     assert tab2.post_hash_label.text() == (f"with these post-stages: {UNCHANGED}. The project's own post_stages.yaml "
                                            f"then replaces the pack's post_stages/basic.yaml.")
+
+
+def test_the_post_stages_are_those_of_the_environment_that_runs_the_recipe(qtbot, tmp_path):
+    """Post-stages are installed where the project runs (D39; design R6: .venv_packs or a lab's own environment):
+    the listing and the write go to the runner of the recipe's own interpreter when this computer stores one
+    (session.runner_for, which the Project dock's runs take), while the role and form previews stay the engine's."""
+    def answer(kw):
+        return preview_record(BINDS, config_hash=PACK_HASH, changed=False)
+
+    engine, recipe_env = FakePostRunner(answer, rows=[]), FakePostRunner(answer)
+    asked = []
+    session = FakeSession(engine)
+
+    def runner_for(pack_id=None, recipe_id=None, should_stop=None):
+        asked.append((pack_id, recipe_id))
+        return recipe_env
+
+    session.runner_for = runner_for
+    pin = {"pack": {"id": "test_pack", "version": "0.1.0", "recipe": "basic"}}
+    tab = _tab(qtbot, tmp_path, session=session,
+               reader=lambda root, reference=None: fake_view(root, manifest=pin, post=post_list(root)))
+    assert asked == [("test_pack", "basic")] and tab.post_stage_names() == [FIXTURE, RING]
+    assert engine.post_calls == [] and recipe_env.post_calls == ["list"]
+    tab.set_post_stage(RING, True)
+    assert tab.apply_post_stages()
+    _settle(tab, qtbot)
+    assert _writes(recipe_env) == [[{"name": RING, "params": {}}]] and engine.post_calls == []
+    assert asked == [("test_pack", "basic")] * 2
+    assert len(engine.calls) == 1 and recipe_env.calls == []            # the role preview: the engine's
 
 
 def test_without_post_stages_the_section_says_why_and_the_rest_works(qtbot, tmp_path):
