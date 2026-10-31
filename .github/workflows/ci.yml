@@ -58,12 +58,17 @@ env:
   CUDA_VISIBLE_DEVICES: "-1"
   ENGINE_REPOSITORY: ryan-eastman/C_elegans_germline_masking_and_spot_counting
   # train B of tranche 5, open: the pushed head of the engine's integration branch feat/t5-train-b, as a full sha,
-  # moved after every engine merge (Train B plan, section 5.4). Now 78af711: merge #3 (P5: projects, batch formats,
-  # the sample sheet, the training and tuning engine), whose version document lists nine features. Before it,
-  # 82099b8 (merge #2 and the engine CI's move of its macOS job to macos-15, decision D54), fb6cf1a (merge #2, P2c,
-  # labels from files), 361b082 (merge #1, P2b, single-plane images) and main's pin b90ebdf ("Merge pull request
-  # #12", tranche-5 train A, merged).
-  ENGINE_COMMIT: 78af711e6c16fc9a53ee46f413182f879d890b88
+  # moved after every engine merge (Train B plan, section 5.4). Now 3770fb2: merge #4 (P5b, the post-stage
+  # contract), the merge of engine main f00cb36 and the docs and D55 commits, whose version document lists all ten
+  # features. Before it, 78af711 (merge #3, P5: projects, batch formats, the sample sheet, the training and tuning
+  # engine), 82099b8 (merge #2 and the engine CI's move of its macOS job to macos-15, decision D54), fb6cf1a
+  # (merge #2, P2c, labels from files), 361b082 (merge #1, P2b, single-plane images) and main's pin b90ebdf
+  # ("Merge pull request #12", tranche-5 train A, merged).
+  ENGINE_COMMIT: 3770fb2f54a93e48ca13ac63380ebe45a19440b7
+  # the ten engine features of the Train B plan (section 9.3), required from the final engine head on and after the
+  # engine pull request merges (section 5.4, items 2 and 3): a test gated on one of them fails instead of skipping
+  # when the engine lacks it (tests/conftest.py, need_features); with all ten present it changes nothing
+  NAPARI_GERMQUANT_REQUIRE_FEATURES: "packs,planar,labels_from,projects,sample_sheet,import_labels,train_curve,pack_derive,tune_spots,post_stages"
 
 jobs:
   test:
