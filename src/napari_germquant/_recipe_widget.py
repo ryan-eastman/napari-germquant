@@ -1,5 +1,6 @@
-"""The Recipe tab of the Project dock: the role editor and the parameter form (docs/DESIGN_system_packs.md,
-sections 7.3 and 8.5; P6 acceptance 4 and 5; tranche 5 Train B plan, decision D39).
+"""The Recipe tab of the Project dock: the role editor, the parameter form and the post-stages
+(docs/DESIGN_system_packs.md, sections 5.6, 7.3 and 8.5; P6 acceptance 4, 5 and 10; tranche 5 Train B plan,
+decision D39).
 
 The role editor offers one combo per role of the pack recipe's channel map, listing the channels of a reference
 image (the project's first image, or the one chosen in the tab's own list or by ``set_reference_image``) after
@@ -19,6 +20,15 @@ only. Apply sends the changed values (``--set``) and the reset keys (``--unset``
 validates them by origin; every Apply shows the new config_hash, and with every edit reset the project hashes as
 the pack recipe again. Back to the pack recipe is ``project edit --revert``.
 
+The post-stages: the post-stages installed in the environment that runs the project (the recipe's own interpreter,
+else the engine), listed through its runner (``python -m germquant.post_stages list --json``), each with a switch
+and its declared parameters as typed widgets (as the tunables are; a switched-off post-stage's parameters wait).
+The section names the list a run uses now (the project's post_stages.yaml, else the one its pack ships for the
+recipe, else none) and what in it a run would refuse. Apply post-stages writes the project's post_stages.yaml
+through that runner (``python -m germquant.post_stages write``, which validates the entries there): each post-stage
+switched on, with its parameters off their defaults. post_stages.yaml is not part of config_hash, so the hash,
+validated and the recipe files stay as they are, and the tab says so.
+
 Where it runs: the tab reads the project in this napari environment (``_params.read_view``) and sends every
 dry run and write to the engine runner of the viewer's engine session (``_engine_session``), in a thread worker,
 one call at a time, the newest request of each kind first; the GUI thread never waits. The tab takes no edit
@@ -28,8 +38,9 @@ and while one of its writes is queued or running (the write's answer replaces th
 The host: the Project dock (unit P6-PROJECT) shows the tab through one line of its EXTRA_TABS,
 ``("Recipe", "napari_germquant._recipe_widget:RecipeProjectTab")``. RecipeProjectTab follows the dock's tab
 protocol (``project_changed(state)``, ``running_changed(running)``), asks the dock to read the project again
-after each write, and leaves the role preview until it is shown. The tab also works alone (``set_project``,
-``set_running``, ``set_reference_image``).
+after each recipe write (a post-stage write changes nothing the dock shows), and leaves the role preview and the
+post-stage listing until it is shown. The tab also works alone (``set_project``, ``set_running``,
+``set_reference_image``).
 """
 from __future__ import annotations
 
@@ -82,6 +93,10 @@ RUNNING_TEXT = "a run of this project is in progress: recipe edits wait until it
 WRITING_TEXT = "a write is in progress: the next edit waits until it is done"
 # the engine's dry run says changed: false (a channel the pack map's role already names, alone, is no edit)
 NO_ROLE_CHANGE_TEXT = "no role change: the pack map already names these channels, so the project's map stays as it is"
+NO_POST_RUNNER_TEXT = "this engine runner cannot list post-stages"
+POST_DUE_TEXT = "The post-stages of the engine environment are listed when this tab is shown."
+POST_LISTING_TEXT = "Listing the post-stages of the engine environment ..."
+NO_POSTS_TEXT = "The engine environment offers no post-stages (a post-stage is an installed package: docs/POST_STAGES.md)."
 INT_LIMIT = 2 ** 31 - 1
 FLOAT_LIMIT = 1.0e12
 
@@ -152,12 +167,24 @@ class FormRow:
     shown: object = None
 
 
+@dataclasses.dataclass
+class PostRow:
+    """The widgets of one post-stage the engine environment offers: its switch, its title, and one FormRow per
+    declared parameter (``pack_label`` says the declared default, ``reset_btn`` goes back to it)."""
+
+    stage: _params.PostStage
+    switch: QCheckBox
+    title_label: QLabel
+    params: dict
+
+
 class RecipeTab(QWidget):
     """The Recipe tab (module docstring). ``session``: the engine session (default: the viewer's); ``reader``:
     ``(root, reference=None) -> RecipeView`` (default ``_params.read_view``), replaced by the widget tests."""
 
     applied = Signal(dict)       # the engine's record of a write (config_hash, validated, written, removed, ...)
     loaded = Signal()            # the project was read again (after set_project, a reload or a write)
+    post_written = Signal(dict)  # the engine's record of a post_stages.yaml write ("path" and "entries")
 
     def __init__(self, napari_viewer=None, parent=None, *, session=None, reader=None):
         super().__init__(parent)
@@ -185,6 +212,16 @@ class RecipeTab(QWidget):
         self.engine_error: str | None = None        # no engine to preview and write with: the tab is read only
         self.role_combos: dict[str, QComboBox] = {}
         self.form_rows: dict[str, FormRow] = {}
+        # the post-stages: the engine environment's listing (None: not listed), the root it was made for, why there
+        # is none, the changes not applied ({name: {"on": bool, "values": {key: value}}}, against the list in force)
+        self._posts: list | None = None
+        self._posts_root: Path | None = None
+        self.post_error: str | None = None
+        self._post_pending: dict[str, dict] = {}
+        self._want_posts: dict | None = None
+        self._posts_due = False                     # a listing asked for while the tab could not ask (hidden)
+        self.last_post_record: dict | None = None
+        self.post_rows: dict[str, PostRow] = {}
         self.worker = WorkerRunner(napari_viewer, self)
         self._build()
         changed = getattr(self.session, "changed", None)
@@ -215,18 +252,21 @@ class RecipeTab(QWidget):
         self._want_roles = self._want_form = self._want_reference = None
         self.last_error = self.engine_error = None
         self.last_record = None
+        self._posts, self._posts_root, self.post_error, self._post_pending = None, None, None, {}
+        self._want_posts, self._posts_due, self.last_post_record = None, False, None
         self._rebuild()
         if self._root is None:
             self._status("", None)
             return
         self._status(f"reading the project {self._root} ...", None)
-        self._request_load(keep=False)
+        self._request_load(keep=False, list_posts=True)
 
     def reload(self) -> None:
-        """Read the project again (after a change made elsewhere); unapplied choices and values are dropped."""
+        """Read the project again (after a change made elsewhere), and list the engine environment's post-stages
+        again; unapplied choices and values are dropped."""
         if self._root is not None:
-            self._choices, self._pending = {}, {}
-            self._request_load(keep=False)
+            self._choices, self._pending, self._post_pending = {}, {}, {}
+            self._request_load(keep=False, list_posts=True)
 
     def set_reference_image(self, image_id) -> None:
         """The image whose channels the role combos list."""
@@ -250,7 +290,8 @@ class RecipeTab(QWidget):
     def idle(self) -> bool:
         """No engine call or read is in flight or waiting."""
         return (not self.worker.busy and self._want_load is None and self._want_reference is None
-                and self._want_roles is None and self._want_form is None and not self._writes)
+                and self._want_roles is None and self._want_form is None and self._want_posts is None
+                and not self._writes)
 
     def wait_idle(self, timeout_s: float = 300.0) -> bool:
         """For a script driving the tab: run the Qt event loop until ``idle`` (True) or ``timeout_s`` (False)."""
@@ -305,6 +346,44 @@ class RecipeTab(QWidget):
         when the engine refused them."""
         cur = self._current_form_record()
         return cur.get("config_hash") if isinstance(cur, dict) else None
+
+    def post_stage_names(self) -> list[str]:
+        """The post-stages the engine environment offers, in its order ([] while none is listed)."""
+        return [s.name for s in self._posts or []]
+
+    def post_switch(self, name: str) -> bool:
+        """Whether post-stage ``name`` is switched on in the form (the list in force, or a change not applied)."""
+        pending = self._post_pending.get(name) or {}
+        if "on" in pending:
+            return bool(pending["on"])
+        return bool((self._post_base()[0].get(name) or {}).get("on"))
+
+    def post_value(self, name: str, key: str):
+        """The value the form holds for post-stage ``name``'s parameter ``key`` (MISSING when it is not offered)."""
+        pending = (self._post_pending.get(name) or {}).get("values") or {}
+        if key in pending:
+            return pending[key]
+        return ((self._post_base()[0].get(name) or {}).get("values") or {}).get(key, MISSING)
+
+    def post_entries(self) -> list[dict]:
+        """What Apply post-stages writes (the entries of post_stages.yaml, _params.post_entries)."""
+        if not self._posts:
+            return []
+        on = {s.name: self.post_switch(s.name) for s in self._posts}
+        values = {s.name: {p.key: self.post_value(s.name, p.key) for p in s.params} for s in self._posts}
+        return _params.post_entries(self._posts, on, values)
+
+    @property
+    def post_changed(self) -> bool:
+        """Whether Apply post-stages would change what a run of the project gets (_params.post_list_changed)."""
+        if self._view is None or self._posts is None:
+            return False
+        return _params.post_list_changed(self._posts, self._view.post, self.post_entries())
+
+    @property
+    def post_problems(self) -> list[str]:
+        """What a run would refuse in the list in force, or the form cannot show, each with what Apply writes."""
+        return self._post_base()[1]
 
     # ------------------------------------------------------------------ layout
     def _build(self) -> None:
@@ -388,6 +467,33 @@ class RecipeTab(QWidget):
         pl.addLayout(fb)
         root.addWidget(params)
 
+        posts = QGroupBox("Post-stages (installed in the engine environment; post_stages.yaml is not part of "
+                          "config_hash)")
+        ql = QVBoxLayout(posts)
+        self.post_label = QLabel("")
+        self.post_label.setWordWrap(True)
+        ql.addWidget(self.post_label)
+        self.post_box = QWidget()
+        self.post_grid = QGridLayout(self.post_box)
+        self.post_grid.setContentsMargins(0, 0, 0, 0)
+        ql.addWidget(self.post_box)
+        self.post_problems_label = QLabel("")
+        self.post_problems_label.setWordWrap(True)
+        self.post_problems_label.setStyleSheet(_colour_css(AMBER))
+        ql.addWidget(self.post_problems_label)
+        self.post_hash_label = QLabel("")
+        self.post_hash_label.setWordWrap(True)
+        ql.addWidget(self.post_hash_label)
+        qb = QHBoxLayout()
+        self.apply_post_btn = QPushButton("Apply post-stages")
+        self.apply_post_btn.setToolTip("write the project's post_stages.yaml through the engine environment (python "
+                                       "-m germquant.post_stages write): config_hash and validated stay as they are")
+        self.apply_post_btn.clicked.connect(self.apply_post_stages)
+        qb.addWidget(self.apply_post_btn)
+        qb.addStretch(1)
+        ql.addLayout(qb)
+        root.addWidget(posts)
+
         tail = QHBoxLayout()
         self.revert_all_btn = QPushButton("Back to the pack recipe")
         self.revert_all_btn.setToolTip("drop every recipe edit, role edit and project model (project edit --revert): "
@@ -430,7 +536,8 @@ class RecipeTab(QWidget):
         key = getattr(current, "key", None)
         if key is not None and (self.engine_error is not None or (self._runner_key is not None
                                                                   and key != self._runner_key)):
-            self._request_load(keep=True)     # an engine now, or another one: its previews are asked for again
+            # an engine now, or another one: its previews and its post-stages are asked for again
+            self._request_load(keep=True, list_posts=True)
 
     # ------------------------------------------------------------------ rebuilding from the view
     def _rebuild(self) -> None:
@@ -452,10 +559,12 @@ class RecipeTab(QWidget):
             self._rebuild_reference_combo()
             self._rebuild_roles()
             self._rebuild_form()
+            self._rebuild_posts()
         finally:
             self._syncing = False
         self._show_preview()
         self._show_form_preview()
+        self._show_post_state()
         self._update_enabled()
 
     def _rebuild_reference_combo(self) -> None:
@@ -562,9 +671,14 @@ class RecipeTab(QWidget):
             note = (note + "; " if note else "") + f"now {_params.value_text(t.value)}, outside the declared range"
         return note
 
-    def _make_widget(self, t: _params.Tunable) -> QWidget | None:
+    def _make_widget(self, t: _params.Tunable, on_change=None) -> QWidget | None:
+        """The value widget of a declared parameter (a tunable, or a post-stage's parameter), ``on_change()``
+        called on each change the user makes (default: the form row's)."""
         if not t.editable:
             return None
+        if on_change is None:
+            def on_change(key=t.key):
+                self._on_widget(key)
         if t.type == "float":
             w = QDoubleSpinBox()
             step = _step(t)
@@ -573,18 +687,18 @@ class RecipeTab(QWidget):
             w.setSingleStep(step)
             if t.unit:
                 w.setSuffix(f" {t.unit}")
-            w.valueChanged.connect(lambda _v, key=t.key: self._on_widget(key))
+            w.valueChanged.connect(lambda _v: on_change())
             return w
         if t.type == "int":
             w = QSpinBox()
             w.setRange(int(t.lo) if t.lo is not None else -INT_LIMIT, int(t.hi) if t.hi is not None else INT_LIMIT)
             if t.unit:
                 w.setSuffix(f" {t.unit}")
-            w.valueChanged.connect(lambda _v, key=t.key: self._on_widget(key))
+            w.valueChanged.connect(lambda _v: on_change())
             return w
         if t.type == "bool":
             w = QCheckBox()
-            w.toggled.connect(lambda _v, key=t.key: self._on_widget(key))
+            w.toggled.connect(lambda _v: on_change())
             return w
         if t.type == "choice":
             w = QComboBox()
@@ -592,10 +706,10 @@ class RecipeTab(QWidget):
                 w.addItem(_params.value_text(c), c)
             if t.value is not MISSING and not any(_params._same(t.value, c) for c in t.choices):
                 w.addItem(f"{_params.value_text(t.value)} (not a declared choice)", t.value)
-            w.currentIndexChanged.connect(lambda _i, key=t.key: self._on_widget(key))
+            w.currentIndexChanged.connect(lambda _i: on_change())
             return w
         w = QLineEdit()
-        w.editingFinished.connect(lambda key=t.key: self._on_widget(key))
+        w.editingFinished.connect(lambda: on_change())
         return w
 
     def _restore_widget(self, row: FormRow) -> None:
@@ -708,8 +822,8 @@ class RecipeTab(QWidget):
                                                                                       self._view.saved_roles())
 
     def _previews_now(self) -> bool:
-        """Whether the role preview is asked for now: the engine's dry run reads the header of every image of the
-        project. Always here; RecipeProjectTab waits while it is hidden in the dock."""
+        """Whether the role preview (the engine's dry run reads the header of every image of the project) and the
+        post-stage listing are asked for now. Always here; RecipeProjectTab waits while it is hidden in the dock."""
         return True
 
     def _after_role_change(self) -> None:
@@ -998,6 +1112,235 @@ class RecipeTab(QWidget):
         self._queue_write("revert", {"revert": True}, "going back to the pack recipe")
         return True
 
+    # ------------------------------------------------------------------ the post-stages
+    def _post_base(self) -> tuple[dict, list[str]]:
+        """``(state, problems)`` of the list in force against the engine environment's listing
+        (_params.post_state); empty while no post-stage is listed."""
+        if self._view is None or self._posts is None:
+            return {}, []
+        return _params.post_state(self._posts, self._view.post)
+
+    def _post_stage(self, name: str) -> _params.PostStage:
+        if self._view is None:
+            raise ValueError("no project is shown")
+        if self._posts is None:
+            raise ValueError(f"no post-stage list: {self.post_error or 'the engine environment is not asked yet'}")
+        for s in self._posts:
+            if s.name == name:
+                return s
+        raise ValueError(f"post-stage {name} is not offered by the engine environment (it offers "
+                         f"{', '.join(self.post_stage_names()) or 'none'})")
+
+    def _rebuild_posts(self) -> None:
+        """One switch per post-stage the engine environment offers, its title, and one row per declared parameter
+        (its label, its widget, the declared default, a note, Default), as the list in force and the changes not
+        applied say."""
+        self._clear_grid(self.post_grid)
+        self.post_rows = {}
+        if self._view is None or not self._posts:
+            return
+        r = 0
+        for s in self._posts:
+            switch = QCheckBox(s.label())
+            switch.setToolTip(f"switch {s.name} on for the runs of this project: it writes the table"
+                              f"{'s' if len(s.writes) != 1 else ''} {', '.join(s.writes) or 'none'}")
+            switch.setChecked(self.post_switch(s.name))
+            switch.toggled.connect(lambda _c, name=s.name: self._on_post_switch(name))
+            title = QLabel(s.title)
+            title.setWordWrap(True)
+            self.post_grid.addWidget(switch, r, 0, 1, 2)
+            self.post_grid.addWidget(title, r, 2, 1, 4)
+            r += 1
+            params: dict[str, FormRow] = {}
+            for p in s.params:
+                t = dataclasses.replace(p, value=self.post_value(s.name, p.key))
+                label = QLabel(t.title)
+                label.setToolTip(f"{s.name}: {t.key} ({t.type}" + (f", {t.unit}" if t.unit else "") + ")")
+                widget = self._make_widget(t, lambda name=s.name, key=p.key: self._on_post_widget(name, key))
+                default = QLabel(f"default {_params.value_text(p.pack_value)}")
+                note = QLabel("")
+                reset = QPushButton("Default")
+                reset.setToolTip(f"back to the declared default ({_params.value_text(p.pack_value)})")
+                reset.clicked.connect(lambda _c=False, name=s.name, key=p.key: self.reset_post_param(name, key))
+                row = FormRow(t, label, widget, default, note, reset)
+                self._show_value(row, t.value)
+                row.shown = self._widget_value(row)
+                self.post_grid.addWidget(label, r, 1)                  # below its switch, one column in
+                if widget is not None:
+                    self.post_grid.addWidget(widget, r, 2)
+                self.post_grid.addWidget(default, r, 3)
+                self.post_grid.addWidget(note, r, 4)
+                self.post_grid.addWidget(reset, r, 5)
+                params[p.key] = row
+                r += 1
+            self.post_rows[s.name] = PostRow(s, switch, title, params)
+
+    def _show_post_state(self) -> None:
+        """The section's lines: the list in force and the listing's state; what a run would refuse in the list; the
+        hash line of the changes not applied (post_stages.yaml is not part of config_hash); each row's note."""
+        v = self._view
+        if v is None:
+            for label in (self.post_label, self.post_problems_label, self.post_hash_label):
+                label.setText("")
+            return
+        lines = [f"In force: {v.post.summary()}."]
+        if self.engine_error:
+            lines.append("No post-stage list: there is no engine to ask.")
+        elif self.post_error:
+            lines.append(f"No post-stage list: {self.post_error}")
+        elif self._posts is None:
+            lines.append(POST_DUE_TEXT if self._posts_due else POST_LISTING_TEXT)
+        elif not self._posts:
+            lines.append(NO_POSTS_TEXT)
+        self.post_label.setText("\n".join(lines))
+        self.post_problems_label.setText("\n".join(f"warning: {p}" for p in self.post_problems))
+        for name, prow in self.post_rows.items():
+            pending = (self._post_pending.get(name) or {}).get("values") or {}
+            for key, row in prow.params.items():
+                row.note_label.setText(f"changed: {_params.value_text(pending[key])} at Apply" if key in pending
+                                       else "")
+        if not self.post_changed:
+            self.post_hash_label.setText("")
+            return
+        text = f"with these post-stages: config_hash {v.config_hash} {_params.UNCHANGED_TEXT}"
+        if v.post.origin == "pack":
+            text += f". The project's own {_params.POST_STAGES_NAME} then replaces {v.post.where()}."
+        self.post_hash_label.setText(text)
+
+    def _set_post_pending(self, name: str, *, on=MISSING, key: str | None = None, value=MISSING) -> None:
+        """Record a change of the form against the list in force: the switch (``on``), or one parameter's value; a
+        change back to the list's own is no change."""
+        base = self._post_base()[0].get(name) or {"on": False, "values": {}}
+        entry = self._post_pending.setdefault(name, {})
+        if on is not MISSING:
+            if bool(on) == bool(base["on"]):
+                entry.pop("on", None)
+            else:
+                entry["on"] = bool(on)
+        if key is not None:
+            spec = self._post_stage(name).param(key)
+            values = entry.setdefault("values", {})
+            if _params.post_same(spec, value, base["values"].get(key, spec.pack_value)):
+                values.pop(key, None)
+            else:
+                values[key] = value
+            if not values:
+                entry.pop("values", None)
+        if not entry:
+            self._post_pending.pop(name, None)
+
+    def _sync_post_switch(self, name: str) -> None:
+        prow = self.post_rows.get(name)
+        if prow is None:
+            return
+        was = self._syncing
+        self._syncing = True
+        try:
+            prow.switch.setChecked(self.post_switch(name))
+        finally:
+            self._syncing = was
+
+    def _after_post_change(self) -> None:
+        self._show_post_state()
+        self._update_enabled()
+
+    def set_post_stage(self, name: str, on: bool) -> None:
+        """The programmatic twin of a post-stage's switch: on or off at Apply. ValueError for a post-stage the
+        engine environment does not offer (or with no list)."""
+        stage = self._post_stage(name)
+        blocked = self._blocked()
+        if blocked:
+            self._refused(blocked)
+            return
+        self._set_post_pending(stage.name, on=bool(on))
+        self._sync_post_switch(stage.name)
+        self._after_post_change()
+
+    def _on_post_switch(self, name: str) -> None:
+        if self._syncing:
+            return
+        prow = self.post_rows.get(name)
+        if prow is None:
+            return
+        blocked = self._blocked()
+        if blocked:                           # the switches are off then; a change made all the same is put back
+            self._sync_post_switch(name)
+            self._refused(blocked)
+            return
+        self._set_post_pending(name, on=prow.switch.isChecked())
+        self._after_post_change()
+
+    def set_post_param(self, name: str, key: str, value) -> None:
+        """The programmatic twin of a post-stage parameter's widget: ``value`` checked by the declaration
+        (ValueError naming the key and the rule), shown, and pending until Apply."""
+        stage = self._post_stage(name)
+        spec = stage.param(key)                          # ValueError for an undeclared parameter
+        value = spec.check(value)
+        blocked = self._blocked()
+        if blocked:
+            self._refused(blocked)
+            return
+        self._show_value(self.post_rows[name].params[key], value)
+        self._set_post_pending(name, key=key, value=value)
+        self._after_post_change()
+
+    def reset_post_param(self, name: str, key: str) -> None:
+        """Back to the parameter's declared default (written as no value at all: post_stages.yaml holds only the
+        values off their defaults)."""
+        spec = self._post_stage(name).param(key)
+        blocked = self._blocked()
+        if blocked:
+            self._refused(blocked)
+            return
+        self._show_value(self.post_rows[name].params[key], spec.pack_value)
+        self._set_post_pending(name, key=key, value=spec.pack_value)
+        self._after_post_change()
+
+    def _on_post_widget(self, name: str, key: str) -> None:
+        if self._syncing:
+            return
+        prow = self.post_rows.get(name)
+        row = prow.params.get(key) if prow is not None else None
+        if row is None:
+            return
+        blocked = self._blocked()
+        if blocked:                           # the widgets are off then; a change made all the same is put back
+            self._show_value(row, self.post_value(name, key))
+            self._refused(blocked)
+            return
+        value = self._widget_value(row)
+        base = ((self._post_base()[0].get(name) or {}).get("values") or {}).get(key, row.tunable.pack_value)
+        if _params._same(value, self._widget_value_for(row, base)):
+            value = base                      # back to the list's own value (as the widget rounds it)
+        else:
+            try:
+                value = row.tunable.check(value)
+            except ValueError as e:
+                self._status(str(e), RED)
+                return
+        self._set_post_pending(name, key=key, value=value)
+        self._after_post_change()
+
+    def apply_post_stages(self) -> bool:
+        """Write the project's post_stages.yaml through the runner of the environment that runs it (``python -m
+        germquant.post_stages write``, which validates the entries there; D39). False, with the reason, when
+        there is nothing to apply, a run or a write is in progress, or no post-stage is listed."""
+        blocked = self._blocked()
+        if blocked:
+            self._refused(blocked)
+            return False
+        if self._posts is None:
+            self._status(f"no post-stage list: {self.post_error or 'the engine environment is not asked yet'}",
+                         AMBER)
+            return False
+        if not self.post_changed:
+            self._status("no post-stage change to apply", AMBER)
+            return False
+        pin = self._view.manifest.get("pack") or {}
+        self._queue_write("post", {"entries": self.post_entries(), "pack": pin.get("id"),
+                                   "recipe": pin.get("recipe") or self._view.recipe}, "writing post_stages.yaml")
+        return True
+
     # ------------------------------------------------------------------ enabling
     def _update_enabled(self) -> None:
         ok = self._view is not None and self.last_error is None
@@ -1016,10 +1359,37 @@ class RecipeTab(QWidget):
         cur = self._current_form_record()
         self.apply_form_btn.setEnabled(editable and bool(edits or unset) and (cur is None or isinstance(cur, dict)))
         self.revert_all_btn.setEnabled(editable and (self._view.edited or any(r.edit for r in self._view.roles)))
+        for name, prow in self.post_rows.items():   # a switched-off post-stage's parameters wait
+            on = self.post_switch(name)
+            prow.switch.setEnabled(editable)
+            for key, row in prow.params.items():
+                if row.widget is not None:
+                    row.widget.setEnabled(editable and on)
+                row.reset_btn.setEnabled(editable and on and not _params.post_same(
+                    row.tunable, self.post_value(name, key), row.tunable.pack_value))
+        self.apply_post_btn.setEnabled(editable and self._posts is not None and self.post_changed)
 
     # ------------------------------------------------------------------ the engine calls (one at a time)
-    def _request_load(self, *, keep: bool) -> None:
-        self._want_load = {"keep": keep}
+    def _request_load(self, *, keep: bool, list_posts: bool = False) -> None:
+        """Read the project (the newest request); ``list_posts`` also asks the engine environment for its post-stages
+        again afterwards (a request it replaces keeps that)."""
+        list_posts = list_posts or bool((self._want_load or {}).get("list_posts"))
+        self._want_load = {"keep": keep, "list_posts": list_posts}
+        self._pump()
+
+    def _request_posts(self) -> None:
+        """Ask the engine environment for its post-stages (the newest request): now when the tab can ask, else when
+        it is shown (RecipeProjectTab, whose listing waits as its role preview does)."""
+        if self._view is None or self.last_error is not None or self.engine_error:
+            return
+        if not self._previews_now():
+            self._posts_due = True
+            self._show_post_state()
+            return
+        self._posts_due = False
+        pin = self._view.manifest.get("pack") or {}
+        self._want_posts = {"pack": pin.get("id"), "recipe": pin.get("recipe") or self._view.recipe}
+        self._show_post_state()
         self._pump()
 
     def _queue_write(self, kind: str, kwargs: dict, label: str) -> None:
@@ -1034,8 +1404,8 @@ class RecipeTab(QWidget):
         return self.session.require("projects", should_stop=self.worker.should_stop)
 
     def _pump(self) -> None:
-        """Start the next call when the worker is free: a write first, then a load, a reference image, the role
-        preview and the form preview (each the newest request of its kind)."""
+        """Start the next call when the worker is free: a write first, then a load, a reference image, the
+        post-stage listing, the role preview and the form preview (each the newest request of its kind)."""
         if self.worker.busy:
             return
         if self._writes:
@@ -1043,7 +1413,7 @@ class RecipeTab(QWidget):
             self._start("write", lambda: self._write_job(job), job["label"])
             return
         if self._root is None:
-            self._want_load = self._want_reference = self._want_roles = self._want_form = None
+            self._want_load = self._want_reference = self._want_roles = self._want_form = self._want_posts = None
             return
         root, reference = self._root, self._reference
         if self._want_load is not None:
@@ -1055,6 +1425,9 @@ class RecipeTab(QWidget):
             ref, self._want_reference = self._want_reference, None
             self._start("reference", lambda: {"root": root, "view": self._reader(root, reference=ref)},
                         "reading the reference image")
+        elif self._want_posts is not None:
+            req, self._want_posts = self._want_posts, None
+            self._start("posts", lambda: self._posts_job(root, req), "listing the post-stages")
         elif self._want_roles is not None:
             req, self._want_roles = self._want_roles, None
             self._start("roles", lambda: self._preview_job(root, {"roles": req["roles"]}, req),
@@ -1095,7 +1468,7 @@ class RecipeTab(QWidget):
         with its message."""
         view = self._reader(root, reference=reference)
         out = {"root": root, "view": view, "record": None, "sent": None, "keep": bool(req.get("keep")),
-               "runner_key": None, "engine_error": None}
+               "runner_key": None, "engine_error": None, "list_posts": bool(req.get("list_posts"))}
         try:
             runner = self._runner()
         except RunnerError as e:
@@ -1119,10 +1492,47 @@ class RecipeTab(QWidget):
             record = str(e)
         return {"root": root, "record": record, **req}
 
+    def _post_runner(self, pack_id, recipe_id):
+        """The runner of the environment that runs the project's recipe, where its post-stages are installed: the
+        interpreter stored for that pack recipe on this computer, else the engine (the runner the Project dock's
+        runs take, session.runner_for)."""
+        runner_for = getattr(self.session, "runner_for", None)
+        if callable(runner_for):
+            return runner_for(pack_id, recipe_id, should_stop=self.worker.should_stop)
+        return self._runner()
+
+    def _posts_job(self, root, req) -> dict:
+        """The post-stages of the environment that runs the project (its runner's ``list_post_stages``, `python -m
+        germquant.post_stages list --json` through the subprocess runner); ``error`` says why there is no list (an
+        engine without the post_stages feature gives its one message)."""
+        out = {"root": root, "rows": None, "error": None}
+        try:
+            runner = self._post_runner(req.get("pack"), req.get("recipe"))
+            lister = getattr(runner, "list_post_stages", None)
+            if not callable(lister):
+                out["error"] = NO_POST_RUNNER_TEXT
+                return out
+            rows = lister(should_stop=self.worker.should_stop)
+        except NotImplementedError:
+            out["error"] = NO_POST_RUNNER_TEXT
+        except Exception as e:  # noqa: BLE001 - kept with its project (the answer is dropped if another is shown)
+            out["error"] = _error_text(e)
+        else:
+            if isinstance(rows, list):
+                out["rows"] = rows
+            else:
+                out["error"] = f"the engine's post-stage list is not a list: {rows!r}"[:400]
+        return out
+
     def _write_job(self, job) -> dict:
         root = job["root"]
-        runner = self._runner()
-        record = runner.project_edit(root, should_stop=self.worker.should_stop, **job["kwargs"])
+        if job["kind"] == "post":             # post_stages.yaml, through the environment that runs the project
+            kw = job["kwargs"]
+            runner = self._post_runner(kw.get("pack"), kw.get("recipe"))
+            record = runner.write_post_stages(root, kw["entries"], should_stop=self.worker.should_stop)
+        else:
+            runner = self._runner()
+            record = runner.project_edit(root, should_stop=self.worker.should_stop, **job["kwargs"])
         try:
             view = self._reader(root, reference=job.get("reference"))
         except Exception as e:  # noqa: BLE001 - the write is done; the read error is shown
@@ -1154,6 +1564,26 @@ class RecipeTab(QWidget):
             self._form_record = (res["record"], res["sent"], res["digest"])
             self._show_form_preview()
             self._update_enabled()
+        elif kind == "posts":
+            self._posts_listed(res.get("rows"), res.get("error"))
+
+    def _posts_listed(self, rows, error) -> None:
+        """The engine environment's post-stages (``rows``), or why there is none (``error``): the section again,
+        with the changes not applied of the post-stages still offered."""
+        if error:
+            self._posts, self.post_error = None, str(error)
+        else:
+            self._posts, self.post_error = _params.post_stages_from_listing(rows), None
+            listed = set(self.post_stage_names())
+            self._post_pending = {k: v for k, v in self._post_pending.items() if k in listed}
+        self._posts_root = self._root
+        self._syncing = True
+        try:
+            self._rebuild_posts()
+        finally:
+            self._syncing = False
+        self._show_post_state()
+        self._update_enabled()
 
     def _loaded(self, res: dict) -> None:
         view = res["view"]
@@ -1173,6 +1603,13 @@ class RecipeTab(QWidget):
         record = res.get("record")
         self._role_record = None if record is None else (record, res["sent"], view.digest)
         self._form_record = None
+        if self.engine_error:                               # no engine to list the post-stages with either
+            self._posts, self.post_error = None, None
+        if not keep:
+            self._post_pending = {}
+        elif self._posts is not None:
+            listed = set(self.post_stage_names())
+            self._post_pending = {k: v for k, v in self._post_pending.items() if k in listed}
         if self.engine_error:
             self._status(f"read only: {self.engine_error}", RED)
         elif isinstance(record, dict) and record.get("refused"):
@@ -1183,11 +1620,17 @@ class RecipeTab(QWidget):
         if not self.engine_error:
             self._after_role_change()
             self._after_form_change()
+            if (res.get("list_posts") or self._posts_root != self._root
+                    or (self._posts is None and self.post_error is None)):
+                self._request_posts()                       # the engine environment's: per project, and on reload
         if self._reference is not None and self._reference != view.reference and self._reference in view.image_ids():
             self._want_reference = self._reference          # chosen while this read was under way
         self.loaded.emit()
 
     def _written(self, res: dict) -> None:
+        if res.get("kind") == "post":
+            self._post_written(res)
+            return
         record = res["record"] if isinstance(res["record"], dict) else {"result": res["record"]}
         self.last_record = record
         if res.get("root") != self._root:     # the project shown changed meanwhile: the write is still announced
@@ -1230,6 +1673,38 @@ class RecipeTab(QWidget):
         self.applied.emit(record)
         self.loaded.emit()
 
+    def _post_written(self, res: dict) -> None:
+        """A post_stages.yaml write came back (its record: "path" and "entries", the keys both runners give): the
+        project read again (post_stages.yaml is in no digest, so every preview stays current, and the role choices
+        and form values not applied stay), the list in force read back from the file, and config_hash unchanged."""
+        record = res["record"] if isinstance(res["record"], dict) else {"result": res["record"]}
+        self.last_post_record = record
+        path = record.get("path") or str(Path(res["root"]) / _params.POST_STAGES_NAME)
+        if res.get("root") != self._root:     # the project shown changed meanwhile: the write is still announced
+            self.post_written.emit(record)
+            return
+        view = res["view"]
+        if isinstance(view, BaseException):
+            self.last_error = _error_text(view)
+            self._view = None
+            self._rebuild()
+            self._status(f"wrote {path}; the project could not be read again: {self.last_error}", RED)
+            self.post_written.emit(record)
+            return
+        old = self._view
+        if old is not None and old.digest == view.digest:
+            view.config_hash = old.config_hash      # nothing hashed changed: the hash shown stays the engine's
+        self._view = view
+        self.last_error = None
+        self._post_pending = {}
+        self._rebuild()
+        self._after_role_change()
+        self._after_form_change()
+        self._status(f"wrote {path}: {_params.entries_text(view.post.entries)}; config_hash {view.config_hash} "
+                     f"{_params.UNCHANGED_TEXT}", GREEN)
+        self.post_written.emit(record)
+        self.loaded.emit()
+
     def _carried_preview(self, view: _params.RecipeView, record: dict) -> tuple | None:
         """After a form write the role bindings are what they were (a tunable binds no channel), so the preview of
         the saved roles carries over, with the new config_hash; with role choices pending a new dry run is due."""
@@ -1252,6 +1727,8 @@ class RecipeTab(QWidget):
             self._status(text, RED)
         elif kind == "reference":
             self._status(f"the reference image could not be read: {text}", AMBER)
+        elif kind == "posts":
+            self._posts_listed(None, text)
         else:
             self._status(text, RED)
             if kind == "write" and self._root is not None and self._want_load is None:
@@ -1273,7 +1750,8 @@ class RecipeProjectTab(RecipeTab):
     viewer and engine session; after each write it asks the dock to read the project again (``dock.reload``), so
     the header and the status board follow the new config_hash. While the tab is hidden (another tab of the dock
     is shown) it follows the dock's readings, but the role preview, a dry run that reads every image's header,
-    waits until it is shown."""
+    and the post-stage listing wait until it is shown. A post-stage write does not ask the dock to read the project
+    again: nothing the dock shows changes with post_stages.yaml."""
 
     def __init__(self, dock) -> None:
         super().__init__(getattr(dock, "viewer", None), dock, session=getattr(dock, "session", None))
@@ -1287,6 +1765,8 @@ class RecipeProjectTab(RecipeTab):
         super().showEvent(event)
         if self._view is not None and self.last_error is None and not self.engine_error:
             self._after_role_change()          # the role preview that waited while the tab was hidden
+            if self._posts_due:
+                self._request_posts()          # and the post-stage listing
 
     def project_changed(self, state) -> None:
         root = getattr(state, "root", None) if state is not None else None
