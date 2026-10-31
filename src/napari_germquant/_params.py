@@ -16,6 +16,16 @@ says.
 recipe.yaml holds only ``extends: pack:<id>@<version>/<recipe>`` and the edits (design 7.3), so its keys are the
 project's edits; the manifest says where each came from (``recipe.origins``: form, tuning, model or manual) and
 which roles the role editor bound (``recipe.roles``: {role: exact channel name}).
+
+Post-stages (design 5.6 and 8.5; docs/POST_STAGES.md in the engine). The post-stages a run can switch on are those
+installed in the environment that runs it, so their list comes from the engine runner (`python -m
+germquant.post_stages list --json`, ``post_stages_from_listing``), and post_stages.yaml is written there too
+(`python -m germquant.post_stages write`, which validates the entries against them; D39). The tab reads the list a
+run of the project uses in this environment (``post_list``): the project's own post_stages.yaml, else the
+post_stages/<recipe>.yaml its pack ships, else none. post_stages.yaml is not part of config_hash: switching a
+post-stage on is no recipe edit, and changes neither the hash nor validated (design 7.3). What Apply writes holds,
+for each post-stage switched on, only the parameters off their declared defaults (``post_entries``), as recipe.yaml
+holds only the edits.
 """
 from __future__ import annotations
 
@@ -62,6 +72,12 @@ CHANNEL_MAP_KEY = "io.channel_map"
 # plain
 STATES = ("collision", "missing", "index", "unbound", "name")
 HOW_TEXT = {"name": "by name", "index": "by index", "unbound": "unbound"}
+# the post-stage list of a project (its root) and of a pack (post_stages/<recipe>.yaml), as the engine names them
+# (germquant.post_stages.POST_STAGES_FILE and PACK_POST_STAGES_DIR)
+POST_STAGES_NAME = "post_stages.yaml"
+PACK_POST_STAGES_DIR = "post_stages"
+POST_ENTRY_KEYS = ("name", "params")
+UNCHANGED_TEXT = "unchanged (post_stages.yaml is not part of config_hash)"
 
 
 class ProjectsMissing(RuntimeError):
@@ -226,15 +242,76 @@ class Role:
         return "pack map: no channel"
 
 
+@dataclasses.dataclass(frozen=True)
+class PostList:
+    """The post-stage list a run of the project uses (``post_list``): ``origin`` "project" (its own
+    post_stages.yaml), "pack" (the post_stages/<recipe>.yaml its pack ships) or None (none in force); ``path`` the
+    file; ``entries`` the entries as read ({"name", "params"} each; empty when none is in force or the file cannot
+    be read); ``problem`` why the file cannot be read."""
+
+    origin: str | None = None
+    path: Path | None = None
+    entries: tuple = ()
+    problem: str | None = None
+
+    def where(self) -> str:
+        """The list's name in a message."""
+        if self.origin == "project":
+            return f"the project's {POST_STAGES_NAME}"
+        if self.origin == "pack" and self.path is not None:
+            return f"the pack's {PACK_POST_STAGES_DIR}/{Path(self.path).name}"
+        return "no post-stage list"
+
+    def summary(self) -> str:
+        """What is in force, in words (the section's first line)."""
+        if self.origin is None:
+            return (f"none: the project has no {POST_STAGES_NAME}, and its pack ships no {PACK_POST_STAGES_DIR}/"
+                    f"<recipe>.yaml for its recipe")
+        if self.problem:
+            return f"{self.where()}, which cannot be read ({self.problem})"
+        return f"{self.where()}: {entries_text(self.entries)}"
+
+
+@dataclasses.dataclass(frozen=True)
+class PostStage:
+    """A post-stage the engine environment offers (a row of its listing, `python -m germquant.post_stages list
+    --json`, I12): its name, version, distribution and title, and its declared parameters as form rows
+    (``params``: Tunables whose pack value is the declared default; the types are the tunables' own)."""
+
+    name: str
+    version: str | None
+    dist: str | None
+    title: str
+    params: tuple
+    reads: dict = dataclasses.field(default_factory=dict)
+    writes: dict = dataclasses.field(default_factory=dict)
+
+    @property
+    def defaults(self) -> dict:
+        return {p.key: p.pack_value for p in self.params}
+
+    def param(self, key: str) -> Tunable:
+        for p in self.params:
+            if p.key == key:
+                return p
+        raise ValueError(f"post-stage {self.name} declares no parameter {key} (its parameters: "
+                         f"{', '.join(p.key for p in self.params) or 'none'})")
+
+    def label(self) -> str:
+        """The switch's text: name, version and distribution."""
+        return f"{self.name} {self.version or '?'}" + (f" ({self.dist})" if self.dist else "")
+
+
 @dataclasses.dataclass
 class RecipeView:
     """A project's recipe as the tab shows it (``read_view``). ``config_hash`` is the project's hash as this
     environment computes it on open (the engine's dry run confirms it), ``validated`` the manifest's record,
     ``digest`` the sha256 of the manifest and the two recipe files (a preview made for another digest is
     stale), ``saved`` the manifest's saved stamp (every write changes it), ``overrides`` the stage switches the
-    project turns off (the manifest's recipe overrides, ``{"spots.enabled": False}``: they enter the hash), and
+    project turns off (the manifest's recipe overrides, ``{"spots.enabled": False}``: they enter the hash),
     ``manifest`` the manifest as read (a host's later reading equal to it holds no write since: the saved stamp
-    alone is to the second, so two writes in one second share it)."""
+    alone is to the second, so two writes in one second share it), and ``post`` the post-stage list a run of the
+    project uses (not part of the hash, nor of ``digest``: a post-stage write leaves every preview current)."""
 
     root: Path
     name: str
@@ -257,6 +334,7 @@ class RecipeView:
     saved: dict | None = None
     overrides: dict = dataclasses.field(default_factory=dict)
     manifest: dict = dataclasses.field(default_factory=dict)
+    post: PostList = dataclasses.field(default_factory=PostList)
 
     def role(self, name: str) -> Role:
         for r in self.roles:
@@ -381,7 +459,8 @@ def state_digest(root: Path) -> str:
 
 
 def read_view(root, *, reference: str | None = None) -> RecipeView:
-    """The project's recipe as the tab shows it, read in this environment (module docstring). ``reference``: the
+    """The project's recipe as the tab shows it, read in this environment (module docstring), with the post-stage
+    list its runs use (``post_list``: its post_stages.yaml, else its pack's for the recipe). ``reference``: the
     image whose channels the role combos list (default: the project's first image that is not excluded).
     ProjectsMissing when this germquant cannot read projects; the project's own refusals (not a project, a
     manifest that does not load) as they come."""
@@ -443,7 +522,8 @@ def read_view(root, *, reference: str | None = None) -> RecipeView:
                       reference=chosen["id"] if chosen else None, channels=channels, channels_error=channels_error,
                       warnings=warnings, digest=digest,
                       saved=dict(m["saved"]) if isinstance(m.get("saved"), dict) else None,
-                      overrides=dict((m.get("recipe") or {}).get("overrides") or {}), manifest=copy.deepcopy(m))
+                      overrides=dict((m.get("recipe") or {}).get("overrides") or {}), manifest=copy.deepcopy(m),
+                      post=post_list(root, getattr(pack, "folder", None), str(recipe.id)))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -576,3 +656,239 @@ def written_text(record: dict) -> str:
     if not parts:
         parts.append("no recipe file changed")
     return "; ".join(parts) + f"; config_hash {record.get('config_hash')}"
+
+
+# ---------------------------------------------------------------------------------------------------
+# post-stages: the list in force, the engine environment's post-stages, and what Apply writes
+# ---------------------------------------------------------------------------------------------------
+
+
+def _entries_problems(doc) -> list[str]:
+    """The shape problems of a post-stage list, in the engine's words (germquant.post_stages.config's
+    entries_problems): a list of mappings, each with a name and, optionally, params."""
+    if isinstance(doc, (str, bytes)) or not isinstance(doc, (list, tuple)):
+        return [f"post-stages must be a list of {{name, params}} entries, got {type(doc).__name__}"]
+    out = []
+    for i, e in enumerate(doc):
+        if not isinstance(e, dict):
+            out.append(f"entry {i} must be a mapping {{name, params}}, got {type(e).__name__}")
+            continue
+        unknown = sorted(str(k) for k in e if k not in POST_ENTRY_KEYS)
+        if unknown:
+            out.append(f"entry {i}: unknown key(s) {unknown} (an entry takes name and params)")
+        if "name" not in e:
+            out.append(f"entry {i} has no name")
+        elif not isinstance(e["name"], str) or not e["name"].strip():
+            out.append(f"entry {i}: name must be the post-stage's name as text, got {e['name']!r}")
+        params = e.get("params")
+        if params is not None and not isinstance(params, dict):
+            out.append(f"entry {i}: params must be a mapping of parameter keys to values, got {type(params).__name__}")
+    return out
+
+
+def read_post_entries(path) -> tuple[list[dict] | None, str | None]:
+    """``(entries, problem)`` of a post_stages.yaml, read as the engine's load_post_stages_file reads it: UTF-8 with
+    or without a byte-order mark, YAML, an empty file an empty list, a list of {name, params}. ``entries`` is None
+    when the file cannot be read, and ``problem`` says why. The names and values are not checked here: only the
+    environment that runs has the post-stages to check them against (post_state names what its listing lacks)."""
+    import yaml
+
+    p = Path(path)
+    try:
+        data = _read_bytes(p)
+    except OSError as e:
+        return None, f"{p} cannot be opened ({e.strerror or e})"
+    if data is None:
+        return None, f"{p} is missing"
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        return None, f"{p} is not UTF-8 text (byte {e.start})"
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)
+        return None, f"{p} cannot be read as YAML" + (f" (line {mark.line + 1})" if mark is not None else "")
+    if doc is None:
+        return [], None
+    problems = _entries_problems(doc)
+    if problems:
+        return None, f"{p}: " + "; ".join(problems)
+    return [{"name": str(e["name"]), "params": dict(e.get("params") or {})} for e in doc], None
+
+
+def _is_file(path) -> bool:
+    try:
+        return os.path.isfile(_long(path))
+    except OSError:
+        return False
+
+
+def post_list(root, pack_folder=None, recipe: str | None = None) -> PostList:
+    """The post-stage list a run of the project in ``root`` uses (the engine's post_stages_in_force, which project
+    run follows): the project's own post_stages.yaml; else the post_stages/<recipe>.yaml that the pack in
+    ``pack_folder`` ships for ``recipe``; else none. A project's file replaces the pack's, an empty one included."""
+    own = Path(root) / POST_STAGES_NAME
+    if _is_file(own):
+        entries, problem = read_post_entries(own)
+        return PostList("project", own, tuple(entries or ()), problem)
+    if pack_folder is not None and recipe:
+        shipped = Path(pack_folder) / PACK_POST_STAGES_DIR / f"{recipe}.yaml"
+        if _is_file(shipped):
+            entries, problem = read_post_entries(shipped)
+            return PostList("pack", shipped, tuple(entries or ()), problem)
+    return PostList()
+
+
+def post_stages_from_listing(rows) -> list[PostStage]:
+    """The post-stages of an engine environment's listing (`python -m germquant.post_stages list --json`, or
+    api.list_post_stages in process: [{"name", "version", "dist", "title", "reads", "writes", "params",
+    "source"}]), in its order (by name); a row without a name is left out."""
+    out = []
+    for r in rows or ():
+        if not isinstance(r, dict) or not r.get("name"):
+            continue
+        params = []
+        for spec in r.get("params") or ():
+            if isinstance(spec, dict) and spec.get("key"):
+                default = spec.get("default", MISSING)
+                params.append(Tunable.from_declaration(spec, pack_value=default, value=default))
+        out.append(PostStage(name=str(r["name"]), version=str(r["version"]) if r.get("version") else None,
+                             dist=str(r["dist"]) if r.get("dist") else None, title=str(r.get("title") or ""),
+                             params=tuple(params), reads=dict(r.get("reads") or {}),
+                             writes=dict(r.get("writes") or {})))
+    return out
+
+
+def post_value_problem(spec: Tunable, value) -> str | None:
+    """Why ``value`` cannot be the value of the declared post-stage parameter ``spec``, in the engine's words (its
+    param_problem: a float takes any finite number but true or false; an int an integer, never a float; a choice
+    one of its choices of the same type; ranges inclusive), or None when it can."""
+    kind, key = spec.type, spec.key
+    is_num = isinstance(value, numbers.Real) and not isinstance(value, bool)
+    if kind == "float":
+        if not is_num or not math.isfinite(float(value)):
+            return f"parameter {key} must be a number, got {value!r}"
+    elif kind == "int":
+        if not isinstance(value, int) or isinstance(value, bool):
+            return f"parameter {key} must be an integer, got {value!r}"
+    elif kind == "bool":
+        if not isinstance(value, bool):
+            return f"parameter {key} must be true or false, got {value!r}"
+    elif kind == "choice":
+        if not any(type(c) is type(value) and c == value for c in spec.choices):
+            return f"parameter {key} must be one of {list(spec.choices)}, got {value!r}"
+    elif kind == "str":
+        if not isinstance(value, str):
+            return f"parameter {key} must be text, got {value!r}"
+    else:
+        return f"parameter {key} has the unknown type {kind!r}"
+    if kind in ("float", "int"):
+        if spec.lo is not None and value < spec.lo:
+            return f"parameter {key} must be at least {spec.lo}, got {value!r}"
+        if spec.hi is not None and value > spec.hi:
+            return f"parameter {key} must be at most {spec.hi}, got {value!r}"
+    return None
+
+
+def post_same(spec: Tunable, a, b) -> bool:
+    """Whether a post-stage parameter's two values give a run the same value (the engine stores a float parameter
+    as a float, so 1 equals 1.0 there; any other type is compared with its type)."""
+    if a is MISSING or b is MISSING:
+        return a is b
+    nums = all(isinstance(v, numbers.Real) and not isinstance(v, bool) for v in (a, b))
+    if spec.type == "float" and nums:
+        return float(a) == float(b)
+    return type(a) is type(b) and a == b
+
+
+def post_state(stages, plist: PostList) -> tuple[dict, list[str]]:
+    """``({name: {"on": bool, "values": {key: value}}}, problems)``: what the form shows of the list in force, for
+    each post-stage of the listing ``stages`` (on when the list names it; each parameter the list's value, else the
+    default). What the engine would refuse in a run of the list, or cannot be shown, is a problem, each saying what
+    Apply writes instead: a list that cannot be read, a post-stage the engine environment does not offer, one
+    listed twice, an undeclared parameter, a value outside its declaration (the form then shows the default)."""
+    by = {s.name: s for s in stages}
+    state = {s.name: {"on": False, "values": dict(s.defaults)} for s in stages}
+    where = plist.where()
+    if plist.problem:
+        return state, [f"{where} cannot be read ({plist.problem}): a run of the project is refused while it is so, "
+                       f"and Apply writes a new {POST_STAGES_NAME}"]
+    problems: list[str] = []
+    seen: set[str] = set()
+    for e in plist.entries:
+        name = str(e.get("name"))
+        if name in seen:
+            problems.append(f"{where} lists {name} more than once: Apply writes it once")
+            continue
+        seen.add(name)
+        stage = by.get(name)
+        if stage is None:
+            problems.append(f"{where} switches on {name}, which the engine environment does not offer: a run of the "
+                            f"project is refused while the list names it, and Apply writes the list without it")
+            continue
+        state[name]["on"] = True
+        for key, value in dict(e.get("params") or {}).items():
+            try:
+                spec = stage.param(str(key))
+            except ValueError:
+                problems.append(f"{where}: {name} declares no parameter {key}: Apply leaves it out")
+                continue
+            why = post_value_problem(spec, value)
+            if why:
+                problems.append(f"{where}: {name}: {why}: the form shows the default {value_text(spec.pack_value)}, "
+                                f"which Apply writes")
+                continue
+            state[name]["values"][spec.key] = float(value) if spec.type == "float" else value
+    return state, problems
+
+
+def post_entries(stages, on: dict, values: dict) -> list[dict]:
+    """The post_stages.yaml Apply writes: each post-stage of ``stages`` that ``on`` switches on, in the listing's
+    order, with the parameters of ``values`` that are off their declared defaults (post_stages.yaml then holds
+    only what was changed, as recipe.yaml holds only the edits). An empty list switches every post-stage off."""
+    out = []
+    for s in stages:
+        if not on.get(s.name):
+            continue
+        given = values.get(s.name) or {}
+        params = {}
+        for p in s.params:
+            v = given.get(p.key, p.pack_value)
+            if v is MISSING or post_same(p, v, p.pack_value):
+                continue
+            params[p.key] = v
+        out.append({"name": s.name, "params": params})
+    return out
+
+
+def post_list_changed(stages, plist: PostList, entries) -> bool:
+    """Whether writing ``entries`` changes what a run gets from the list in force: which post-stages are on, and
+    each of their parameters' values with the defaults filled in, whatever the order of the entries or a default
+    written out. A list in force with a problem (post_state) is always a change: Apply writes one a run takes."""
+    state, problems = post_state(stages, plist)
+    if problems:
+        return True
+    by = {s.name: s for s in stages}
+    current = {name: st["values"] for name, st in state.items() if st["on"]}
+    wanted = {}
+    for e in entries:
+        s = by.get(str(e.get("name")))
+        if s is None:
+            return True
+        wanted[s.name] = {**s.defaults, **dict(e.get("params") or {})}
+    if current.keys() != wanted.keys():
+        return True
+    return any(not post_same(p, wanted[name].get(p.key, MISSING), current[name].get(p.key, MISSING))
+               for name in wanted for p in by[name].params)
+
+
+def entries_text(entries) -> str:
+    """A post-stage list in words: "fixture_nuclei (factor 2.5, statistic max)", "ring_intensity (its defaults)",
+    or "every post-stage off" for an empty list."""
+    parts = []
+    for e in entries or ():
+        params = dict(e.get("params") or {})
+        inner = ", ".join(f"{k} {value_text(v)}" for k, v in params.items()) or "its defaults"
+        parts.append(f"{e.get('name')} ({inner})")
+    return "; ".join(parts) or "every post-stage off"
