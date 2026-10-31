@@ -544,6 +544,9 @@ def test_a_sheet_keyed_by_file_keeps_its_key_when_the_dock_saves_it(qtbot, tmp_p
     assert _cells(w.samples_table, 1) == ["sub\\x.ome.tif", "y.nd2"] and not w.samples.dirty
     with pytest.raises(ValueError, match="file"):
         w.set_sample("x", "file", "x.ome.tif")
+    w.samples_table.item(0, 1).setText("x.ome.tif")            # typed into the table: the cell goes back
+    assert _cells(w.samples_table, 1)[0] == "sub\\x.ome.tif" and "sheet's key" in w.status_label.text()
+    assert not w.samples.dirty
     # a sheet the engine refuses (two rows name y): the tab says why, and Save never writes over it
     bad = b"file,genotype\r\ny.nd2,N2\r\nsub\\y.nd2,CB4856\r\n"
     (root / "samples.csv").write_bytes(bad)

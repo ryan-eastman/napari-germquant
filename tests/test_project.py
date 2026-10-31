@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -213,10 +214,14 @@ def test_the_sample_table_prefills_from_file_names_and_keeps_extra_columns(tmp_p
     assert t2.not_in_sheet() == [worm] and not t2.dirty and t2.changed_ids() == [worm]
     t2.set(field, "lane", "4")
     assert t2.changed_ids() == [worm, field]
-    # a cp1252 sheet (Excel's plain CSV) reads too, with the warning the engine gives
+    # a cp1252 sheet (Excel's plain CSV) reads too, with the warning the engine gives, said once (in the tab's
+    # notes): the engine's reader does not issue it again as a Python warning, which napari would show as well
     (root / "samples.csv").write_bytes("image_id,genotype\r\nfield_07,caf\xe9\r\n".encode("cp1252"))
-    t3 = P.SampleTable.from_project(root, read_manifest(root), regex=WORM_REGEX, defaults=WORM_DEFAULTS)
+    with warnings.catch_warnings(record=True) as issued:
+        warnings.simplefilter("always")
+        t3 = P.SampleTable.from_project(root, read_manifest(root), regex=WORM_REGEX, defaults=WORM_DEFAULTS)
     assert t3.row(field)["genotype"] == "caf" + chr(0xE9) and "cp1252" in " ".join(t3.warnings)
+    assert not [w for w in issued if "cp1252" in str(w.message)]
 
 
 def test_a_sheet_keyed_by_file_is_read_as_runs_read_it_and_keeps_its_key(tmp_path, monkeypatch):
