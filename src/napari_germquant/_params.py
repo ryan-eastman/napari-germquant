@@ -743,10 +743,11 @@ def post_list(root, pack_folder=None, recipe: str | None = None) -> PostList:
 def post_stages_from_listing(rows) -> list[PostStage]:
     """The post-stages of an engine environment's listing (`python -m germquant.post_stages list --json`, or
     api.list_post_stages in process: [{"name", "version", "dist", "title", "reads", "writes", "params",
-    "source"}]), in its order (by name); a row without a name is left out."""
+    "source"}]), in its order (by name); a row without a name is left out, and so is a row that says it cannot be
+    used ("usable": false, a row of `list --all`): it cannot be switched on."""
     out = []
     for r in rows or ():
-        if not isinstance(r, dict) or not r.get("name"):
+        if not isinstance(r, dict) or not r.get("name") or r.get("usable") is False:
             continue
         params = []
         for spec in r.get("params") or ():

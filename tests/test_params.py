@@ -939,6 +939,8 @@ def test_the_post_stage_rules(tmp_path):
     stages = post_stages_from_listing(post_rows())
     assert [s.name for s in stages] == [FIXTURE, RING] and stages[0].defaults == {"factor": 1.0, "min_voxels": 0,
                                                                                     "statistic": "mean", "fail": False}
+    unusable = {**post_rows()[1], "usable": False, "problems": ["no declaration file"]}   # a `list --all` row
+    assert [s.name for s in post_stages_from_listing([{**post_rows()[0], "usable": True}, unusable])] == [FIXTURE]
     want = post_entries(stages, {RING: True, FIXTURE: True}, {FIXTURE: {"factor": 1.0, "statistic": "max"},
                                                              RING: {"radius_um": 0.8}})
     assert want == [{"name": FIXTURE, "params": {"statistic": "max"}}, {"name": RING, "params": {"radius_um": 0.8}}]
