@@ -562,7 +562,7 @@ touched. With `QT_QPA_PLATFORM` unset on a desktop session, napari queries the r
 
 ## Layout
 
-- `src/napari_germquant/napari.yaml`: the npe2 manifest (reader, four widgets).
+- `src/napari_germquant/napari.yaml`: the npe2 manifest (reader, six widgets).
 - `_engine.py`: the glue to `germquant.api`, no Qt: profiles, recipes (a profile, a config file or a pack
   recipe), role rows, stage rows, `RunPlan` (the one description a run has, executed by an engine runner and
   spelled out as commands for the terminal), the system-pack feature gate.
@@ -580,7 +580,8 @@ touched. With `QT_QPA_PLATFORM` unset on a desktop session, napari queries the r
   `corrections.json`, train with the device choice, register, the command lines).
 - `_timelapse.py`: a series folder without Qt (the lazy label and reference stacks, raw or registered, the
   Tracks and Points data, the register_shifts summary, Register and Link with the commands' arguments).
-- `_run_widget.py`, `_results_widget.py`, `_training_widget.py`, `_timelapse_widget.py`: the four docks.
+- `_run_widget.py`, `_results_widget.py`, `_training_widget.py`, `_timelapse_widget.py`, `_project_widget.py`,
+  `_tuning_widget.py`: the six docks.
 - `_qt_common.py`: adding layer tuples, the log-to-status-bar bridge, and the worker runner the Training and
   Time-lapse docks use (one engine call at a time in a napari thread worker, elapsed time and log lines in the
   status bar).
