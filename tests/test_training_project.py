@@ -975,3 +975,25 @@ def test_project_events_read_no_project_file_on_the_gui_thread(qtbot, tmp_path, 
     _settle(qtbot, w)
     assert len(w.pairs) == 2 and w.index == 0
     assert on_gui == []
+
+
+def test_a_channel_named_by_digits_goes_as_its_index(make_napari_viewer, qtbot, tmp_path, monkeypatch):
+    """A channel named by digits only (a laser line such as 405) goes as its index: `import-labels --channel` and the
+    in-process runner read text of digits as an index (plan 9.4 #11), so its name would ask for channel 405 (review
+    P6_package S2)."""
+    image = tmp_path / "img_a.ome.tif"
+    image.write_bytes(b"x")
+    monkeypatch.setattr(T, "image_channels", lambda path: ["405", "477 SYP-3"])
+    runner = ChannelTrainRunner()
+    viewer, w = _dock(make_napari_viewer, runner)
+    _settle(qtbot, w)
+    w.set_labels_file(tmp_path / "masks.tif")
+    w.set_import_image(image)
+    w.set_pairs_dir(tmp_path / "pairs")
+    _settle(qtbot, w)
+    assert _items(w.channel_combo)[1:] == ["0", "477 SYP-3"]
+    for value in ("405", 0):
+        assert w.select_channel(value)
+        assert w.import_labels()
+        _settle(qtbot, w)
+        assert runner.last("import_labels")[1]["channel"] == "0"
