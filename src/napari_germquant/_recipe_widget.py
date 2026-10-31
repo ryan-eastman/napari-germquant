@@ -152,6 +152,15 @@ def _step(t: _params.Tunable) -> float:
     return 0.1
 
 
+def _spin_int(value, default: int) -> int:
+    """``value`` as a QSpinBox takes it: a 32-bit int, so a declared bound or a value past that range is clipped to
+    its end (a post-stage's unsigned 32-bit seed declares max 4294967295, which the engine's declaration rules
+    accept, and setRange or setValue would raise OverflowError); None gives ``default``."""
+    if value is None:
+        return default
+    return max(-INT_LIMIT, min(INT_LIMIT, int(value)))
+
+
 @dataclasses.dataclass
 class FormRow:
     """The widgets of one tunable: its label, its value widget (None when shown read only), the pack value, the
@@ -691,7 +700,7 @@ class RecipeTab(QWidget):
             return w
         if t.type == "int":
             w = QSpinBox()
-            w.setRange(int(t.lo) if t.lo is not None else -INT_LIMIT, int(t.hi) if t.hi is not None else INT_LIMIT)
+            w.setRange(_spin_int(t.lo, -INT_LIMIT), _spin_int(t.hi, INT_LIMIT))
             if t.unit:
                 w.setSuffix(f" {t.unit}")
             w.valueChanged.connect(lambda _v: on_change())
@@ -730,7 +739,7 @@ class RecipeTab(QWidget):
             if isinstance(w, QDoubleSpinBox) and isinstance(value, (int, float)) and not isinstance(value, bool):
                 w.setValue(float(value))
             elif isinstance(w, QSpinBox) and isinstance(value, (int, float)) and not isinstance(value, bool):
-                w.setValue(int(value))
+                w.setValue(_spin_int(value, 0))
             elif isinstance(w, QCheckBox):
                 w.setChecked(bool(value))
             elif isinstance(w, QComboBox):
