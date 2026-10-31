@@ -832,3 +832,30 @@ def test_the_recipes_spot_backend_comes_before_the_runs(qtbot, tproj, fake, monk
     w.refresh()
     _settle(qtbot, w)
     assert (w.backend, w.backend_source) == ("log", "the annotated runs")
+
+
+def test_the_search_runs_in_the_recipes_own_interpreter(qtbot, tproj, fake):
+    """A project whose pack recipe has its own interpreter on this computer runs and reads its status there (the
+    Project dock, EngineSession.runner_for): its search runs there too, where the recipe's spot backend is
+    installed (review P6_package S1); Apply, a project write, goes to the engine, as the Project dock's writes do."""
+    standard_project(tproj)
+    recipe_runner = FakeTuneRunner()
+
+    class RecipeSession(StaticSession):
+        asked = None
+
+        def runner_for(self, pack_id=None, recipe_id=None, should_stop=None):
+            RecipeSession.asked = (pack_id, recipe_id)
+            return recipe_runner
+
+    w = SpotTuningWidget(None, session=RecipeSession(fake))
+    qtbot.addWidget(w)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    try:
+        assert w.tune()
+        _settle(qtbot, w)
+        assert RecipeSession.asked == ("test_pack", "basic")
+        assert [c[0] for c in recipe_runner.calls] == ["tune_spots"] and "tune_spots" not in [c[0] for c in fake.calls]
+    finally:
+        recipe_runner.release()

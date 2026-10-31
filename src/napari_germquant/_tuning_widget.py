@@ -323,8 +323,17 @@ class SpotTuningWidget(QWidget):
         """Whether a search (tune-spots) runs in the engine worker."""
         return self.engine_worker.busy and self.engine_worker.label == TUNE_LABEL
 
+    def _recipe(self) -> tuple[str | None, str | None]:
+        """(pack id, recipe id) of the open project's pinned pack recipe, or (None, None)."""
+        pin = (self.manifest or {}).get("pack") or {}
+        return pin.get("id"), pin.get("recipe")
+
     def _cancellable(self) -> bool:
-        """Whether the engine can stop a search (a subprocess engine; the in-process engine cannot)."""
+        """Whether the engine can stop a search (a subprocess engine; the in-process engine cannot): the recipe's own
+        interpreter on this computer when one is stored (the search runs there), else the engine."""
+        mapped = _settings.recipe_interpreter(*self._recipe()) if self.manifest else None
+        if mapped:
+            return mapped != _settings.INPROCESS
         try:
             return bool(getattr(self.session.runner(), "cancellable", False))
         except Exception:  # noqa: BLE001 - an engine that cannot be asked cannot be stopped either
@@ -983,9 +992,14 @@ class SpotTuningWidget(QWidget):
         grid, max_runs = self.grid_file, int(self.max_runs_spin.value())
         say = self._lines.line.emit
         self.progress_text = ""
+        pack_id, recipe_id = self._recipe()
 
         def job(should_stop):
-            runner = self.session.require(_tuning.FEATURE, should_stop=should_stop)
+            # the search runs the recipe's spot backend on the project's runs, so it runs where they run: the
+            # recipe's own interpreter on this computer when one is stored (as the Project dock's runs and status),
+            # else the engine
+            runner = self.session.runner_for(pack_id, recipe_id, should_stop=should_stop)
+            runner.require(_tuning.FEATURE, should_stop=should_stop)
             rec = runner.tune_spots(str(root), points=_tuning.POINTS_DIR, grid=str(grid) if grid else None,
                                     max_runs=max_runs, say=say, should_stop=should_stop)
             run = rec.get("run_dir") if isinstance(rec, dict) else None
