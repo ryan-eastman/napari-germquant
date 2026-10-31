@@ -690,12 +690,15 @@ class SampleTable:
     restales exactly those."""
 
     def __init__(self, ids: list[str], columns: list[str], rows: dict[str, dict], saved: dict | None,
-                 warnings: list[str] | None = None, *, key: str = "image_id") -> None:
+                 warnings: list[str] | None = None, *, key: str = "image_id", moved: tuple | None = None) -> None:
         if key not in KEY_COLUMNS:
             raise ValueError(f"a sample sheet is keyed by image_id or file, not {key!r}")
         self.ids = list(ids)
         self.columns = list(columns)
         self.key = key
+        # (the sheet's own folder, the project root) when the sheet was read from another folder than the root,
+        # where Save writes samples.csv: records() then names each file of a relative file cell from the root
+        self._moved = None if moved is None else (Path(moved[0]), Path(moved[1]))
         self._rows = {i: dict(rows[i]) for i in self.ids}
         self.saved = None if saved is None else {i: dict(r) for i, r in saved.items()}
         self.warnings = list(warnings or [])
@@ -749,7 +752,10 @@ class SampleTable:
                 if key == "file":                        # a new row names its image by the file's name
                     pre["file"] = PureWindowsPath(str(e.get("path", ""))).name
                 rows[iid] = {c: pre.get(c, "") for c in columns}
-        return cls(ids, columns, rows, saved, warnings, key=key)
+        moved = None
+        if key == "file" and os.path.normcase(os.path.abspath(sheet.parent)) != os.path.normcase(os.path.abspath(root)):
+            moved = (os.path.abspath(sheet.parent), os.path.abspath(root))
+        return cls(ids, columns, rows, saved, warnings, key=key, moved=moved)
 
     def row(self, image_id: str) -> dict:
         return dict(self._rows[image_id])
@@ -757,11 +763,30 @@ class SampleTable:
     def records(self) -> list[dict]:
         """Every row, in the manifest's order, with every column: what write_sample_sheet is given. A sheet keyed by
         file keeps its key: file comes first and image_id is left out (write_sample_sheet keys a sheet by image_id
-        whenever it has that column), each file cell as the sheet had it, so a path there still names that file."""
+        whenever it has that column), each file cell as the sheet had it, so a path there still names that file
+        (from the root, where Save writes the sheet, for a sheet read from another folder: ``_from_root``)."""
         cols = self.columns
         if self.key == "file":
             cols = ["file", *(c for c in self.columns if c not in KEY_COLUMNS)]
-        return [{c: self._rows[i].get(c, "") for c in cols} for i in self.ids]
+        out = [{c: self._rows[i].get(c, "") for c in cols} for i in self.ids]
+        if self.key == "file" and self._moved is not None:
+            for r in out:
+                r["file"] = self._from_root(str(r["file"]))
+        return out
+
+    def _from_root(self, cell: str) -> str:
+        """A file cell as Save writes it into the project root, for a sheet read from another folder: a folder part
+        that is relative names the file from the sheet's own folder (as the engine reads it), so it is written from
+        the root, where it names the same file; a file name alone and an absolute path stay as they are."""
+        text = cell.replace("\\", "/")
+        if not (len(PureWindowsPath(cell).parts) > 1 or len(PurePosixPath(cell).parts) > 1) or Path(text).is_absolute():
+            return cell
+        base, root = self._moved
+        target = os.path.normpath(os.path.join(base, text))
+        try:
+            return os.path.relpath(target, root)
+        except ValueError:                        # another drive than the root's (Windows): the absolute path
+            return target
 
     def not_in_sheet(self) -> list[str]:
         return [i for i in self.ids if self.saved is None or i not in self.saved]
