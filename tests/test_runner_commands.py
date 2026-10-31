@@ -5,7 +5,9 @@ plugin version stamped on every project write, ``project=`` on the pack calls, t
 probe, the refusal forms of the Train B commands, and the in-process runner: the same commands through
 germquant.api, each error a refusal or a failure as that command answers it, but its project writes through the
 torch-free command of this environment (and, on an engine with projects, both runners writing the same project
-files, an Apply's record with the engine's warning, and the same refusal of a project file that is not YAML)."""
+files, an Apply's record with the engine's warning, and the same refusal of a project file that is not YAML). The
+two post-stage commands, ``python -m germquant.post_stages list --json`` and ``write``, in process: the listing's
+errors as the command answers them, and the write step by step as the command takes it."""
 from __future__ import annotations
 
 import inspect
@@ -323,8 +325,12 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
         monkeypatch.setattr(api, name, fake(name, ret), raising=False)
     monkeypatch.setattr(api, "run_project", run_project, raising=False)
     writes: list = []
-    fake_post = types.ModuleType("germquant.post_stages")
+    fake_post = types.ModuleType("germquant.post_stages")          # what the post-stage write takes of it
+    fake_post.POST_STAGES_FILE = "post_stages.yaml"
+    fake_post.validate_post_stages = lambda entries, declarations=None: []
     fake_post.write_post_stages_file = lambda path, entries, **k: writes.append((Path(path), entries)) or Path(path)
+    fake_post.post_stages_sha256 = lambda source, declarations=None: "ab" * 32
+    fake_post.load_post_stages_file = lambda path: [{"name": "fixture_post", "params": {}}]
     monkeypatch.setitem(sys.modules, "germquant.post_stages", fake_post)
     try:                                   # the warning class an Apply records (9.4 #7)
         from germquant.tune import TuningWarning
@@ -385,7 +391,10 @@ def test_the_in_process_runner_calls_the_project_api(project_env, monkeypatch):
         warnings.simplefilter("ignore")
         assert r.tune_apply(P, "tuning/t1") == {"config_hash": "805dad578390", "warnings": [note]}
     assert r.list_post_stages() == [{"name": "fixture_post"}]
-    r.write_post_stages(P, [{"name": "fixture_post", "params": {}}])
+    Path(P).mkdir(exist_ok=True)                                   # the write refuses a root that is not a folder
+    assert r.write_post_stages(P, [{"name": "fixture_post", "params": {}}]) == {
+        "written": True, "path": str(Path(P) / "post_stages.yaml"), "sha256": "ab" * 32,
+        "entries": [{"name": "fixture_post", "params": {}}]}
     assert writes == [(Path(P) / "post_stages.yaml", [{"name": "fixture_post", "params": {}}])]
     # an API refusal of a one-shot command reads as the engine's exit 2
     monkeypatch.setattr(api, "import_labels", fake("import_labels", _raise(ValueError("a test-split image"))))
@@ -799,7 +808,8 @@ def _fake_api(monkeypatch, raising: dict) -> None:
     answers = {"open_project": _FakeProject, "project_status": {"format": 1, "images": []},
                "collect_project": {"tables": []}, "export_commands": "germquant project run X\n",
                "run_project": {"exit_code": 0}, "import_labels": {"pairs": 2},
-               "tune_spots": {"run_dir": "tuning/t1", "best": None, "ranked": []}, "apply_tuning": "fedcba987654"}
+               "tune_spots": {"run_dir": "tuning/t1", "best": None, "ranked": []}, "apply_tuning": "fedcba987654",
+               "list_post_stages": [{"name": "fixture_post"}]}
     for name, value in answers.items():
         monkeypatch.setattr(api, name, fake(name, value), raising=False)
     monkeypatch.setattr(T, "train_curve", fake("train_curve", {"models": []}), raising=False)
@@ -815,10 +825,12 @@ IN_PROCESS_CALLS = {
     "project status": lambda r, P: r.project_status(P),
     "project collect": lambda r, P: r.project_collect(P),
     "project export-commands": lambda r, P: r.project_export_commands(P),
+    "post_stages list": lambda r, P: r.list_post_stages(),
 }
 
 # (the command, the API function that raises, the error, what the command answers), as the commands are built at
-# 39a0a84: cli_training._import_labels and _train_curve, cli_tune.dispatch and cli_projects.dispatch
+# 39a0a84: cli_training._import_labels and _train_curve, cli_tune.dispatch and cli_projects.dispatch; and at P5b's
+# WIRE draft eef86bc: germquant.post_stages.__main__._list
 ANSWERS = [
     # import-labels: ValueError, FileNotFoundError and ImportError are refused; any other OSError fails
     ("import-labels", "import_labels", lambda E: ValueError("a test-split image"), "refused"),
@@ -859,6 +871,12 @@ ANSWERS = [
     ("project collect", "collect_project", lambda E: _yaml_error(), "refused"),
     ("project collect", "collect_project", lambda E: RuntimeError("boom"), "failed"),
     ("project export-commands", "export_commands", lambda E: _yaml_error(), "refused"),
+    # post_stages list: the command has no handler, so every error fails it (a traceback, exit 1), also the classes
+    # the other commands refuse
+    ("post_stages list", "list_post_stages", lambda E: ValueError("a declaration file that cannot be read"),
+     "failed"),
+    ("post_stages list", "list_post_stages", lambda E: FileNotFoundError("no such distribution"), "failed"),
+    ("post_stages list", "list_post_stages", lambda E: PermissionError(13, "Permission denied"), "failed"),
 ]
 
 
@@ -944,3 +962,128 @@ def test_a_project_file_that_is_not_yaml_is_refused_alike_through_both_runners(p
             call(root)
         assert str(e.value) == line, call.__name__
     assert list(root.glob("runs/*.jsonl")) == []
+
+
+# ---- the two post-stage commands: `python -m germquant.post_stages list --json` and `write DIR --entries JSON
+# --json` (germquant.post_stages.__main__, P5b; plan 9.2 and 9.4 #9; handoff/P6-RUNNER.md, round 3) ----
+
+POST = "fixture_post"
+
+
+def _fake_post_stages(monkeypatch, *, problems=(), raising: dict | None = None) -> types.SimpleNamespace:
+    """A stand-in germquant.post_stages with the names the write takes (POST_STAGES_FILE, validate_post_stages,
+    write_post_stages_file, post_stages_sha256, load_post_stages_file), each call recorded in ``calls``.
+    validate_post_stages answers ``problems``; the writer refuses a list with problems as the engine's does (a
+    ValueError, nothing written); ``raising`` maps "validate", "write", "sha256" or "load" to the error that call
+    raises. This environment has every Train B feature."""
+    fake = types.SimpleNamespace(calls=[], problems=list(problems), raising=dict(raising or {}))
+
+    def call(name, *args):
+        fake.calls.append((name, *args))
+        if name in fake.raising:
+            raise fake.raising[name]
+
+    def validate_post_stages(entries, declarations=None):
+        call("validate", entries)
+        return list(fake.problems)
+
+    def write_post_stages_file(path, entries, *, declarations=None):
+        call("write", Path(path), entries)
+        if fake.problems:
+            raise ValueError("post_stages.yaml not written: " + "; ".join(fake.problems))
+        Path(path).write_bytes(b"- name: fixture_post\n  params:\n    radius_um: 1.5\n")
+        return Path(path)
+
+    def post_stages_sha256(source, declarations=None):
+        call("sha256", Path(source))
+        return "ab" * 32
+
+    def load_post_stages_file(path):
+        call("load", Path(path))
+        return [{"name": POST, "params": {"radius_um": 1.5}}]
+
+    post = types.ModuleType("germquant.post_stages")
+    post.POST_STAGES_FILE = "post_stages.yaml"
+    for f in (validate_post_stages, write_post_stages_file, post_stages_sha256, load_post_stages_file):
+        setattr(post, f.__name__, f)
+    monkeypatch.setitem(sys.modules, "germquant.post_stages", post)
+    monkeypatch.setattr(InProcessRunner, "features", lambda self, should_stop=None: frozenset(_engine.FEATURES))
+    return fake
+
+
+def test_an_in_process_post_stage_write_gives_the_commands_record(tmp_path, monkeypatch):
+    """`post_stages write DIR --entries JSON --json` answers {"written": true, "path", "sha256", "entries"} (plan 9.4
+    #9); in process too, through the engine's own functions (the file's digest, post_stages_sha256, and its entries
+    as written, load_post_stages_file), where the record was {"path", "entries"} with the entries as given
+    (reviews/P6_package.md). The engine gets the entries as the command parses them, the JSON list the subprocess
+    runner sends (a tuple of entries is a list), checks them, then writes once."""
+    fake = _fake_post_stages(monkeypatch)
+    root = tmp_path / "proj"
+    root.mkdir()
+    given = ({"name": POST, "params": {"radius_um": 1.5}},)
+    rec = InProcessRunner().write_post_stages(root, given)
+    target = root / "post_stages.yaml"
+    assert rec == {"written": True, "path": str(target), "sha256": "ab" * 32,
+                   "entries": [{"name": POST, "params": {"radius_um": 1.5}}]}
+    assert fake.calls == [("validate", [given[0]]), ("write", target, [given[0]]), ("sha256", target),
+                          ("load", target)]
+    assert type(fake.calls[0][1]) is list and fake.calls[0][1][0] is not given[0]     # the command's parse
+
+
+def test_an_in_process_post_stage_write_refuses_each_problem_on_its_line(tmp_path, monkeypatch):
+    """The command checks the entries before it writes (validate_post_stages) and refuses every problem, one line
+    each (exit 2, nothing written); in process EngineRefused with one "REFUSED: <problem>" line per problem, where
+    the writer's ValueError was one line, "REFUSED: post_stages.yaml not written: <problem>; <problem>"."""
+    problems = ["entry 0: post-stage fixture_post: parameter radius_um must be at most 5.0, got 9.0",
+                "entry 1: post-stage no_such is not installed in this environment (installed: fixture_post)"]
+    fake = _fake_post_stages(monkeypatch, problems=problems)
+    root = tmp_path / "proj"
+    root.mkdir()
+    with pytest.raises(EngineRefused) as e:
+        InProcessRunner().write_post_stages(root, [{"name": POST, "params": {"radius_um": 9.0}}, {"name": "no_such"}])
+    assert str(e.value) == "\n".join(f"REFUSED: {p}" for p in problems)
+    assert e.value.output == "\n".join(problems) and e.value.exit_code == 2
+    assert [c[0] for c in fake.calls] == ["validate"] and list(root.iterdir()) == []      # nothing written
+
+
+def test_an_in_process_post_stage_write_refuses_a_root_that_is_not_a_folder(tmp_path, monkeypatch):
+    """`post_stages write DIR` refuses a DIR that is not a folder ("<DIR> is not a folder", exit 2) before it checks
+    the entries; in process the same line, where the write was tried and its error read as the refusal."""
+    fake = _fake_post_stages(monkeypatch, problems=["never checked"])
+    a_file = tmp_path / "a_file.txt"
+    a_file.write_bytes(b"x")
+    for root in (tmp_path / "missing", a_file, str(tmp_path / "missing" / "deeper")):
+        with pytest.raises(EngineRefused) as e:
+            InProcessRunner().write_post_stages(root, [{"name": POST, "params": {}}])
+        assert str(e.value) == f"REFUSED: {Path(root)} is not a folder" and e.value.exit_code == 2, root
+    assert fake.calls == [] and not (tmp_path / "missing").exists() and a_file.read_bytes() == b"x"
+
+
+WRITE_FAILURES = [
+    ("write", lambda: OSError(28, DISK_FULL)),
+    ("write", lambda: PermissionError(13, "Permission denied")),
+    ("write", lambda: ValueError("post_stages.yaml not written: fixture_post was uninstalled meanwhile")),
+    ("write", lambda: RuntimeError("boom")),
+    ("validate", lambda: ValueError("a declaration of this environment cannot be read")),
+    ("sha256", lambda: OSError(13, "Permission denied")),
+    ("load", lambda: ValueError("post_stages.yaml cannot be read as YAML (line 3)")),
+]
+
+
+@pytest.mark.parametrize(("where", "error"), WRITE_FAILURES,
+                         ids=[f"{i}-{w}-{e().__class__.__name__}" for i, (w, e) in enumerate(WRITE_FAILURES)])
+def test_an_in_process_post_stage_write_that_fails_is_a_failure(where, error, tmp_path, monkeypatch):
+    """Past its two refusals the command fails on every error (exit 1): the write's OSError or ValueError ("error:
+    <path> could not be written (...)"), anything else, and an error of the check or of the record (no handler
+    around them, a traceback); in process a RunnerError naming the error, never EngineRefused, where an OSError or
+    a ValueError of the write read as refused (the dock's "refused by the engine", nothing written, it implies)."""
+    exc = error()
+    fake = _fake_post_stages(monkeypatch, raising={where: exc})
+    root = tmp_path / "proj"
+    root.mkdir()
+    with pytest.raises(RunnerError) as e:
+        InProcessRunner().write_post_stages(root, [{"name": POST, "params": {}}])
+    assert not isinstance(e.value, EngineRefused), str(e.value)
+    assert f"{type(exc).__name__}: {exc}" in str(e.value) and e.value.__cause__ is exc
+    order = ["validate", "write", "sha256", "load"]
+    assert [c[0] for c in fake.calls] == order[:order.index(where) + 1]

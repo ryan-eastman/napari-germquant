@@ -819,9 +819,19 @@ class EngineRunner:
         raise NotImplementedError
 
     def list_post_stages(self, *, should_stop=None) -> list:
+        """``post_stages list --json``: the post-stages the engine environment offers, read from metadata (no
+        post-stage is imported), ``[{"name", "version", "dist", "title", "reads", "writes", "params", "source"}]``
+        (api.list_post_stages). The command has no handler, so an error is a failure (RunnerError), never a
+        refusal."""
         raise NotImplementedError
 
     def write_post_stages(self, root, entries: list, *, should_stop=None) -> dict:
+        """``post_stages write ROOT --entries JSON --json`` (D39): ``entries`` (``[{"name", "params"}]``; an empty
+        list switches every post-stage off) checked against the post-stages of the engine environment, then
+        written to <root>/post_stages.yaml. The record ``{"written": True, "path", "sha256", "entries"}`` (plan
+        9.4 #9): the file, its digest and its entries as written. Refused before anything is written
+        (EngineRefused, one line per problem): a ``root`` that is not a folder, then each problem of the entries.
+        A write that fails is a RunnerError."""
         raise NotImplementedError
 
 
@@ -889,6 +899,12 @@ def _path_list(paths) -> list:
     return list(paths)
 
 
+def _entries_json(entries) -> str:
+    """``--entries`` of ``post_stages write``: the post-stage list as compact ASCII JSON, the text the command
+    parses (the in-process write hands the engine that same parse)."""
+    return json.dumps(list(entries), separators=(",", ":"), ensure_ascii=True)
+
+
 def _write_atomic(path, data: bytes) -> Path:
     """Write ``data`` to ``path`` through a temporary file next to it and os.replace, both through
     germquant.fsutil.long_path (past the 260-character limit on Windows): a reader never sees half a file, and
@@ -923,8 +939,7 @@ def _command_name(argv: list[str]) -> str:
 
 def _refusal_types() -> tuple:
     """The errors the project command line turns into a refusal (exit 2), a YAML error aside: ValueError (which
-    ProjectError is), OSError and PackInstallError. ``_api_call``'s default, which the two post-stage methods
-    still take (their own rule is RECIPE's post-stage pass, after merge #4)."""
+    ProjectError is), OSError and PackInstallError. ``_api_call``'s default; every call names its own rule."""
     types_: list = [ValueError, OSError]
     try:
         from germquant.packs import PackInstallError
@@ -941,7 +956,9 @@ def _refusal_types() -> tuple:
 # traceback). The in-process runner makes the same call, so it answers as that command does: each rule below
 # takes the error and gives the reason a refusal shows, or None for a failure (a RunnerError naming the error).
 # As the commands are built at 39a0a84: cli_projects.dispatch, cli_training._import_labels and _train_curve, and
-# cli_tune.dispatch.
+# cli_tune.dispatch. The two post-stage commands (germquant.post_stages.__main__, P5b) need no rule here: `list` has
+# no handler (every error a failure), and `write` refuses only what it checks before writing, which
+# InProcessRunner.write_post_stages checks the same way.
 
 
 def _engine_classes(*names: str) -> tuple:
@@ -1439,21 +1456,43 @@ class InProcessRunner(EngineRunner):
         notes = [str(w.message) for w in caught if issubclass(w.category, TuningWarning)]
         return {"config_hash": h, "warnings": notes}
 
+    # -- the torch-free post-stage entry's two commands (germquant.post_stages.__main__), as they answer
     def list_post_stages(self, *, should_stop=None) -> list:
+        """``post_stages list --json`` in this environment: api.list_post_stages, the rows the command prints. The
+        command has no handler, so every error of the listing is a failure (a RunnerError naming it)."""
         self._start(should_stop, "post_stages")
-        return _jsonable(self._api_call(self._api("list_post_stages")))
+        return _jsonable(self._api_call(self._api("list_post_stages"), refusals=()))
 
     def write_post_stages(self, root, entries, *, should_stop=None) -> dict:
-        """post_stages.write_post_stages_file into <project>/post_stages.yaml, validated against the post-stages
-        installed in this environment."""
+        """``post_stages write ROOT --entries JSON --json`` in this environment, step by step as the command takes
+        them (germquant.post_stages.__main__._write), through the engine's own functions. The entries are the
+        command's parse of the JSON the subprocess runner sends. A ``root`` that is not a folder, then every
+        problem validate_post_stages finds against the post-stages installed here, is refused before anything is
+        written: EngineRefused, one "REFUSED: <problem>" line each. Then write_post_stages_file, every error of
+        which is a failure (the command's exit 1, a RunnerError), and the command's record ``{"written": True,
+        "path", "sha256", "entries"}``: the file's digest (post_stages_sha256) and its entries as written
+        (load_post_stages_file)."""
         self._start(should_stop, "post_stages")
         try:
             post = importlib.import_module(POST_STAGES_MODULE)
         except ImportError as e:
             raise FeatureMissing(self.feature_message("post_stages"), "post_stages") from e
-        path = Path(root) / "post_stages.yaml"
-        written = self._api_call(post.write_post_stages_file, path, list(entries))
-        return {"path": str(written or path), "entries": _jsonable(list(entries))}
+        from germquant.fsutil import long_path
+
+        listed = json.loads(_entries_json(entries))
+        folder = Path(root)
+        if not os.path.isdir(long_path(folder)):          # as the command checks it: past MAX_PATH on Windows too
+            problems = [f"{folder} is not a folder"]
+        else:
+            problems = [str(p) for p in self._api_call(post.validate_post_stages, listed, refusals=())]
+        if problems:
+            raise EngineRefused("\n".join(f"REFUSED: {p}" for p in problems), output="\n".join(problems))
+        target = folder / post.POST_STAGES_FILE
+        self._api_call(post.write_post_stages_file, target, listed, refusals=())
+        return {"written": True, "path": str(target),
+                "sha256": self._api_call(post.post_stages_sha256, target, refusals=()),
+                "entries": _jsonable(self._api_call(post.load_post_stages_file, target, refusals=()))}
+
 
 class SubprocessRunner(EngineRunner):
     """An engine interpreter in its own process. ``env`` overrides variables of the inherited environment
@@ -2098,8 +2137,7 @@ class SubprocessRunner(EngineRunner):
         """``post_stages write DIR --entries JSON``: the engine environment, where the post-stages are installed,
         validates the entries and writes <project>/post_stages.yaml (D39)."""
         self._start(should_stop, "post_stages")
-        text = json.dumps(list(entries), separators=(",", ":"), ensure_ascii=True)
-        return self._command_json(self.post_stages_argv("write", root, "--entries", text, "--json"),
+        return self._command_json(self.post_stages_argv("write", root, "--entries", _entries_json(entries), "--json"),
                                   should_stop=should_stop)
 
     # -- other commands of the full command line
