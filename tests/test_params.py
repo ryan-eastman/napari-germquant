@@ -651,6 +651,7 @@ def test_the_post_stages_are_listed_switched_and_written_through_the_engine(qtbo
     assert ring.params["note"].note_label.text() == "changed: x at Apply"
     tab.reset_post_param(RING, "note")
     assert note.text() == "none" and tab.post_entries() == [{"name": RING, "params": {"radius_um": 0.8}}]
+    assert ring.params["note"].note_label.text() == ""                  # back to the list's own value: no change
     with pytest.raises(ValueError, match="must be at most 5"):
         tab.set_post_param(RING, "radius_um", 7.0)
     with pytest.raises(ValueError, match="declares no parameter width"):
@@ -702,6 +703,9 @@ def test_post_stage_edits_wait_for_a_run_and_a_write(qtbot, tmp_path):
     assert not tab.apply_post_stages()
     tab.set_running(False)
     tab.set_post_stage(FIXTURE, True)
+    tab.set_running(True)                                               # a change made, then a run: Apply waits
+    assert not tab.apply_post_stages() and tab.status_label.text() == RUNNING_TEXT and _writes(fake) == []
+    tab.set_running(False)
     tab.choose_channel("dna", "DAPI")                                   # chosen before the write, not applied
     _settle(tab, qtbot)
     fake.post_gate = threading.Event()                                  # hold the write
@@ -815,6 +819,33 @@ def test_without_post_stages_the_section_says_why_and_the_rest_works(qtbot, tmp_
     tab2 = _tab(qtbot, tmp_path, session=FakeSession(fake2), reader=lambda root, reference=None: view)
     assert tab2.post_error == message and "Post-stages need the tranche-5 Train B engine" in tab2.post_label.text()
     assert tab2.role_combos["dna"].isEnabled() and tab2.last_error is None and tab2.engine_error is None
+
+
+SEEDED = {"name": "seeded", "version": "1.0.0", "dist": "lab-seeded", "title": "Draws with an unsigned 32-bit seed",
+          "reads": {"roles": [], "tables": ["nuclei"], "labels": False, "image": False},
+          "writes": {"draws": ["nucleus_id", "draw"]},
+          "params": [{"key": "seed", "type": "int", "default": 0, "min": 0, "max": 4294967295}],
+          "source": "entry point lab_seeded:measure"}
+
+
+def test_an_int_parameter_declared_past_32_bits_gets_a_clipped_spin_box(qtbot, tmp_path):
+    """A post-stage parameter whose declared range passes the 32-bit int a QSpinBox holds (an unsigned 32-bit
+    seed, max 4294967295, which the engine's declaration rules accept): the section lists it with a spin box
+    clipped to that range, where setRange raised OverflowError in the listing's answer and left the tab half built
+    (reviews/P6_post_stages.md S1); a value past the spin box's range is still written, and read back, as given."""
+    tab, fake = _post_tab(qtbot, tmp_path, rows=[post_rows()[0], SEEDED])
+    assert tab.post_stage_names() == [FIXTURE, "seeded"] and sorted(tab.post_rows) == [FIXTURE, "seeded"]
+    spin = tab.post_rows["seeded"].params["seed"].widget
+    assert isinstance(spin, QSpinBox) and (spin.minimum(), spin.maximum()) == (0, 2 ** 31 - 1)
+    assert tab.post_label.text().startswith("In force: none") and "Listing" not in tab.post_label.text()
+    tab.set_post_stage("seeded", True)
+    tab.set_post_param("seeded", "seed", 3_000_000_000)                 # inside the declaration, past the spin box
+    assert spin.value() == 2 ** 31 - 1
+    assert tab.post_entries() == [{"name": "seeded", "params": {"seed": 3_000_000_000}}]
+    assert tab.apply_post_stages()
+    _settle(tab, qtbot)
+    assert _writes(fake) == [[{"name": "seeded", "params": {"seed": 3_000_000_000}}]]
+    assert tab.post_value("seeded", "seed") == 3_000_000_000 and not tab.post_changed     # read back from the file
 
 
 # ---------------------------------------------------------------------------------------------------

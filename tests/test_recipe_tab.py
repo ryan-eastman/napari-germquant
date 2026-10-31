@@ -11,10 +11,10 @@ from pathlib import Path
 
 from types import SimpleNamespace
 
-from _p6_recipe import FIXTURE, RING, FakePostRunner, FakeRunner, FakeSession, fake_view, preview_record
+from _p6_recipe import FIXTURE, RING, FakePostRunner, FakeRunner, FakeSession, fake_view, post_rows, preview_record
 from qtpy.QtWidgets import QWidget
 
-from napari_germquant import _engine, _params
+from napari_germquant import _engine, _params, _settings
 from napari_germquant._engine_session import NOT_CHOSEN, EngineSession
 from napari_germquant._recipe_widget import RecipeProjectTab, RecipeTab
 from napari_germquant._runner import FeatureMissing
@@ -274,3 +274,62 @@ def test_a_hidden_tab_lists_the_post_stages_once_it_is_shown(qtbot, tmp_path):
     tab.reload()
     _settle(tab, qtbot)
     assert fake.post_calls == ["list", "list"]
+
+
+PIN = {"pack": {"id": "test_pack", "version": "0.1.0", "recipe": "basic"}, "saved": {"at": "t0"}}
+
+
+def test_the_post_stages_are_listed_again_when_the_recipe_gets_its_own_interpreter(qtbot, tmp_path):
+    """The listing is of the environment that runs the recipe (session.runner_for: the engine lists fixture_nuclei,
+    the recipe's own interpreter ring_intensity). This computer then stores an interpreter for the project's recipe
+    (the Project dock's Run tab or the Run dock, which signal no engine change): an Apply asked for before the tab
+    lists again writes nothing and lists that environment's post-stages; shown again after the interpreter is
+    cleared, the tab lists the engine's again (reviews/P6_post_stages.md S2)."""
+    engine = FakePostRunner(lambda kw: preview_record(_bindings(), changed=False), rows=[post_rows()[0]])
+    recipe_env = FakePostRunner(lambda kw: preview_record(_bindings(), changed=False), rows=[post_rows()[1]])
+    session = FakeSession(engine)
+    session.runner_for = (lambda pack_id=None, recipe_id=None, should_stop=None:
+                          recipe_env if _settings.recipe_interpreter(pack_id, recipe_id) else engine)
+    dock = _Dock(session)
+    qtbot.addWidget(dock)
+    tab = RecipeProjectTab(dock)
+    tab._reader = lambda root, reference=None: fake_view(root, manifest=PIN, saved=PIN["saved"])
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest=PIN))
+    dock.show()
+    _settle(tab, qtbot)
+    assert tab.post_stage_names() == [FIXTURE] and engine.post_calls == ["list"]
+    tab.set_post_stage(FIXTURE, True)
+    _settings.set_recipe_interpreter("test_pack", "basic", sys.executable)
+    assert not tab.apply_post_stages() and "listed again" in tab.status_label.text()
+    _settle(tab, qtbot)
+    assert recipe_env.post_calls == ["list"] and engine.post_calls == ["list"]          # nothing written
+    assert tab.post_stage_names() == [RING] and not tab.post_changed
+    tab.set_post_stage(RING, True)
+    assert tab.apply_post_stages()
+    _settle(tab, qtbot)
+    assert recipe_env.post_calls == ["list", ("write", [{"name": RING, "params": {}}])]
+    _settings.set_recipe_interpreter("test_pack", "basic", None)
+    dock.hide()
+    dock.show()
+    _settle(tab, qtbot)
+    assert engine.post_calls == ["list", "list"] and tab.post_stage_names() == [FIXTURE]
+
+
+def test_a_post_stage_write_asks_the_dock_to_read_the_project_again(qtbot, tmp_path):
+    """The engine's project status reads the project's post-stage list (a series every run refuses for post-stages
+    reads so: the written agreement for project/status.py of 2026-10-31), so after a post-stage write the dock
+    reads the project again, as after a recipe write (reviews/P6_post_stages.md N1)."""
+    fake = FakePostRunner(lambda kw: preview_record(_bindings(), changed=False))
+    dock = _Dock(FakeSession(fake))
+    qtbot.addWidget(dock)
+    tab = RecipeProjectTab(dock)
+    tab._reader = lambda root, reference=None: fake_view(root, saved={"at": "t0"}, post=_params.post_list(root))
+    tab.project_changed(SimpleNamespace(root=Path(tmp_path), manifest={"saved": {"at": "t0"}}))
+    dock.show()
+    _settle(tab, qtbot)
+    n = dock.reloads
+    tab.set_post_stage(RING, True)
+    assert tab.apply_post_stages()
+    _settle(tab, qtbot)
+    assert [c for c in fake.post_calls if isinstance(c, tuple)] == [("write", [{"name": RING, "params": {}}])]
+    assert dock.reloads == n + 1
