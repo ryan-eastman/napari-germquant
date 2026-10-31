@@ -832,3 +832,84 @@ def test_the_recipes_spot_backend_comes_before_the_runs(qtbot, tproj, fake, monk
     w.refresh()
     _settle(qtbot, w)
     assert (w.backend, w.backend_source) == ("log", "the annotated runs")
+
+
+def test_the_search_runs_in_the_recipes_own_interpreter(qtbot, tproj, fake):
+    """A project whose pack recipe has its own interpreter on this computer runs and reads its status there (the
+    Project dock, EngineSession.runner_for): its search runs there too, where the recipe's spot backend is
+    installed (review P6_package S1); Apply, a project write, goes to the engine, as the Project dock's writes do."""
+    standard_project(tproj)
+    recipe_runner = FakeTuneRunner()
+
+    class RecipeSession(StaticSession):
+        asked = None
+
+        def runner_for(self, pack_id=None, recipe_id=None, should_stop=None):
+            RecipeSession.asked = (pack_id, recipe_id)
+            return recipe_runner
+
+    w = SpotTuningWidget(None, session=RecipeSession(fake))
+    qtbot.addWidget(w)
+    w.set_annotator("tester")
+    _opened(qtbot, w, tproj)
+    try:
+        assert w.tune()
+        _settle(qtbot, w)
+        assert RecipeSession.asked == ("test_pack", "basic")
+        assert [c[0] for c in recipe_runner.calls] == ["tune_spots"] and "tune_spots" not in [c[0] for c in fake.calls]
+        assert w.apply()
+        _settle(qtbot, w)
+        assert [c[0] for c in fake.calls] == ["tune_apply"] and [c[0] for c in recipe_runner.calls] == ["tune_spots"]
+    finally:
+        recipe_runner.release()
+
+
+def test_cancel_follows_the_interpreter_the_search_started_in(qtbot, tproj):
+    """Cancel follows where the search runs (review P6_package S1), decided as it starts, as the Training dock's
+    steps are: the recipe's own interpreter on this computer when one is stored, a Python of its own that Cancel
+    ends, also after the project was closed while the search goes on, or this napari environment, which cannot
+    stop it although the engine could."""
+    standard_project(tproj)
+    engine = FakeTuneRunner()
+    engine.cancellable = False                                         # as the engine in napari's own process
+    recipe_runner = FakeTuneRunner()
+
+    class RecipeSession(StaticSession):
+        def runner_for(self, pack_id=None, recipe_id=None, should_stop=None):
+            return recipe_runner
+
+    w = SpotTuningWidget(None, session=RecipeSession(engine))
+    qtbot.addWidget(w)
+    w.set_annotator("tester")
+
+    def started_there():
+        qtbot.waitUntil(lambda: recipe_runner.started.is_set() or not w.searching, timeout=WAIT)
+        assert recipe_runner.started.is_set(), w.last_message          # the search went to the recipe's own
+
+    _settings.set_recipe_interpreter("test_pack", "basic", "C:/elsewhere/python.exe")
+    _opened(qtbot, w, tproj)
+    recipe_runner.gate = threading.Event()
+    try:
+        assert w.tune()
+        started_there()
+        assert w.cancel_btn.isEnabled()
+        w.close_project()                                              # the search goes on in that interpreter
+        assert w.searching and w.cancel_btn.isEnabled()
+        assert w.cancel()
+        _settle(qtbot, w)
+        assert "cancelled" in w.last_message
+    finally:
+        recipe_runner.release()
+    engine.cancellable, recipe_runner.cancellable = True, False
+    _settings.set_recipe_interpreter("test_pack", "basic", _settings.INPROCESS)
+    _opened(qtbot, w, tproj)
+    recipe_runner.gate, recipe_runner.started = threading.Event(), threading.Event()
+    try:
+        assert w.tune()
+        started_there()
+        assert not w.cancel_btn.isEnabled() and "cannot be stopped" in w.cancel_btn.toolTip()
+        assert not w.cancel() and "cannot be stopped from the dock" in w.last_message
+    finally:
+        recipe_runner.release()
+    _settle(qtbot, w)
+    assert w.current_run is not None and engine.calls == []

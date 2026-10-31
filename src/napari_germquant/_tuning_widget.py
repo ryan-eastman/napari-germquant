@@ -22,11 +22,14 @@ What it shows, top to bottom:
 * Tune: the grid (the engine's default for the recipe's spot backend, or a grid file), Max runs, how many
   detections the search means on the annotated images, Tune and Cancel. Tune runs ``germquant tune-spots
   --project DIR --points annotations --max-runs N [--grid FILE] --json`` through the engine runner, in a thread
-  worker, with the engine's lines on the status bar. Cancel ends the engine's process (an engine in napari's own
-  process cannot be stopped, so Cancel is off for it).
+  worker, with the engine's lines on the status bar. The search runs where the project's runs run: in the
+  interpreter stored on this computer for the project's pack recipe when there is one (as the Project dock's runs
+  and status), else in the engine. Cancel ends that process (napari's own process cannot be stopped, so Cancel is
+  off for a search there).
 * Result: the project's tuning runs (newest first), the top five rows of the selected run's ranked.csv (the
   columns the engine writes, the objective named), its best setting and warnings, and Apply, which runs
-  ``germquant tune-spots --project DIR --apply tuning/<run>`` through the engine with the plugin version (D42).
+  ``germquant tune-spots --project DIR --apply tuning/<run>`` through the engine with the plugin version (D42;
+  the engine stored for this computer, where the Project dock's project writes go).
   The project's config_hash then changes, the message says whether it reads validated (the manifest after the
   write) and shows the engine's warnings of the Apply in amber, its images turn stale, and the Project dock reads
   it again.
@@ -139,6 +142,9 @@ class SpotTuningWidget(QWidget):
         self.last_apply: dict | None = None
         self.progress_text = ""
         self.engine_error: str | None = None
+        # the interpreter stored for the project's recipe as the last search started (None: the search went to the
+        # engine): Cancel follows it while that search goes on, also when its project is closed or another one taken
+        self._search_interpreter: str | None = None
         self.interpreter_dialog = None
         self._hub_root: Path | None = None             # the project the Project dock opened, which this dock follows
         # one more at every reading of a project asked for (and at Close): only the newest reading is taken. A job of
@@ -323,8 +329,18 @@ class SpotTuningWidget(QWidget):
         """Whether a search (tune-spots) runs in the engine worker."""
         return self.engine_worker.busy and self.engine_worker.label == TUNE_LABEL
 
+    def _recipe(self) -> tuple[str | None, str | None]:
+        """(pack id, recipe id) of the open project's pinned pack recipe, or (None, None)."""
+        pin = (self.manifest or {}).get("pack") or {}
+        return pin.get("id"), pin.get("recipe")
+
     def _cancellable(self) -> bool:
-        """Whether the engine can stop a search (a subprocess engine; the in-process engine cannot)."""
+        """Whether the search in flight can be stopped (an interpreter of its own; this napari environment cannot):
+        the recipe's own interpreter on this computer when one was stored as the search started (the search runs
+        there; decided at its start, as the Training dock's steps are), else the engine."""
+        mapped = self._search_interpreter
+        if mapped:
+            return mapped != _settings.INPROCESS
         try:
             return bool(getattr(self.session.runner(), "cancellable", False))
         except Exception:  # noqa: BLE001 - an engine that cannot be asked cannot be stopped either
@@ -964,8 +980,9 @@ class SpotTuningWidget(QWidget):
 
     # ------------------------------------------------------------------ tune and apply
     def tune(self) -> bool:
-        """Run ``germquant tune-spots`` on the project's saved truth points through the engine, in the engine
-        worker. True when it started."""
+        """Run ``germquant tune-spots`` on the project's saved truth points through the engine runner (the recipe's
+        own interpreter on this computer when one is stored, else the engine), in the engine worker. True when it
+        started."""
         if self.root is None:
             self._message("open a project first", AMBER)
             return False
@@ -983,9 +1000,15 @@ class SpotTuningWidget(QWidget):
         grid, max_runs = self.grid_file, int(self.max_runs_spin.value())
         say = self._lines.line.emit
         self.progress_text = ""
+        pack_id, recipe_id = self._recipe()
+        self._search_interpreter = _settings.recipe_interpreter(pack_id, recipe_id)
 
         def job(should_stop):
-            runner = self.session.require(_tuning.FEATURE, should_stop=should_stop)
+            # the search runs the recipe's spot backend on the project's runs, so it runs where they run: the
+            # recipe's own interpreter on this computer when one is stored (as the Project dock's runs and status),
+            # else the engine
+            runner = self.session.runner_for(pack_id, recipe_id, should_stop=should_stop)
+            runner.require(_tuning.FEATURE, should_stop=should_stop)
             rec = runner.tune_spots(str(root), points=_tuning.POINTS_DIR, grid=str(grid) if grid else None,
                                     max_runs=max_runs, say=say, should_stop=should_stop)
             run = rec.get("run_dir") if isinstance(rec, dict) else None
