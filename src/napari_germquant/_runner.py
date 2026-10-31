@@ -2130,12 +2130,16 @@ class SubprocessRunner(EngineRunner):
 
     # -- the torch-free post-stage entry
     def list_post_stages(self, *, should_stop=None) -> list:
+        """``post_stages list --json``: exit 0 with the listing; the command has no handler, so an error is a
+        traceback with exit 1, a RunnerError (exit 2, a usage error, is a refusal as for every command)."""
         self._start(should_stop, "post_stages")
         return self._command_json(self.post_stages_argv("list", "--json"), should_stop=should_stop)
 
     def write_post_stages(self, root, entries, *, should_stop=None) -> dict:
-        """``post_stages write DIR --entries JSON``: the engine environment, where the post-stages are installed,
-        validates the entries and writes <project>/post_stages.yaml (D39)."""
+        """``post_stages write DIR --entries JSON --json``: the engine environment, where the post-stages are
+        installed, checks the entries and writes <project>/post_stages.yaml (D39). Exit 0 with its record; 2
+        refused before anything was written, EngineRefused (the reason its "refused: <problem>" lines); 1 the file
+        could not be written, a RunnerError (its "error: ..." line is no refusal)."""
         self._start(should_stop, "post_stages")
         return self._command_json(self.post_stages_argv("write", root, "--entries", _entries_json(entries), "--json"),
                                   should_stop=should_stop)

@@ -6,10 +6,12 @@ probe, the refusal forms of the Train B commands, and the in-process runner: the
 germquant.api, each error a refusal or a failure as that command answers it, but its project writes through the
 torch-free command of this environment (and, on an engine with projects, both runners writing the same project
 files, an Apply's record with the engine's warning, and the same refusal of a project file that is not YAML). The
-two post-stage commands, ``python -m germquant.post_stages list --json`` and ``write``, in process: the listing's
-errors as the command answers them, and the write step by step as the command takes it."""
+two post-stage commands, ``python -m germquant.post_stages list --json`` and ``write``: their exit codes through
+the subprocess runner, the in-process write step by step as the command takes it, and, on an engine with
+post-stages, both runners listing, writing, refusing and failing alike."""
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -1087,3 +1089,107 @@ def test_an_in_process_post_stage_write_that_fails_is_a_failure(where, error, tm
     assert f"{type(exc).__name__}: {exc}" in str(e.value) and e.value.__cause__ is exc
     order = ["validate", "write", "sha256", "load"]
     assert [c[0] for c in fake.calls] == order[:order.index(where) + 1]
+
+
+def test_the_subprocess_runner_reads_the_post_stage_commands_exit_codes(tmp_path):
+    """Both post-stage commands through the subprocess runner, as germquant.post_stages.__main__ answers: `list
+    --json` exits 0 with the listing, or 1 with a traceback (it has no handler: a failure); `write` exits 0 with
+    its record, 2 when it refused before writing (the reason its "refused:" lines), and 1 when the file could not
+    be written (a failure, not a refusal, though its line starts with "error:"). Exit 2 is a refusal as for every
+    command, a usage error of the listing too."""
+    own = plugin_engine_info()
+    version = MIN if engine_too_old(str(own["germquant"])) else str(own["germquant"])
+    root = standin_engine(tmp_path / "eng", version=version, git_sha=str(own["git_sha"]),
+                          features=list(_engine.FEATURES))
+    P = str(tmp_path / "proj")
+
+    def runner(**env) -> SubprocessRunner:
+        return SubprocessRunner(sys.executable, env={"PYTHONPATH": str(root), **env})
+
+    listing = [{"name": POST, "version": "1.0.0", "dist": "lab-post-stages", "params": []}]
+    assert runner(FAKE_ENGINE_STDOUT=json.dumps(listing, indent=1)).list_post_stages() == listing
+    crash = runner(FAKE_ENGINE_EXIT="1", FAKE_ENGINE_STDERR="Traceback (most recent call last):\nValueError: bad")
+    with pytest.raises(RunnerError, match=r"`germquant.post_stages list` failed \(exit 1\)") as e:
+        crash.list_post_stages()
+    assert not isinstance(e.value, EngineRefused)
+    usage = runner(FAKE_ENGINE_EXIT="2",
+                   FAKE_ENGINE_STDERR="python -m germquant.post_stages: error: unrecognized arguments: --json")
+    with pytest.raises(EngineRefused) as e:
+        usage.list_post_stages()
+    assert e.value.exit_code == 2
+    record = {"written": True, "path": str(Path(P) / "post_stages.yaml"), "sha256": "ab" * 32, "entries": []}
+    assert runner(FAKE_ENGINE_STDOUT=json.dumps(record, indent=1)).write_post_stages(P, []) == record
+    line = f"error: {Path(P) / 'post_stages.yaml'} could not be written (PermissionError: Access is denied)"
+    with pytest.raises(RunnerError, match=r"`germquant.post_stages write` failed \(exit 1\)") as e:
+        runner(FAKE_ENGINE_EXIT="1", FAKE_ENGINE_STDERR=line).write_post_stages(P, [])
+    assert not isinstance(e.value, EngineRefused) and str(e.value).endswith(line)
+    refused = runner(FAKE_ENGINE_EXIT="2", FAKE_ENGINE_STDERR=f"refused: {P} is not a folder",
+                     FAKE_ENGINE_STDOUT=json.dumps({"written": False, "problems": [f"{P} is not a folder"]}, indent=1))
+    with pytest.raises(EngineRefused) as e:
+        refused.write_post_stages(P, [])
+    assert str(e.value).splitlines()[1:] == [f"refused: {P} is not a folder"] and e.value.exit_code == 2
+
+
+def test_both_runners_list_write_refuse_and_fail_post_stages_alike(tmp_path, monkeypatch):
+    """On an engine with post-stages, the fixture post-stage installed from metadata where each runner looks (the
+    child's PYTHONPATH, this process's sys.path): both runners list the same post-stages; write the same
+    post_stages.yaml with the same record (an empty list too, which switches every post-stage off); refuse the
+    same problems, one line each, and a root that is not a folder, writing nothing; and fail, not refuse, a write
+    the file system stops (a folder where post_stages.yaml goes: the command's exit 1)."""
+    need_features("post_stages")
+    from germquant.post_stages import validate_post_stages
+    from germquant.post_stages.testing import FIXTURE_NAME, write_fixture_distribution
+
+    dist = write_fixture_distribution(tmp_path / "dist")
+    monkeypatch.syspath_prepend(str(dist))
+    child_path = os.pathsep.join(p for p in (str(dist), os.environ.get("PYTHONPATH")) if p)
+    runners = {"subprocess": SubprocessRunner(sys.executable, env={"PYTHONPATH": child_path}),
+               "inprocess": InProcessRunner()}
+    listed = {k: r.list_post_stages() for k, r in runners.items()}
+    assert listed["subprocess"] == listed["inprocess"]
+    assert FIXTURE_NAME in [row["name"] for row in listed["inprocess"]]
+
+    def problems_of(e: EngineRefused) -> list[str]:      # each refused line's problem, whatever the head and case
+        return [ln.split(": ", 1)[1] for ln in str(e).splitlines() if ln.lower().startswith("refused: ")]
+
+    roots = {k: tmp_path / k for k in runners}
+    for entries, written in (([{"name": FIXTURE_NAME, "params": {"factor": 3, "statistic": "max"}}],
+                              [{"name": FIXTURE_NAME, "params": {"factor": 3.0, "statistic": "max"}}]), ([], [])):
+        recs = {}
+        for k, r in runners.items():
+            roots[k].mkdir(exist_ok=True)
+            recs[k] = r.write_post_stages(roots[k], entries)
+        data = {k: (roots[k] / "post_stages.yaml").read_bytes() for k in runners}
+        assert data["subprocess"] == data["inprocess"]
+        for k in runners:
+            assert recs[k] == {"written": True, "path": str(roots[k] / "post_stages.yaml"),
+                               "sha256": hashlib.sha256(data[k]).hexdigest(), "entries": written}, k
+            # the entries as written: the float parameter given as 3 reads back as 3.0
+            assert [type(v) for e in recs[k]["entries"] for v in e["params"].values()] == \
+                [type(v) for e in written for v in e["params"].values()], k
+    bad = [{"name": FIXTURE_NAME, "params": {"factor": 99.0, "nope": 1}}, {"name": "not_there"}]
+    problems = validate_post_stages(bad)
+    assert len(problems) == 3
+    a_file = tmp_path / "a_file.txt"
+    a_file.write_bytes(b"x")
+    for k, r in runners.items():
+        with pytest.raises(EngineRefused) as e:
+            r.write_post_stages(roots[k], bad)
+        assert problems_of(e.value) == problems and e.value.exit_code == 2, k
+        for root in (tmp_path / "missing", a_file):
+            with pytest.raises(EngineRefused) as e:
+                r.write_post_stages(root, bad)
+            assert problems_of(e.value) == [f"{root} is not a folder"], (k, root)
+    assert {k: (roots[k] / "post_stages.yaml").read_bytes() for k in runners} == data      # nothing written
+    assert not (tmp_path / "missing").exists() and a_file.read_bytes() == b"x"
+    for k, r in runners.items():
+        blocked = tmp_path / f"blocked_{k}"
+        (blocked / "post_stages.yaml").mkdir(parents=True)
+        with pytest.raises(RunnerError) as e:
+            r.write_post_stages(blocked, [{"name": FIXTURE_NAME, "params": {}}])
+        assert not isinstance(e.value, EngineRefused), (k, str(e.value))
+        if k == "subprocess":
+            assert "failed (exit 1)" in str(e.value) and "could not be written" in str(e.value)
+        else:
+            assert isinstance(e.value.__cause__, OSError), repr(e.value.__cause__)
+        assert [p.name for p in blocked.iterdir()] == ["post_stages.yaml"] and (blocked / "post_stages.yaml").is_dir()
