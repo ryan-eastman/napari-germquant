@@ -965,6 +965,7 @@ def test_codeless_project_from_the_test_pack(make_napari_viewer, qtbot, served_m
     settle(w, qtbot)
     assert tab.last_error is None, tab.status_label.text()
     assert w.status["config_hash"] == tab.config_hash
+    assert tab.view.tunable(served_model_pack.tunable).value == pytest.approx(0.4)   # recipe.yaml's, read again
     assert w.last_error is None, w.last_error
     assert w.status["config_hash"] != before and w.badge_label.text() == "validated: false (edited)"
     assert _board(w) == [(image_id, "stale")] and w.rows[0].reason_code == "config_hash"
