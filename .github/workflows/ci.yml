@@ -66,14 +66,16 @@ env:
   # -1, not an empty string (Windows drops empty variables): torch sees no CUDA device
   CUDA_VISIBLE_DEVICES: "-1"
   ENGINE_REPOSITORY: ryan-eastman/C_elegans_germline_masking_and_spot_counting
-  # train B of tranche 5, open: the pushed head of the engine's integration branch feat/t5-train-b, as a full sha,
-  # moved after every engine merge (Train B plan, section 5.4). Now 3770fb2: merge #4 (P5b, the post-stage
-  # contract), the merge of engine main f00cb36 and the docs and D55 commits, whose version document lists all ten
-  # features. Before it, 78af711 (merge #3, P5: projects, batch formats, the sample sheet, the training and tuning
+  # train B of tranche 5, merged: engine main's merge commit of pull request 20, as a full sha (Train B plan,
+  # section 5.4, item 3). Now 3aa5244: "Merge pull request #20" of feat/t5-train-b 59669ca (the G4 head 3770fb2
+  # and a docs commit) into main f00cb36; its tree is 59669ca's, and its version document lists all ten features.
+  # Before it, the pushed heads of the integration branch feat/t5-train-b, moved after every engine merge: 3770fb2
+  # (the head G4 ran on: merge #4, P5b, the post-stage contract, the merge of engine main f00cb36 and the docs and
+  # D55 commits), 78af711 (merge #3, P5: projects, batch formats, the sample sheet, the training and tuning
   # engine), 82099b8 (merge #2 and the engine CI's move of its macOS job to macos-15, decision D54), fb6cf1a
   # (merge #2, P2c, labels from files), 361b082 (merge #1, P2b, single-plane images) and main's pin b90ebdf
   # ("Merge pull request #12", tranche-5 train A, merged).
-  ENGINE_COMMIT: 3770fb2f54a93e48ca13ac63380ebe45a19440b7
+  ENGINE_COMMIT: 3aa5244a9de1611bc7461bd2da2cf9f0d81a4037
   # the ten engine features of the Train B plan (section 9.3), required from the final engine head on and after the
   # engine pull request merges (section 5.4, items 2 and 3): a test gated on one of them fails instead of skipping
   # when the engine lacks it (tests/conftest.py, need_features); with all ten present it changes nothing
