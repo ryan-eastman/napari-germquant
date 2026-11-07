@@ -824,19 +824,33 @@ touched. With `QT_QPA_PLATFORM` unset on a desktop session, napari queries the r
 - `src/napari_germquant/napari.yaml`: the npe2 manifest (reader, six widgets).
 - `_engine.py`: the glue to `germquant.api`, no Qt: profiles, recipes (a profile, a config file or a pack
   recipe), role rows, stage rows, `RunPlan` (the one description a run has, executed by an engine runner and
-  spelled out as commands for the terminal), the system-pack feature gate.
+  spelled out as commands for the terminal), the system-pack feature gate and the one message for a missing
+  Train B feature.
 - `_runner.py`: where germquant runs, no Qt: `SubprocessRunner` (the engine interpreter, the torch-free
-  `python -m germquant.packs` entry for listing, checks and fetching, `python -m germquant run` for runs, each
-  engine process ended with everything it started on Cancel or when napari closes) and `InProcessRunner`, the
-  version check, interpreter suggestions, and the run logs.
+  `python -m germquant.packs`, `germquant.project` and `germquant.post_stages` entries, `python -m germquant ...`
+  for runs and the other commands, each engine process ended with everything it started on Cancel or when napari
+  closes) and `InProcessRunner`, with one method per engine command (projects, training, tuning, post-stages),
+  the run-log tail of `project run`, the exit codes and the features gate; the version check, interpreter
+  suggestions, and the run logs.
+- `_engine_session.py`: the one engine session per viewer that the Project dock, the Recipe tab, the Training
+  dock and the Spot tuning dock share (which engine, checked once; the recipe's own interpreter; the device; the
+  one message for a missing feature), no Qt.
 - `_packs.py`: an engine's pack listing and the pack card, no Qt.
-- `_settings.py`: the settings (QSettings): the engine interpreter and recipe interpreters (per computer), the
-  device and the last pack (per user).
+- `_settings.py`: the settings (QSettings): the engine interpreter, recipe interpreters and recent projects (per
+  computer), the device, the last pack and the spot-tuning annotator (per user).
 - `_engine_widgets.py`: the Engine box, the interpreter dialog and the System pack picker.
-- `_reader.py`: the reader and the single-time-point check.
-- `_results.py`: a results folder as layer tuples, no Qt.
-- `_training.py`: the training round without Qt (export, the pair list, the atomic save and
-  `corrections.json`, train with the device choice, register, the command lines).
+- `_reader.py`: the reader, the single-time-point check and the scale of a single plane.
+- `_results.py`: a results folder as layer tuples, no Qt (the run's own grid, single-plane results, the Points
+  size from the run).
+- `_project.py`: the Project dock's model, no Qt: the status board from the engine's status record and the run's
+  log, the header's words, what Save writes, the sample table.
+- `_recipe_widget.py`: the Project dock's Recipe tab (the role editor, the parameter form, the post-stages);
+  `_params.py`: what it shows and sends, no Qt.
+- `_tuning.py`: the Spot tuning dock's model, no Qt: the project's images with their runs and truth points, an
+  image opened on its run's grid, the truth-point files, the tuning runs.
+- `_training.py`: the training round without Qt (export, the pair list, the atomic save and `corrections.json`,
+  train with the device choice, register, the command lines; in a project, each run's geometry, the rounds, the
+  imports and the starting weights).
 - `_timelapse.py`: a series folder without Qt (the lazy label and reference stacks, raw or registered, the
   Tracks and Points data, the register_shifts summary, Register and Link with the commands' arguments).
 - `_run_widget.py`, `_results_widget.py`, `_training_widget.py`, `_timelapse_widget.py`, `_project_widget.py`,
@@ -846,6 +860,8 @@ touched. With `QT_QPA_PLATFORM` unset on a desktop session, napari queries the r
   status bar).
 - `constraints/`: the CPU-filtered constraints copy, the record of the workstation install and the CI pins.
 - `tests/fixtures/packs/test_pack`: the engine's test pack, copied (CI checks the copy).
+- `tests/_p6_*.py`: the helpers of the tranche 5 Train B tests (stand-in and fake engines, project and results
+  folders written as the engine writes them, the seams wrapper).
 - `.github/workflows/ci.yml`: the CI workflow. `docs/screenshots/`: the pictures in this README.
 
 ## License
