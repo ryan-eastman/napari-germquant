@@ -558,6 +558,81 @@ root.
    nuclei themselves. Flip back to raw to check a track against the labels it was linked from.
 6. For a full-resolution series, set **Labels xy stride** to 2 or 4 before scrolling through z.
 
+## First project: one study in the Project dock
+
+A project is a folder that holds one study: the pack version it was made with (copied into the project), the
+recipe and any edits to it, the images, a sample sheet, the models trained in it, every result and every run's
+log (the engine's `docs/PROJECTS.md` describes the folder). Every change to its recipe or manifest is an engine
+command, run in the engine's environment with this plugin's version recorded, so `germquant project run` in a
+terminal runs the same project the same way. You need an engine with projects (see Install).
+
+1. Plugins > germquant > Project. The engine line shows the engine chosen for this computer (the Run dock's
+   choice; Choose engine... when there is none).
+2. **New...**: pick the pack and the recipe (the list comes from the engine; Get models and Get example work as
+   in the Run dock), a name, a new or empty folder with a short path (results nest below it) and, if you like,
+   the first images. OK runs `germquant project new` and records this computer's device, runner and interpreter
+   in the project.
+3. **Images**: Add files..., Add folder... (the engine finds the images by the recipe's suffixes), or paste a
+   path or a glob and press Add path. Each goes through `germquant project add`; a refused path is named with the
+   engine's reason.
+4. **Samples** (optional): fill in the design columns where the file names do not carry them (the rows are
+   prefilled where the recipe's file-name rule matches), add columns of your own (strain, lane), then **Save
+   sheet**: samples.csv is written with the engine's own writer and recorded in the project; images whose row
+   changed turn stale.
+5. **Recipe** (optional): bind the channel roles on a reference image and check the preview for every image, then
+   Apply roles; change declared parameters, then Apply parameters; switch post-stages on, then Apply post-stages.
+   The header shows the new config_hash and "validated: false (edited)" after a recipe edit; a post-stage Apply
+   leaves both as they are.
+6. **Run**: untick the stages you do not want, set the xy stride (1 is the validated setting; 4 for a quick look)
+   and the device, then **Run all** (or select rows and Run selected; Rerun selected runs done images again). The
+   settings the tab shows are recorded in the project before the run starts. The board's rows follow the run;
+   Cancel ends the engine process, and the board says interrupted.
+7. Double-click a done row: its labels, spots and source image open as layers (an image with timepoints names its
+   folder for the Time-lapse dock). **Collect tables** writes the batch tables of the finished images under
+   `results/`; **Export commands...** writes the commands that run the project headless into a file you name (a
+   PowerShell script for a .ps1 file, the default on Windows, else an sh script).
+8. **Save** records the Run tab's settings and the sample sheet (when edited); **Close**. Later, **Open...** the
+   folder (or pick it in the list of this computer's recent projects): the dock reads the project and asks the
+   engine for its status, so an image whose inputs changed reads stale.
+9. To train a nucleus model on the project's runs, open Plugins > germquant > Training: it follows the open
+   project (rounds under `training/`, Import labels, Use in project, Derive pack; the Training dock above).
+10. To tune the spots, open Plugins > germquant > Spot tuning: click truth points on finished images, Save
+    points, Tune, read the top five, then Apply to the project (the Spot tuning dock above).
+
+In a terminal of the engine environment the same project runs with `germquant project run DIR`, and
+`germquant project status DIR` and `germquant project collect DIR` give the board and the tables.
+
+## Where each step runs
+
+The engine environment makes every number and every change to a project's recipe or manifest; napari's own
+process reads files and writes a few itself: samples.csv and truth points with the engine's own writers, the
+Training dock's corrected labels, and a model registration. "The engine" is the interpreter chosen for this
+computer (Choose engine...), or napari's own environment when you chose "in process"; a pack recipe can have its
+own interpreter on this computer (Recipe interpreter...), where its runs go. `<python> -m germquant ...` imports
+torch first; the `germquant.packs`, `germquant.project` and `germquant.post_stages` entries do not.
+
+| step | where it runs | how |
+|---|---|---|
+| pack list, check, Get models, Get example (a project's own packs included) | the engine | `<python> -m germquant.packs list`, `check`, `fetch-models`, `fetch-example` (`--project DIR`) |
+| project new, add, edit (Save, the Recipe tab's Apply, the Run tab's settings), use-model, rounds, unlock | the engine | `<python> -m germquant.project ...` with `--plugin-version`; the role and parameter previews are `project edit ... --dry-run --json`. In process: napari's own Python runs the same command in a child process |
+| Run selected, Run all, Rerun selected | the recipe's own interpreter, else the engine | `<python> -m germquant project run DIR [--images ID ...] [--no-resume] --device D --run-id ID --via gui-subprocess`; the dock reads the engine's log, `<project>/runs/<run_id>.jsonl`, as it grows. In process: `germquant.api.run_project(..., via="gui-inprocess")` |
+| the status board and the header's warnings | the recipe's own interpreter, else the engine | `project status DIR --json` |
+| Collect tables, Export commands | the engine | `project collect DIR --json`, `project export-commands DIR --shell SHELL --out FILE` (ps1 for a .ps1 file, else sh) |
+| post-stage list, Apply post-stages | the recipe's own interpreter, else the engine | `<python> -m germquant.post_stages list --json`, `write DIR --entries JSON --json` |
+| Save sheet | napari | germquant.io.sample_sheet.write_sample_sheet (ASCII, atomic), then `project edit --samples` |
+| Export slices, Import labels, Train (Training dock) | the engine (in a project, the recipe's own interpreter); with no engine chosen, napari, said in amber | `<python> -m germquant export-training`, `import-labels`, `train-nuclei` |
+| Save corrections, Register model (Training dock) | napari | the atomic label save and corrections.json; `register-model`'s function |
+| Use in project, Derive pack (Training dock) | the engine (with none chosen, napari's own Python in a child process) | `project use-model`, `<python> -m germquant.packs derive` |
+| Save points (Spot tuning dock) | napari | germquant.tune.points.write_points |
+| Tune (Spot tuning dock) | the recipe's own interpreter, else the engine | `<python> -m germquant tune-spots --project DIR --points annotations --max-runs N [--grid FILE] --json` |
+| Apply to the project (Spot tuning dock) | the engine | `tune-spots --project DIR --apply tuning/<run> --plugin-version V --json` |
+| reading manifests, headers, run logs, results, the sample sheet, pairs and truth points | napari | file reads in thread workers: the GUI thread never waits on the engine or a slow share |
+
+Every engine call and file read runs in a thread worker, never in napari's GUI thread, and a write or a reading
+that comes back after its project was closed (or another one opened) is not applied to the dock. An engine
+without a feature a step needs gets one message (projects, sample_sheet, import_labels, train_curve, pack_derive,
+tune_spots, post_stages) before any command starts.
+
 ## Headless, and why the numbers agree
 
 With the subprocess runner the dock runs `<python> -m germquant run IMAGE --pack ID@VERSION --recipe R --out
@@ -572,6 +647,14 @@ runtime (device asked for and used, torch, Python) in `run_manifest.json` and `<
 never enter a table, a hash or the completion marker. The exported overlay YAML is a different object: a profile
 hashes as text, so a run made with it has its own `config_hash` and the same numbers; the commands file says so.
 Identical numbers are claimed within one environment and one device; the run log says which ran.
+
+A project follows the same rule. Run all through the subprocess runner is `<python> -m germquant project run DIR
+--device D --run-id ID --via gui-subprocess` (with `--images ID ...` for a selection and `--no-resume` for a
+rerun), and through the in-process runner `germquant.api.run_project(project, ..., via="gui-inprocess",
+run_id=ID)`. The engine writes the run's log itself (`<project>/runs/<run_id>.jsonl`, whose `run_start` names the
+via and the run id), and the plugin writes no log of its own for a project run. Every change the docks make to a
+project is an engine command a terminal can repeat (`germquant project edit`, `use-model`, `tune-spots --apply`,
+`python -m germquant.post_stages write`), and Export commands writes the commands that run the project headless.
 
 ## Tests
 
