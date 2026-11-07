@@ -372,3 +372,18 @@ def test_the_engine_reads_a_plane_as_the_plugin_shows_it(qtbot, tmp_path):
     qtbot.addWidget(w)
     w.set_image(src)
     assert "\nsingle plane, voxel um dy=0.100 dx=0.100\n" in w.image_info.text()
+
+
+def test_a_z_range_run_opens_its_source_on_the_runs_planes(pack_env, tmp_path):
+    """A run made with a z range writes the labels of those planes only; the source opened with its results (the
+    Results dock, and the Project dock's double-click) is read on the same planes, so the two overlay (review
+    P6_package S3)."""
+    from conftest import TEST_IMAGE
+
+    out = tmp_path / "results" / "test_pack_synthetic"
+    api.run(TEST_IMAGE, pack="test_pack", recipe="basic", out=out, z_range=(4, 10), overrides={"spots.enabled": False})
+    rs = _results.ResultsSet(out, "test_pack_synthetic")
+    assert rs.done_marker()["z_range"] == [4, 10]
+    by = _by_kind(load_results_layers(rs, include_source=True))
+    assert [data.shape[0] for data, _kw in by["labels"]] == [6]
+    assert [data.shape[0] for data, _kw in by["image"]] == [6, 6]            # the two channels, planes 4 to 9

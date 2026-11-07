@@ -77,14 +77,16 @@ def check_single_timepoint(path: str | Path, meta: dict) -> None:
             f"file into one scene per image and open those.")
 
 
-def open_image(path: str | Path, xy_stride: int = 1, *, scale=None) -> list[LayerData]:
+def open_image(path: str | Path, xy_stride: int = 1, *, scale=None, z_range=None) -> list[LayerData]:
     """Header check, then the pixels through ``api.read_image``; ``xy_stride`` keeps every n-th pixel in
     y and x (and scales the layer accordingly), for a quick look at a 3 GB gonad on a laptop. ``scale``, a
-    grid of the caller's: see layers_from_stack."""
+    grid of the caller's: see layers_from_stack. ``z_range`` (z0, z1), the planes a run read (its done
+    marker's), so the source sits on that run's labels."""
     path = Path(path)
     meta = api.read_image_metadata(path)
     check_single_timepoint(path, meta)
-    stack = api.read_image(path, xy_stride=int(xy_stride))
+    kw = {"z_range": (int(z_range[0]), int(z_range[1]))} if z_range else {}
+    stack = api.read_image(path, xy_stride=int(xy_stride), **kw)
     return layers_from_stack(stack, path, meta, scale=scale)
 
 

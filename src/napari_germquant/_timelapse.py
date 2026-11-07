@@ -754,14 +754,22 @@ def link_summary(res: dict) -> str:
 
 
 def backend_choices() -> list[tuple[str, bool, str]]:
-    """(backend, usable here, what it is) for the Link backend list. Nothing is imported to find out."""
+    """(backend, usable here, what it is) for the Link backend list. Nothing is imported to find out. The
+    engine's flow-prior backend, laptrack_flow (germquant.timelapse.flowlink), comes last, listed only when the
+    engine has it; it links with laptrack, so it is usable where the laptrack row is."""
     acdc = importlib.util.find_spec("cellacdc") is not None
     lap = importlib.util.find_spec("laptrack") is not None
-    return [
+    install_lap = ("laptrack is not installed in this environment: uv pip install laptrack==0.17.1 (the engine's "
+                   "timelapse extra)")
+    rows = [
         ("overlap", True, "Cell-ACDC's overlap tracker, headless" if acdc else
          "Cell-ACDC is not installed here: the engine runs its in-house overlap rule instead and says so"),
         ("overlap_inhouse", True, "the same majority-overlap rule in NumPy"),
-        ("laptrack", lap, "LAP linking of the registered centroids with gap closing" if lap else
-         "laptrack is not installed in this environment: uv pip install laptrack==0.17.1 (the engine's timelapse extra)"),
+        ("laptrack", lap, "LAP linking of the registered centroids with gap closing" if lap else install_lap),
         ("none", True, "no linking: the points table only, every nucleus-timepoint without a track"),
     ]
+    if "laptrack_flow" in BACKENDS:
+        rows.append(("laptrack_flow", lap, "the laptrack linking with every nucleus matched at the position the "
+                     "motion of its neighbours predicts for it (a flow prior; the series config's "
+                     "timelapse.track.flow_* keys, else their code defaults)" if lap else install_lap))
+    return rows
