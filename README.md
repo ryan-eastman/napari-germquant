@@ -613,7 +613,7 @@ torch first; the `germquant.packs`, `germquant.project` and `germquant.post_stag
 
 | step | where it runs | how |
 |---|---|---|
-| pack list, check, Get models, Get example (a project's own packs included) | the engine | `<python> -m germquant.packs list`, `check`, `fetch-models`, `fetch-example` (`--project DIR`) |
+| pack list, check, Get models, Get example | the engine | `<python> -m germquant.packs list`, `check`, `fetch-models`, `fetch-example`; for a project's own packs, list, check and fetch-models with `--project DIR` |
 | project new, add, edit (Save, the Recipe tab's Apply, the Run tab's settings), use-model, rounds, unlock | the engine | `<python> -m germquant.project ...` with `--plugin-version`; the role and parameter previews are `project edit ... --dry-run --json`. In process: napari's own Python runs the same command in a child process |
 | Run selected, Run all, Rerun selected | the recipe's own interpreter, else the engine | `<python> -m germquant project run DIR [--images ID ...] [--no-resume] --device D --run-id ID --via gui-subprocess`; the dock reads the engine's log, `<project>/runs/<run_id>.jsonl`, as it grows. In process: `germquant.api.run_project(..., via="gui-inprocess")` |
 | the status board and the header's warnings | the recipe's own interpreter, else the engine | `project status DIR --json` |
