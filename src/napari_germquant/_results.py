@@ -367,10 +367,14 @@ def load_results_layers(rs: ResultsSet, *, include_source: bool = False) -> list
             from ._reader import open_image
 
             done = rs.done_marker()
-            stride = int((done if isinstance(done, dict) else {}).get("xy_stride", 1) or 1)
+            marker = done if isinstance(done, dict) else {}
+            stride = int(marker.get("xy_stride", 1) or 1)
+            zr = marker.get("z_range")
+            z_range = (int(zr[0]), int(zr[1])) if isinstance(zr, (list, tuple)) and len(zr) == 2 else None
             # on the run's own grid, so its labels and points overlay the source whatever pixel size the
-            # reader finds (1 um for a plane run without io.planar, the override with io.voxel_size_um)
-            layers += open_image(src, xy_stride=stride, scale=spacing)
+            # reader finds (1 um for a plane run without io.planar, the override with io.voxel_size_um), and
+            # on its planes (a run made with a z range: the source starts at its first plane, as the labels do)
+            layers += open_image(src, xy_stride=stride, scale=spacing, z_range=z_range)
     _singular, plural = object_words(rs.object_kind())
     for suffix, table, id_col, name in (
         ("nuclei_labels.tif", "nuclei", "nucleus_id", plural),      # "<id> cells" when one row is a cell
