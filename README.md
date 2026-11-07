@@ -719,6 +719,30 @@ menu route, which hands it a proxy of the viewer. Two more tests are data depend
 header of a local `.nd2` copy and skips when it is absent; `nas` reads the header of the live GFP::SYP-2
 series on the lab NAS (56 GB, header only, T=25 refused) and runs only with `NAPARI_GERMQUANT_NAS_TEST=1`.
 
+The tranche 5 Train B tests (346 tests in all at 0.2.0.dev1, with the ones above): the runners' new commands
+(`tests/test_runner_commands.py`: the command line of every engine command, the plugin version on every project
+write, refusals and failures as each command answers them, both runners writing the same project files and
+listing and writing post-stages alike) and the engine session the project docks share
+(`tests/test_engine_session.py`); the Project dock (`tests/test_project.py`, `tests/test_project_dock.py`: New,
+Save and Open keeping the manifest, the board equal to `germquant project status`, Run all through both runners
+writing what `germquant project run` writes, the codeless round from the test pack, the board following a run's
+log, Cancel, the lock, the sample sheet); the Recipe tab (`tests/test_role_editor.py`, `tests/test_params.py`,
+`tests/test_recipe_tab.py`: the role preview from the engine's dry run, ASCII maps, a channel name outside ASCII
+that round-trips, collisions and unbound roles keeping Apply off, only declared tunables, an undeclared key
+refused, Reset back to the pack's hash, a post-stage switched on keeping config_hash and matching a headless
+run); the Training dock's project mode (`tests/test_training.py`, `tests/test_training_project.py`: Cell-ACDC and
+Cellpose imports, proj pairs of a projected run, training through the engine with its seams replaced, Use in
+project, Derive pack); the Spot tuning dock (`tests/test_tuning.py`, `tests/test_tuning_dock.py`: truth points
+saved on the run's grid, a real LoG tune of the test pack's example, the top five, Apply); the 2D display
+(`tests/test_display_2d.py`: a single-plane run's layers at (1.0, dy, dx), its spots image's z axis, the Points
+size from the run, the reader's single plane, the header line, a z-range run's source on the run's planes); and
+the Time-lapse dock's laptrack_flow row (`tests/test_timelapse_backend_rows.py`). A test that needs an engine
+feature skips and names it when the engine lacks it (`need_features` in `tests/conftest.py`), and fails instead
+when `NAPARI_GERMQUANT_REQUIRE_FEATURES` lists the feature (the CI lists all ten). Engine commands that train run
+in a child process whose engine seams a wrapper interpreter replaces (`NAPARI_GERMQUANT_SEAMS`,
+`tests/_p6_runner.py`), so no real Cellpose training runs; spot tuning runs for real with the LoG backend, so no
+SpotMAX is needed.
+
 Every test has its own settings file (`NAPARI_GERMQUANT_SETTINGS`), so no test reads or changes the engine
 stored on this computer, and the pack tests keep every pack folder and store private (`$GERMQUANT_PACKS` set to
 `tests/fixtures/packs`, an empty `$GERMQUANT_MODELS` in a short folder of the system temporary folder, so a
@@ -738,16 +762,18 @@ The subprocess runner tests use this Python as the engine interpreter and pass t
 
 ### Continuous integration
 
-`.github/workflows/ci.yml` runs ruff and the whole suite on ubuntu-latest, windows-latest and macos-15 (Apple
+`.github/workflows/ci.yml` runs ruff and the whole suite on ubuntu-24.04, windows-latest and macos-15 (Apple
 Silicon) with Python 3.11, with `QT_QPA_PLATFORM=offscreen` on Linux and Windows and Qt's native `cocoa` platform
-on macOS. It checks the engine out from its public repository
-at a pinned commit (the head of the engine's integration branch while a train is open, then the engine's main
-commit once the engine pull request has merged, and only then does the plugin pull request merge), installs it
-editable with the readers extra, compares the test pack copy's SHA256SUMS with the engine checkout's and
-verifies every file of the copy against it. Pins: the engine checkout's constraints files plus
-`constraints/ci-plugin-2026-10.txt` (napari, PyQt6, pytest-qt at the workstation's versions, and the bioio
-plugins of the readers extra; their native libraries are left to the resolver, and each job prints what it
-installed).
+on macOS. It checks the engine out from its public repository at a pinned commit (the head of the engine's
+integration branch while a train is open, then the engine's main commit once the engine pull request has merged,
+and only then does the plugin pull request merge; now engine main 3aa5244, the merge commit of the tranche 5
+Train B engine pull request), installs it editable with the readers extra, compares the test pack copy's
+SHA256SUMS with the engine checkout's and verifies every file of the copy against it.
+`NAPARI_GERMQUANT_REQUIRE_FEATURES` names the ten features of that engine (packs, planar, labels_from, projects,
+sample_sheet, import_labels, train_curve, pack_derive, tune_spots, post_stages), so a test that needs one of them
+fails instead of skipping. Pins: the engine checkout's constraints files plus `constraints/ci-plugin-2026-10.txt`
+(napari, PyQt6, pytest-qt at the workstation's versions, and the bioio plugins of the readers extra; their native
+libraries are left to the resolver, and each job prints what it installed).
 
 The macOS runner. The macOS job ran on macos-14 until 2026-10-30. GitHub retires the macOS 14 images on
 2026-11-02 (actions/runner-images issue 13518), and that image's scheduled brownouts cancelled the job before it
@@ -755,6 +781,15 @@ started (run 41101457726, all three attempts), so the job moved to macos-15: the
 runner one macOS release newer, with the same engine constraints file (`ci-mac-arm64-2026-10.txt`), the same
 `cocoa` platform and the same 15-minute budget. The workflow names macos-15 rather than macos-latest, which GitHub
 moves to each new macOS release (it is macOS 26 now).
+
+The Linux runner. The Linux job ran on ubuntu-latest until 2026-11-07. GitHub is moving that label to Ubuntu
+26.04 (from 2026-10-19 to 2026-11-19, actions/runner-images issue 14748), and on the new image (ubuntu-26.04
+20261101.186.1, run 42387359684) 16 tests that run the engine, 7 of them main's own, failed in matplotlib
+("FT_Render_Glyph ... failed with error 0x62: raster overflow") while the engine drew the text of its montage;
+the same tests passed on windows-latest and macos-15 in that run, and they pass on ubuntu-24.04 with the same
+matplotlib (run 42393186029). So the job runs on ubuntu-24.04, a label that names its version as macos-15 does,
+until the engine's montage text works on the new image; then it goes back to ubuntu-latest (follow-up FU22 of the
+engine's Train B plan).
 
 Time. Gate G1 gives a job 15 minutes, and each change records what it adds; `timeout-minutes` is 20, so a job
 over budget fails instead of running on. A Linux replica of the ubuntu job (WSL Ubuntu 24.04, plugin bfab387,
@@ -767,6 +802,12 @@ and 3.2 min on macos-14, of which the Test step took 2.2, 4.0 and 2.7 min. The m
 platform instead of offscreen (offscreen has no OpenGL context on macOS, and napari's viewer teardown makes an
 OpenGL call), and torch there offers the Apple GPU, so the tests expect the device the engine picks (mps on that
 runner, cpu on the others).
+
+With the tranche 5 Train B docks the suite has 346 tests. Run 42393186029 (2026-11-07, plugin f6ae908, engine
+main 3aa5244 with the ten features required) took 7.5 min on ubuntu-24.04, 9.7 min on windows-latest and 11.0 min
+on macos-15, of which the Test step took 6.9, 8.1 and 10.3 min (pytest 404, 469 and 602 s): every job is inside
+G1's 15 minutes. On the Windows workstation the whole suite takes about 7 minutes (420 s at f6ae908, with the
+same engine and the ten features required).
 
 On 2026-10-10 both new docks were also driven headless on a scratch copy of the first four timepoints of the
 live GFP::SYP-2 series (xy stride 2, 76 x 1360 x 1360 labels per timepoint; two runs): opening took 1.5 to
