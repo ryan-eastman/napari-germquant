@@ -33,6 +33,15 @@
 # PyPI's arm64 torch, Qt's cocoa platform and the 15-minute budget. Not macos-latest: GitHub moves that label to
 # each new macOS release (it is macOS 26 now), while a pinned label changes only by a commit like this one.
 #
+# The Linux runner: ubuntu-24.04, GitHub's image of Ubuntu 24.04. The job ran on ubuntu-latest until 2026-11-07:
+# GitHub is moving that label to Ubuntu 26.04 (from 2026-10-19 to 2026-11-19, actions/runner-images issue 14748).
+# Run 42387359684 got the new image (ubuntu-26.04 20261101.186.1), and there 16 tests that run the engine, 7 of
+# them main's own, failed in matplotlib ("FT_Render_Glyph ... failed with error 0x62: raster overflow") while the
+# engine drew the text of its montage. The same run's windows-latest and macos-15 jobs passed all 16, and the 15
+# of them that ran before passed on ubuntu-24.04 with the same matplotlib (run 41176750051). As macos-15 does, the
+# label names its version, so the image changes only by a commit like this one. The job goes back to ubuntu-latest
+# once the engine's montage text is fixed on the new image (follow-up FU22 of the Train B plan).
+#
 # Qt: QT_QPA_PLATFORM=offscreen on Linux and Windows. tests/conftest.py answers napari's two OpenGL queries with
 # constants under offscreen, so nothing is rendered and no GPU is touched (none of these runners has one).
 # macOS uses Qt's native cocoa platform instead: under offscreen there is no OpenGL context on macOS, and
@@ -80,7 +89,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             engine_constraints: constraints/ci-cpu-2026-10.txt
             qt_platform: offscreen
           - os: windows-latest
