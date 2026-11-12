@@ -55,7 +55,7 @@ from . import _engine, _packs, _settings
 from ._engine import Recipe, RunPlan
 from ._engine_widgets import EngineBox, InterpreterDialog, PackPicker
 from ._qt_common import LogBridge, WorkerRunner, add_layer_tuples, format_exception, set_viewer_status
-from ._reader import image_info, open_image
+from ._reader import header_spacing_text, image_info, open_image
 from ._results import ResultsSet, load_results_layers, summary_text
 from ._runner import (
     EngineRunner,
@@ -1101,10 +1101,8 @@ class RunWidget(QWidget):
         self._meta = meta
         self._channel_names = [str(n) for n in meta.get("channel_names", [])]
         sizes = meta.get("sizes", {})
-        dz, dy, dx = meta.get("spacing", (1, 1, 1))
         size_text = " ".join(f"{k}={v}" for k, v in sizes.items())
-        spacing_text = f"voxel um dz={dz:.3f} dy={dy:.3f} dx={dx:.3f}" if meta.get("spacing_ok", True) \
-            else "voxel size UNREADABLE (1 um assumed)"
+        spacing_text = header_spacing_text(meta)      # "single plane, voxel um dy=.. dx=.." for one plane
         extra = ""
         n_t = int(sizes.get("T", 1) or 1)
         n_p = max(int(sizes.get("P", 1) or 1), int(meta.get("n_scenes", 1) or 1))

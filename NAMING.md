@@ -10,10 +10,10 @@ plugin name with a hyphen (`napari-germquant`) and the Python import name with a
 |---|---|
 | `pyproject.toml` | `name = "napari-germquant"` under `[project]` (THE name) |
 | `pyproject.toml` | the key of the `[project.entry-points."napari.manifest"]` entry |
-| `src/napari_germquant/napari.yaml` | `name:` and the prefix of every command `id:` (npe2 requires the prefix to equal `name`) |
+| `src/napari_germquant/napari.yaml` | `name:` and the prefix of every command `id:` (npe2 requires the prefix to equal `name`), the docks' `napari-germquant.project_widget` (Project) and `napari-germquant.tuning_widget` (Spot tuning) among them |
 | `src/napari_germquant/__init__.py` | `metadata.version("napari-germquant")` |
 | `tests/test_manifest.py`, `tests/test_reader.py`, `tests/test_training.py`, `tests/test_timelapse.py` | the plugin name passed to `viewer.open(..., plugin=...)`, `get_manifest(...)` and `viewer.window.add_plugin_dock_widget(...)` |
-| `src/napari_germquant/_engine.py`, `_reader.py`, `_training.py` | text in the exported YAML and commands headers, in user-facing messages and in the note of the `corrections.json` a training folder gets |
+| `src/napari_germquant/_engine.py`, `_reader.py`, `_training.py`, `_project.py` | text in the exported YAML and commands headers, in user-facing messages (`_project.py`: "update napari-germquant" for a project manifest of a newer format) and in the note of the `corrections.json` a training folder gets |
 | `src/napari_germquant/_settings.py` | `ORG` and `APP`: the QSettings names the engine interpreter is stored under (renaming forgets the stored choice; the dock then asks again) |
 | `src/napari_germquant/_runner.py` | `user_runs_dir()`: the per-user folder for run logs that cannot sit next to their output folder |
 | `README.md`, `NAMING.md`, `LICENSE` | prose |
@@ -32,10 +32,16 @@ The manifest's `display_name: germquant` is what the napari menus show; it can s
 | `src/napari_germquant/_results.py` | the `napari_germquant_results` metadata key on every layer the results loader adds |
 | `src/napari_germquant/_training_widget.py` | `META_KEY = "napari_germquant_training"`: the metadata key on the two layers the Training dock shows |
 | `src/napari_germquant/_timelapse.py` | `META_KEY = "napari_germquant_timelapse"`: the metadata key on every layer the Time-lapse dock adds |
-| `src/napari_germquant/_runner.py`, `_qt_common.py` | the logger `napari_germquant.engine` that carries an engine subprocess's lines to the status bar |
+| `src/napari_germquant/_tuning.py` | `LAYER_KEY = "napari_germquant_tuning"`: the metadata key on the truth-point layers the Spot tuning dock adds |
+| `src/napari_germquant/_runner.py`, `_qt_common.py`, `_run_widget.py`, `_training_widget.py`, `_project_widget.py` | the logger `napari_germquant.engine` that carries an engine subprocess's lines to the status bar (`_qt_common.py` listens to `napari_germquant`, its parent) |
+| `src/napari_germquant/_recipe_widget.py` | the logger `napari_germquant.recipe` (the Recipe tab's lines), and the module name `napari_germquant._project` it looks up in `sys.modules` (whether a Project dock of this napari runs the project) |
+| `src/napari_germquant/_project_widget.py` | `EXTRA_TABS`: `napari_germquant._recipe_widget:RecipeProjectTab`, the module path of the Recipe tab the Project dock imports |
+| `src/napari_germquant/_runner.py` | `napari_germquant`, the key of this plugin's version in the `plugin` record of `run_start` in a Run dock run log (logs written before a rename keep the old key) |
 | `src/napari_germquant/_settings.py`, `tests/conftest.py` | the environment variable `NAPARI_GERMQUANT_SETTINGS` (a private settings file) |
 | `tests/*.py` | `from napari_germquant import ...` |
 | `tests/conftest.py`, `tests/test_reader.py` | the opt-in environment variable `NAPARI_GERMQUANT_NAS_TEST` |
+| `tests/conftest.py` | the environment variable `NAPARI_GERMQUANT_REQUIRE_FEATURES` (`REQUIRE_FEATURES_ENV`): the engine features whose gated tests fail instead of skipping |
+| `tests/_p6_runner.py` | the environment variable `NAPARI_GERMQUANT_SEAMS` (`SEAMS_ENV`): the engine seams (JSON, `module.attr` to `module:attr`) the tests' wrapper interpreter replaces before it runs an engine command |
 
 ## Renaming
 

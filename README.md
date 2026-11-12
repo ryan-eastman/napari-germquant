@@ -10,9 +10,16 @@ started in a terminal with the same settings write the same files.
 `tests/test_run_widget.py::test_gui_run_writes_the_same_files_as_the_cli` proves that through both runners, on a
 synthetic gonad with a config file and on the engine's test pack with `--pack`: same file list, every table
 cell-identical (the run_timestamp column aside), same completion marker (every key but `finished`, the time it
-was written). The training and time-lapse steps follow the same rule: each button calls the Python function its
-command calls (`export-training`, `train-nuclei`, `register-model`, `register`, `track-link`) with the arguments
-the command would pass, and the tests check those arguments against the command line.
+was written). A project (one study in one folder: its pack recipe and any edits to it, the images, a sample
+sheet, the models trained in it, every result and every run's log) follows the same rule: the Project dock runs
+it with `germquant project run` (or, in process, `germquant.api.run_project`), every change it makes to the
+recipe or the manifest is an engine command (`germquant project new`, `add`, `edit`, `use-model`, ...), and
+`tests/test_project_dock.py::test_run_all_writes_the_same_files_as_project_run` finds the same files after the
+dock's Run all and a terminal `germquant project run`, through both runners. The time-lapse steps call the Python
+function their command calls (`register`, `track-link`) with the arguments the command would pass; the Training
+dock runs `export-training`, `import-labels` and `train-nuclei` as commands of the engine's environment when an
+engine is chosen for this computer, and otherwise calls their Python functions inside napari (and says so);
+`register-model` is always its Python function. The tests check those arguments against the command line.
 
 `napari-germquant` is a working name (see `NAMING.md` for the one-step rename). This is the scaffold of the
 plugin described in the engine's `docs/PROPOSAL_general_modular_tool.md` (sections 5, 11 and 12); the engine
@@ -38,8 +45,13 @@ image canvas, so the docks are shown without it.
   readers extra) adds one Image layer per channel, scaled in microns from the file's voxel size, with the file
   path and channel index kept in the layer's metadata. A time-lapse, multi-position or multi-scene file is
   refused before any pixel is read, with a message that says why (the engine would otherwise silently measure
-  time point 0). For a time-lapse the message gives the `germquant run ... --t all` command that runs the
-  series and points to the Time-lapse dock, which opens the folder that command writes.
+  time point 0). For a time-lapse the message gives the `germquant run ... --t all` command that runs the series
+  and points to the Time-lapse dock, which opens the folder that command writes. A file of one plane that states
+  its pixel size but has no z step (an OME-TIFF of one plane, say) opens at (1.0, dy, dx) microns, the grid of
+  the engine's single-plane runs, without the "voxel size unreadable" warning (with a germquant that reads
+  single-plane images, tranche 5 Train B). A run of it whose recipe leaves io.planar off still measures it at
+  1 um per pixel with the voxel:UNREADABLE flag, so that run's layers do not sit on the image opened from the
+  file; a single-plane recipe (io.planar auto or true, such as the engine's generic_2d profile) lines up.
 - **Engine** (the top box of the Run dock): which Python environment runs germquant on this computer, and on
   which device. Pack lists, pack checks, Get models, Get example and every run go to that environment, so the
   numbers are made where the models, Cellpose and SpotMAX are installed. With no environment chosen yet, Run asks
@@ -63,19 +75,25 @@ image canvas, so the docks are shown without it.
   installed). Until you pick a pack, the picker shows the one you picked last, else the C. elegans germline
   pack; only a pack you pick yourself is remembered.
 - **Run dock**, below the pack: image file (Browse, or the selected layer), a header read (sizes, voxel size,
-  channel names), a channel-roles table resolved with the engine's own channel-map rules (red: a required role
-  with no channel; amber: a role bound by position because no name matched), one checkbox per stage that has a
-  `--no-<stage>` switch (greyed when the recipe has it off or the image lacks a channel role it needs), the xy
-  stride, the output folder, **Run** (in a napari thread worker, progress in the status bar), **Cancel** (ends a
-  run in the engine environment: the engine process and every process it started) and **Export profile**. **Advanced: profile or config file** holds the profile list of the engine checkout's
-  `config/profiles/*.yaml` and the config-file picker, as before packs; tick it to run a profile instead of a
-  pack. The benchmark profiles (`bench_*`) are hidden there unless "show all" is ticked.
+  channel names; "single plane, voxel um dy=.. dx=.." for a file of one plane), a channel-roles table resolved
+  with the engine's own channel-map rules (red: a required role with no channel; amber: a role bound by position
+  because no name matched), one checkbox per stage that has a `--no-<stage>` switch (greyed when the recipe has
+  it off or the image lacks a channel role it needs), the xy stride, the output folder, **Run** (in a napari
+  thread worker, progress in the status bar), **Cancel** (ends a run in the engine environment: the engine
+  process and every process it started) and **Export profile**. **Advanced: profile or config file** holds the
+  profile list of the engine checkout's `config/profiles/*.yaml` and the config-file picker, as before packs;
+  tick it to run a profile instead of a pack. The benchmark profiles (`bench_*`) are hidden there unless "show
+  all" is ticked.
 - **Results as layers.** When a run finishes, or from the **Results dock** (Plugins > germquant > Results) on
   any folder germquant wrote: the nucleus labels as a Labels layer with the nuclei table as its features (hover
   a nucleus: its row shows in the status bar), granule and envelope labels when present, the spots as a Points
   layer in microns with the spots table as features (and one Points layer per extra spot instance, such as the
   53BP1 foci of the cultured cells pack), the spots blob image hidden, and on request the source image at the
-  stride the run used. A batch root lists the images one folder level down. For a pack run the Labels layer is
+  stride the run used and on its z range, placed on the run's own grid, so the labels and the spots overlay it.
+  The Points size is the run's spot size: 2 x spots.spot_radius_um for spotmax, spots.log.diameter_um for LoG, an
+  instance's own for `spots_<name>`, and 0.6 um when no run config is found (a batch image folder takes the batch
+  root's run_manifest.json). Single-plane results (voxel_dz_um NaN) show at (1.0, dy, dx) microns, their YX spots
+  image with a z axis. A batch root lists the images one folder level down. For a pack run the Labels layer is
   named `<image> cells` or `<image> nuclei` after the pack's object kind, and the Results dock shows a summary
   line (for example "11 cells, 8 spots, mean spots per cell 0.73"), a **Provenance** box (pack id and version,
   recipe, config_hash, model sha256, git sha and the device used) and a red banner when the labels were made by
@@ -98,13 +116,29 @@ image canvas, so the docks are shown without it.
   the engine's (same version and git sha; `config_hash_source` says which); `image_done` always carries the run's
   own, from its completion marker. When that folder cannot be written, or would be the output folder itself (an
   output folder named `runs`, or a drive root), the log goes to the per-user folder
-  (`%LOCALAPPDATA%\napari-germquant\runs` on Windows) and `run_start` says so.
+  (`%LOCALAPPDATA%\napari-germquant\runs` on Windows) and `run_start` says so. These logs are a record: nothing
+  reads them back yet. A project's runs are logged by the engine itself (`<project>/runs/<run_id>.jsonl`), which
+  the Project dock reads while the run goes.
 - **Training dock** (Plugins > germquant > Training). The nucleus training round of the engine's
-  `docs/TIMELAPSE.md` ("Segmenting without DAPI: the training loop") in four steps:
+  `docs/TIMELAPSE.md` ("Segmenting without DAPI: the training loop") in four steps, and a fifth in a project.
+  With an engine chosen for this computer, Export, Import labels and Train run as commands of that environment
+  (`python -m germquant export-training`, `import-labels`, `train-nuclei`), with the devices it offers (auto
+  first) and Cancel; in a project whose recipe has its own interpreter on this computer they run in that one.
+  With no engine chosen the dock computes in napari's environment, as before, and says so in amber. Correcting
+  and registering always happen in napari. With a project open (the Project dock's, or one opened here) the
+  folders follow it: the source is `<project>/results/`, the training folder a round,
+  `<project>/training/<round>/`, picked in the round list (New round asks the engine for the next one: r01, r02,
+  ...).
   1. **Export slices.** A results folder, a time-lapse series folder or a batch tree goes through
-     `germquant export-training` (its Python function, in a thread worker) into a training folder of `image/`
-     and `labels/` slice pairs with a `manifest.csv`. Orientations, slices per image, seed, minimum nuclei
-     per slice and the size cap are the command's options, with its defaults.
+     `germquant export-training` (in a thread worker) into a training folder of `image/` and `labels/` slice
+     pairs with a `manifest.csv`. Orientations, slices per image, seed, minimum nuclei per slice and the size cap
+     are the command's options, with its defaults. With every orientation box ticked the export passes
+     `--orientations auto` (with a tranche 5 Train B engine): the xy, xz and yz slices of a 3D run, one proj pair
+     of a projected run (the 2D image its segmenter saw), the plane of a single-plane run; the dock shows what
+     each run gives. **Import labels** (in a project) makes pairs of a project image from labels made elsewhere
+     instead: `germquant import-labels SRC --format F --image IMG --pairs DIR`, the format from the file name
+     (TIFF, PNG, a Cell-ACDC segm.npz, or a Cellpose _seg.npy, which only "Allow pickle" lets through: loading a
+     pickle can run code), with the engine's refusals and warnings shown.
   2. **Correct.** One pair at a time, as an Image layer and an editable Labels layer at the slice's pixel
      size. Previous and Next walk the list `train-nuclei` will read (the manifest rows whose two files
      exist). Leaving a slice with unsaved edits asks whether to save, discard or stay; Revert reloads the
@@ -116,22 +150,30 @@ image canvas, so the docks are shown without it.
      sha256. The dock counts the corrected pairs, and before an export into a folder that holds corrected
      slices of the images it would redo it asks first: an export replaces the manifest rows of every image
      it exports and overwrites the slices it draws again.
-  3. **Train.** `germquant train-nuclei` in a thread worker: model folder, model name, starting weights
-     (`cpsam`, `none` for a random start, a registered model name or a model file), epochs, hold out by
-     series or by image, hold-out fraction, split seed, and the device: cuda, mps or cpu. cpu is the
-     command's `--cpu`; cuda and mps set `GERMQUANT_DEVICE`, the variable the engine reads, for the duration
-     of the call (it is process-wide, so a Run started meanwhile sees it too). A device the computer does not
-     have falls back the way the engine always does (the next accelerator, then the CPU) and the summary says
-     which device actually trained. The elapsed time and Cellpose's epoch lines (epoch, train loss, test
-     loss) go to the status bar; the viewer stays usable, and saving corrections is paused while a model
-     trains, because the model card records the sha256 of every pair when training ends. Before it starts,
-     the dock says how many pairs were corrected and warns when every pair comes from one series (then
-     nothing can be held out). The summary gives the split, the hold-out F1, precision, recall and miss rate
-     overall, per orientation and per zone, the design gate from `docs/TIMELAPSE.md`, the model and card
-     paths, and the command line that does the same.
+  3. **Train.** `germquant train-nuclei` in a thread worker: model folder, model name, starting weights (`cpsam`,
+     `none` for a random start, a registered model name or a model file; in a project also the models the
+     project's pack recipe needs and the models trained in the project), epochs, hold out by series or by image,
+     hold-out fraction, split seed, the device (cuda, mps or cpu; with an engine, the devices it offers) and the
+     model card's Object kind, System and Dataset (`--kind`, `--system`, `--dataset` of a Train B engine; a
+     project sets its pack's object kind). cpu is the command's `--cpu`; cuda and mps set `GERMQUANT_DEVICE`, the
+     variable the engine reads, for the duration of the call (in napari's own environment it is process-wide, so
+     a Run started meanwhile sees it too; an engine command gets it alone). A device the computer does not have
+     falls back the way the engine always does (the next accelerator, then the CPU) and the summary says which
+     device actually trained. The elapsed time and Cellpose's epoch lines (epoch, train loss, test loss) go to
+     the status bar; the viewer stays usable, and saving corrections is paused while a model trains, because the
+     model card records the sha256 of every pair when training ends. Before it starts, the dock says how many
+     pairs were corrected and warns when every pair comes from one series (then nothing can be held out). The
+     summary gives the split, the hold-out F1, precision, recall and miss rate overall, per orientation and per
+     zone, the design gate from `docs/TIMELAPSE.md`, the model and card paths, and the command line that does the
+     same.
   4. **Register model.** `germquant register-model` (model file, card and name are filled in after Train)
      adds the model to `local_models.json` next to the release models; a profile then names it in
      `segmentation.nuclei.cellpose_model`.
+  5. **Use in project** (in a project): `germquant project use-model DIR --model
+     training/<round>/models/<name>/<file>`; the project's recipe then names the model, its config_hash changes
+     and it reads validated: false. **Derive pack** promotes the model into a pack of its own in the project's
+     `packs/` (`python -m germquant.packs derive`), which the project's pack listing then shows. Use in project
+     waits while a run of the project goes.
 - **Time-lapse dock** (Plugins > germquant > Time-lapse). A finished series folder (the `--out` of
   `germquant run SERIES.nd2 --t ...`), read with the engine's own `timelapse.layout`, so the dock sees the
   timepoints the tracking commands see:
@@ -153,35 +195,90 @@ image canvas, so the docks are shown without it.
     shift, capped steps, nearest-neighbour quality before and after, the brightfield cross-check) show in the
     dock;
   - **Link**: `germquant track-link` in a thread worker with the chosen backend (overlap, overlap_inhouse,
-    laptrack or none). The backend parameters come from the series' `run_manifest.json` or the engine's code
-    defaults, exactly as on the command line, and the layers are rebuilt from what it wrote. A backend this
-    environment cannot run is greyed: laptrack is not installed in the plugin environment (see Install), and
-    overlap falls back to the engine's in-house overlap rule when Cell-ACDC is missing (the link record and
-    the summary say so).
+    laptrack or none, and laptrack_flow where the engine has it: laptrack's linking with each nucleus matched
+    where the motion of its neighbours predicts it, with the series config's timelapse.track.flow_* keys or their
+    code defaults; the dock adds no flow control). The backend parameters come from the series'
+    `run_manifest.json` or the engine's code defaults, exactly as on the command line, and the layers are rebuilt
+    from what it wrote. A backend this environment cannot run is greyed: laptrack and laptrack_flow need
+    laptrack, which is not installed in the plugin environment (see Install), and overlap falls back to the
+    engine's in-house overlap rule when Cell-ACDC is missing (the link record and the summary say so).
+- **Project dock** (Plugins > germquant > Project). One study as a folder: the pack version (copied into the
+  project), the recipe and any edits to it, the images, a sample sheet, the models trained in it, every result
+  and every run's log (see "First project" below). The header shows the project's name and folder, the engine
+  line (the engine chosen for this computer, which the Recipe tab, the Training dock and the Spot tuning dock
+  share), the pack id@version and recipe, the config_hash, the badge ("validated: false (edited)", "not validated
+  (provisional pack)" or "validated (record ...)"), the warnings of the engine's status (a hash that differs from
+  the one the project was saved with, the project's copy of its pack missing, a model digest mismatch, an
+  environment mix), what the project records differently from this computer, and a held lock (Remove stale lock
+  for one older than 12 h); with New..., Open..., the list of this computer's recent projects, Save and Close.
+  The **Images** tab: id, path, size, the header summary ("single plane" for a file of one plane) and exclusion;
+  Add files..., Add folder... and Add path (a pasted NAS path kept as it is), each through
+  `germquant project add`, a refusal named per path with the engine's reason; an image that cannot be reached is
+  amber and never blocks the dock. The **Samples** tab: one row per image with the design columns (genotype, sex,
+  germ_cell, treatment, replicate, acquisition_date), prefilled from the file name where the recipe's rule
+  matches, plus any column you add; Save sheet. The **Run** tab: the stage switches (untick = `--no-<stage>`),
+  the xy stride, the device, the recipe's own interpreter, Run selected, Run all, Rerun selected, Cancel, Collect
+  tables, Export commands... and the project's runs. The **status board**: one row per image, done, stale (with
+  the reason), failed (with the error) or missing, with qc_pass, the nuclei or cells and the spots of its
+  results, the last run and the device used; during a run the rows follow the run's own log, and a double-click
+  opens an image's results as layers with its source image. Every recipe and sample edit is off while a run of
+  the project goes.
+- **Recipe tab** of the Project dock. **Channel roles**: one combo per role of the pack recipe's channel map,
+  listing the channels of a reference image, and below it how each role binds on every image of the project with
+  those choices: by name, by the index fallback (amber: the run flags it), unbound (red for a required role) or
+  two roles on one channel (red). The preview is the engine's own dry run (`project edit --role ROLE=CHANNEL ...
+  --dry-run --json`); red keeps Apply roles off, Apply roles writes channel_map.yaml and recipe.yaml in ASCII,
+  and Revert roles goes back to the pack's map. **Parameters**: one widget per tunable the pack recipe declares
+  (a spin box with the declared range and unit, a check box, a combo, a line), the project's value next to the
+  pack's, Reset per row; keys set elsewhere (a tuning result, Use in project, a hand edit) are listed read only.
+  Apply parameters is one `project edit` (`--set`, `--unset`), which takes only declared tunables of the declared
+  type, inside their range; every Apply shows the new config_hash, and with every edit reset the project hashes
+  as the pack recipe again; Back to the pack recipe is `project edit --revert`. **Post-stages**: those installed
+  in the environment that runs the project (the recipe's own interpreter, else the engine), each with a switch
+  and its declared parameters; the section names the list a run uses now (the project's post_stages.yaml, else
+  the one the pack ships for the recipe, else none) and what in it a run would refuse. Apply post-stages writes
+  the project's post_stages.yaml through `python -m germquant.post_stages write` in that environment, which
+  checks every entry; post_stages.yaml is not part of config_hash, so the hash and the badge stay as they are.
+- **Spot tuning dock** (Plugins > germquant > Spot tuning), on the project the Project dock has open (or one
+  opened here). Pick a finished image and Open image: its run's labels and spots, the source image read at the
+  run's stride and on its planes, and one editable Points layer, "<image_id> truth points (<annotator>)", on the
+  run's grid, holding `annotations/<image_id>__points_<annotator>.csv` when it exists. Click the spots you trust,
+  then Save points (the engine's own writer, germquant.tune.points, in napari's process). Tune runs `germquant
+  tune-spots --project DIR --points annotations --max-runs N [--grid FILE] --json` where the project's runs run
+  (the recipe's own interpreter, else the engine), with the engine's default grid for the recipe's spot backend
+  or a grid file, after saying how many detections the grid means; Cancel ends it. The result shows the top five
+  rows of the run's ranked.csv, its best setting and its warnings; Apply to the project runs `germquant
+  tune-spots --project DIR --apply tuning/<run>` through the engine, which writes the best setting into
+  recipe.yaml: a new config_hash, validated: false, and the finished images turn stale. The annotator is a short
+  name kept per user; the engine tunes one annotator per image, so two annotators of one image make the search
+  refuse until one file is moved (the dock says so).
 
 ## What it does not do yet
 
 - A stage can only be switched **off**. The command line has `--no-<stage>` and nothing else, and the plugin
-  keeps that parity on purpose. To turn a stage on that a recipe has off, or to change any parameter, choose
-  or write a profile (Export profile gives you a starting file; pick it with Advanced, "Config file...").
-- Projects (a folder holding the pack version, the images, a sample sheet and any recipe edits, which
-  `germquant project run` runs the same way), the role editor, the parameter form, spot tuning and the 2D
-  display of single-plane results come in later packages of the engine's tranche 5 (P5 and P6). The run logs
-  are written now; nothing reads them back yet.
-- Cancel stops a run, a model download or an example download in the engine environment: the engine process
-  and every process it started are ended, and the run log says the run was cancelled. Closing napari does the
-  same for anything still running (and on Windows an engine never outlives napari, even when napari is killed
-  from Task Manager). A run, a download or a check in this napari environment (the in-process runner) cannot be
-  stopped: it ends on its own, and closing napari waits for it.
-- The plugin does not run a series. The per-timepoint loop is `germquant run SERIES.nd2 --profile live_syp2
-  --t all --out FOLDER` in a terminal (hours for 25 timepoints); the Time-lapse dock opens FOLDER. Track
-  import (TrackMate, Imaris, Cell-ACDC), track strips and the biologist validation (`germquant track-import`,
-  `track-strips`, `track-validate`) are terminal commands too.
+  keeps that parity on purpose, in the Run dock and in a project's Run tab. To turn a stage on that a recipe has
+  off, or to change a parameter outside a project, choose or write a profile (Export profile gives you a starting
+  file; pick it with Advanced, "Config file..."). In a project the Recipe tab changes the tunables the pack
+  recipe declares, through `germquant project edit`.
+- Cancel stops a run (a project run too), a training run, a spot-tuning search, a model download or an example
+  download in the engine environment: the engine process and every process it started are ended, and the run log
+  says the run was cancelled. Closing napari does the same for anything still running (and on Windows an engine
+  never outlives napari, even when napari is killed from Task Manager). A run, a download or a check in this
+  napari environment (the in-process runner) cannot be stopped: it ends on its own, and closing napari waits for
+  it; only a project run stops there, between images.
+- The Run dock does not run a series. The per-timepoint loop is `germquant run SERIES.nd2 --profile live_syp2 --t
+  all --out FOLDER` in a terminal (hours for 25 timepoints); the Time-lapse dock opens FOLDER. In a project,
+  `germquant project run` runs an image with timepoints as a series (the engine refuses, before it starts, one it
+  cannot run in this release: single-plane, labels from files, a sample-sheet row, or post-stages switched on),
+  and a double-click on its board row names its folder for the Time-lapse dock. Track import (TrackMate, Imaris,
+  Cell-ACDC), track strips and the biologist validation (`germquant track-import`, `track-strips`,
+  `track-validate`) are terminal commands too.
 - The Time-lapse labels are a view, not an editor (they are lazy, read-only arrays). Labels are corrected in
   the Training dock, on exported slices.
-- Training is practical only on a GPU: 150 epochs of Cellpose-SAM on the CPU take hours. The plugin
-  environment on the workstation was installed with the CPU torch wheel (the laptop variant below), so its
-  Device list says cuda is not available there. Install the CUDA variant into the plugin environment, or run
+- Training is practical only on a GPU: 150 epochs of Cellpose-SAM on the CPU take hours. The plugin environment
+  on the workstation was installed with the CPU torch wheel (the laptop variant below), so with no engine chosen
+  the Training dock's Device list says cuda is not available there. Choose the engine's `.venv` for this computer
+  (the dock then trains there, on its CUDA), install the CUDA variant into the plugin environment, or run
   `germquant train-nuclei` in the engine's own `.venv`. The Training dock has been tested with the engine's
   training seams replaced (`_build_net`, `_train_seg`, `_predict`), never with a real training run.
 - The reader loads the whole stack into memory (a full-resolution gonad is about 3 GB). Use the stride in the
@@ -193,9 +290,40 @@ image canvas, so the docks are shown without it.
   before it runs, because its card names the missing module. This is why the subprocess runner, which runs in
   the engine's own environment, is the usual route. The in-process runner also shares the device setting
   (`GERMQUANT_DEVICE`) with every other engine call in napari while it runs.
-- Tested on the lab workstation (Windows 11) on 2026-10-09 with the CPU torch wheel; the Training and
-  Time-lapse docks on 2026-10-10 (headless); the pack picker and both runners on 2026-10-11 (headless, CPU).
-  Not yet run on a Mac.
+- Tested on the lab workstation (Windows 11) on 2026-10-09 with the CPU torch wheel; the Training and Time-lapse
+  docks on 2026-10-10 (headless); the pack picker and both runners on 2026-10-11 (headless, CPU). The Project
+  dock, the Recipe tab, the Training dock's project mode and the Spot tuning dock (version 0.2.0.dev1) have run
+  only in the test suite, headless, on synthetic images and the engine's test pack, on the CPU (CI on Linux,
+  Windows and macOS); their first runs on real images, with CUDA and SpotMAX in the engine's `.venv`, are still
+  to come. Not yet run on a Mac.
+
+## Changes in 0.2.0.dev1 to the docks that were there
+
+Version 0.2.0.dev1 adds the Project and Spot tuning docks, the Recipe tab and the Training dock's project mode
+(the plugin half of the engine's tranche 5 Train B). In the docks that were there before, with a germquant that
+has the feature:
+- **Results dock**, "also open the source image": the source opens on the run's own grid and, for a run made with
+  a z range (a project's run.z_range, set with `germquant project edit --z-range`, among them), on the run's
+  planes, so its labels, spots image and Points overlay it; before, the source opened on every plane and each
+  label plane sat z0 planes off it. Other runs open as before.
+- **Results dock**, the Points size: the run's spot size instead of a fixed 0.6 um (above). A default C. elegans
+  run and the cultured cells recipes stay at 0.6 um; budding_yeast cells_spots shows 0.488 um markers and the
+  test pack's LoG recipes 0.5 um. Single-plane results show at (1.0, dy, dx) instead of 1 um a side, and a YX
+  spots image gets its z axis.
+- **Reader** and the Run dock's header: a one-plane file with a pixel size and no z step opens at (1.0, dy, dx)
+  without the "voxel size unreadable" warning, and the header says "single plane, voxel um dy=.. dx=.." (or
+  "single plane, voxel size UNREADABLE (1 um assumed)"). A run of such a file whose recipe leaves io.planar off
+  still measures it at 1 um per pixel, so its result layers no longer sit on the image opened from the file
+  (before, both were at 1 um per pixel); a single-plane recipe lines up.
+- **Training dock**: with an engine chosen for this computer it exports, imports and trains through that engine
+  (its devices, auto first; Cancel); with none chosen it computes in napari's environment, as before, and says so
+  in amber. With every orientation box ticked the export passes `--orientations auto` (the same files for 3D
+  runs, one proj pair for a projected run, the plane of a single-plane run).
+- **Time-lapse dock**: the Link backend list offers laptrack_flow, as its last row, where the engine has it
+  (engine main's flow-prior linking), usable where laptrack is installed; with an engine before it the list has
+  its four backends as before.
+
+The full list, with the runner and CI changes, is in the plugin pull request of tranche 5 Train B.
 
 ## Install
 
@@ -203,10 +331,15 @@ The plugin lives in **its own environment**, never in the engine's `.venv`: Qt a
 pinned environment the validated numbers depend on. You need Python 3.11, the `uv` helper (the engine README's
 setup sections say how to get both) and a checkout of the engine (`git clone`, or the unzipped download) with
 its `config/` and `packs/` folders: the profiles, channel maps and built-in system packs come from there. The
-plugin needs germquant 0.2.0.dev0 or later (the version with system packs); with an older engine the dock says
-so in one message and offers profiles and config files only. Below, `<germquant>` is the path of that checkout,
-for example `C:\Users\you\C_elegans_germline_masking_and_spot_counting`. Install the engine editable (`-e`), as
-below: only an editable checkout finds its built-in packs.
+plugin needs germquant 0.2.0.dev0 or later (the version with system packs); with an older engine the dock says so
+in one message and offers profiles and config files only. Projects, the sample sheet, imported labels, derived
+packs, spot tuning, post-stages and the single-plane display need the tranche 5 Train B engine (engine main from
+3aa5244 on): an engine lists what it has as `features` in `python -m germquant.packs --version --json`, and a
+dock whose engine lacks one says so in one message, while packs and the Run dock keep working. The Project dock's
+Recipe tab and the Spot tuning dock's Save points also use the germquant napari itself imports, so that checkout
+needs the Train B engine too. Below, `<germquant>` is the path of that checkout, for example
+`C:\Users\you\C_elegans_germline_masking_and_spot_counting`. Install the engine editable (`-e`), as below: only
+an editable checkout finds its built-in packs.
 
 ### Windows
 
@@ -250,9 +383,9 @@ Then the nucleus model, once, into the engine checkout (the plugin's germquant r
 
 Start napari with `.venv\Scripts\napari.exe`.
 
-Optional, for the laptrack backend of the Time-lapse dock's Link (the engine's `timelapse` extra; its CI pins
-0.17.1): `uv pip install laptrack==0.17.1`, then restart napari. Without it the backend is greyed and the
-overlap backends still work.
+Optional, for the laptrack and laptrack_flow backends of the Time-lapse dock's Link (the engine's `timelapse`
+extra; its CI pins 0.17.1): `uv pip install laptrack==0.17.1`, then restart napari. Without it both are greyed
+and the overlap backends still work.
 
 ### Mac (Apple silicon)
 
@@ -344,9 +477,11 @@ Set `NAPARI_GERMQUANT_SETTINGS` to the path of an ini file to keep it there inst
    layer per channel appears, named `<image> [<channel>]`; the channel names come from the microscope file. For
    a quick look at a 3 GB gonad on a laptop, use the Run dock instead: Browse..., set "open with xy stride" to
    4, "Open in viewer".
-5. In the Run dock the **Header** line shows the sizes, the voxel size in microns and the channel names.
-   A time-lapse or multi-scene file says REFUSED here and cannot be run. With a pack recipe the card is checked
-   again with the image, and warns when its pixel size or z step lies outside what the pack expects.
+5. In the Run dock the **Header** line shows the sizes, the voxel size in microns and the channel names (a file
+   of one plane: "single plane, voxel um dy=.. dx=.."; a recipe that leaves io.planar off measures a plane
+   without a z step at 1 um per pixel, a single-plane recipe at its own pixel size). A time-lapse or multi-scene
+   file says REFUSED here and cannot be run. With a pack recipe the card is checked again with the image, and
+   warns when its pixel size or z step lies outside what the pack expects.
 6. **Channel roles**: one row per role of the recipe's channel map, with the channel it resolved to. A `*`
    marks a required role. Red means a required role has no channel: the run cannot start; pick a recipe whose
    map fits the panel, or fix the channel names. Amber means the name did not match and the map's position
@@ -366,8 +501,8 @@ Set `NAPARI_GERMQUANT_SETTINGS` to the path of an ini file to keep it there inst
     line into a terminal of the engine environment to repeat the run headless, or the `batch` line to process
     every `.nd2` under a folder on the workstation or the cluster, exactly as the GUI would.
 11. **Results dock**: Browse to any results folder (or a batch root), pick the image, "Open as layers".
-    Tick "also open the source image" to see the labels on the original stack. For a pack run, read the summary
-    line, the Provenance box and, if it shows, the red banner.
+    Tick "also open the source image" to see the labels on the original stack (read at the run's stride and on
+    its z range). For a pack run, read the summary line, the Provenance box and, if it shows, the red banner.
 
 <img src="docs/screenshots/run_dock_cultured_cells_card.png" width="380"
      alt="The System pack card of the cultured cells pack, checked in the engine's .venv">
@@ -423,6 +558,81 @@ root.
    nuclei themselves. Flip back to raw to check a track against the labels it was linked from.
 6. For a full-resolution series, set **Labels xy stride** to 2 or 4 before scrolling through z.
 
+## First project: one study in the Project dock
+
+A project is a folder that holds one study: the pack version it was made with (copied into the project), the
+recipe and any edits to it, the images, a sample sheet, the models trained in it, every result and every run's
+log (the engine's `docs/PROJECTS.md` describes the folder). Every change to its recipe or manifest is an engine
+command, run in the engine's environment with this plugin's version recorded, so `germquant project run` in a
+terminal runs the same project the same way. You need an engine with projects (see Install).
+
+1. Plugins > germquant > Project. The engine line shows the engine chosen for this computer (the Run dock's
+   choice; Choose engine... when there is none).
+2. **New...**: pick the pack and the recipe (the list comes from the engine; Get models and Get example work as
+   in the Run dock), a name, a new or empty folder with a short path (results nest below it) and, if you like,
+   the first images. OK runs `germquant project new` and records this computer's device, runner and interpreter
+   in the project.
+3. **Images**: Add files..., Add folder... (the engine finds the images by the recipe's suffixes), or paste a
+   path or a glob and press Add path. Each goes through `germquant project add`; a refused path is named with the
+   engine's reason.
+4. **Samples** (optional): fill in the design columns where the file names do not carry them (the rows are
+   prefilled where the recipe's file-name rule matches), add columns of your own (strain, lane), then **Save
+   sheet**: samples.csv is written with the engine's own writer and recorded in the project; images whose row
+   changed turn stale.
+5. **Recipe** (optional): bind the channel roles on a reference image and check the preview for every image, then
+   Apply roles; change declared parameters, then Apply parameters; switch post-stages on, then Apply post-stages.
+   The header shows the new config_hash and "validated: false (edited)" after a recipe edit; a post-stage Apply
+   leaves both as they are.
+6. **Run**: untick the stages you do not want, set the xy stride (1 is the validated setting; 4 for a quick look)
+   and the device, then **Run all** (or select rows and Run selected; Rerun selected runs done images again). The
+   settings the tab shows are recorded in the project before the run starts. The board's rows follow the run;
+   Cancel ends the engine process, and the board says interrupted.
+7. Double-click a done row: its labels, spots and source image open as layers (an image with timepoints names its
+   folder for the Time-lapse dock). **Collect tables** writes the batch tables of the finished images under
+   `results/`; **Export commands...** writes the commands that run the project headless into a file you name (a
+   PowerShell script for a .ps1 file, the default on Windows, else an sh script).
+8. **Save** records the Run tab's settings and the sample sheet (when edited); **Close**. Later, **Open...** the
+   folder (or pick it in the list of this computer's recent projects): the dock reads the project and asks the
+   engine for its status, so an image whose inputs changed reads stale.
+9. To train a nucleus model on the project's runs, open Plugins > germquant > Training: it follows the open
+   project (rounds under `training/`, Import labels, Use in project, Derive pack; the Training dock above).
+10. To tune the spots, open Plugins > germquant > Spot tuning: click truth points on finished images, Save
+    points, Tune, read the top five, then Apply to the project (the Spot tuning dock above).
+
+In a terminal of the engine environment the same project runs with `germquant project run DIR`, and
+`germquant project status DIR` and `germquant project collect DIR` give the board and the tables.
+
+## Where each step runs
+
+The engine environment makes every number and every change to a project's recipe or manifest; napari's own
+process reads files and writes a few itself: samples.csv and truth points with the engine's own writers, the
+Training dock's corrected labels, and a model registration. "The engine" is the interpreter chosen for this
+computer (Choose engine...), or napari's own environment when you chose "in process"; a pack recipe can have its
+own interpreter on this computer (Recipe interpreter...), where its runs go. `<python> -m germquant ...` imports
+torch first; the `germquant.packs`, `germquant.project` and `germquant.post_stages` entries do not.
+
+| step | where it runs | how |
+|---|---|---|
+| pack list, check, Get models, Get example | the engine | `<python> -m germquant.packs list`, `check`, `fetch-models`, `fetch-example`; for a project's own packs, list, check and fetch-models with `--project DIR` |
+| project new, add, edit (Save, the Recipe tab's Apply, the Run tab's settings), use-model, rounds, unlock | the engine | `<python> -m germquant.project ...` with `--plugin-version`; the role and parameter previews are `project edit ... --dry-run --json`. In process: napari's own Python runs the same command in a child process |
+| Run selected, Run all, Rerun selected | the recipe's own interpreter, else the engine | `<python> -m germquant project run DIR [--images ID ...] [--no-resume] --device D --run-id ID --via gui-subprocess`; the dock reads the engine's log, `<project>/runs/<run_id>.jsonl`, as it grows. In process: `germquant.api.run_project(..., via="gui-inprocess")` |
+| the status board and the header's warnings | the recipe's own interpreter, else the engine | `project status DIR --json` |
+| Collect tables, Export commands | the engine | `project collect DIR --json`, `project export-commands DIR --shell SHELL --out FILE` (ps1 for a .ps1 file, else sh) |
+| post-stage list, Apply post-stages | the recipe's own interpreter, else the engine | `<python> -m germquant.post_stages list --json`, `write DIR --entries JSON --json` |
+| Save sheet | napari | germquant.io.sample_sheet.write_sample_sheet (ASCII, atomic), then `project edit --samples` |
+| Export slices, Import labels, Train (Training dock) | the engine (in a project, the recipe's own interpreter); with no engine chosen, napari, said in amber | `<python> -m germquant export-training`, `import-labels`, `train-nuclei` |
+| Save corrections, Register model (Training dock) | napari | the atomic label save and corrections.json; `register-model`'s function |
+| Use in project, Derive pack (Training dock) | the engine (with none chosen, napari's own Python in a child process) | `project use-model`, `<python> -m germquant.packs derive` |
+| Save points (Spot tuning dock) | napari | germquant.tune.points.write_points |
+| Tune (Spot tuning dock) | the recipe's own interpreter, else the engine | `<python> -m germquant tune-spots --project DIR --points annotations --max-runs N [--grid FILE] --json` |
+| Apply to the project (Spot tuning dock) | the engine | `tune-spots --project DIR --apply tuning/<run> --plugin-version V --json` |
+| reading manifests, headers, run logs, results, the sample sheet, pairs and truth points | napari | file reads in thread workers: the GUI thread never waits on the engine or a slow share |
+
+Every engine call and file read runs in a thread worker, never in napari's GUI thread, and a write or a reading
+that comes back after its project was closed (or another one opened) is not applied to the dock. An engine
+without a feature a step needs gets one message (projects, sample_sheet, import_labels, train_curve, pack_derive,
+tune_spots, post_stages) before any command starts.
+
 ## Headless, and why the numbers agree
 
 With the subprocess runner the dock runs `<python> -m germquant run IMAGE --pack ID@VERSION --recipe R --out
@@ -437,6 +647,14 @@ runtime (device asked for and used, torch, Python) in `run_manifest.json` and `<
 never enter a table, a hash or the completion marker. The exported overlay YAML is a different object: a profile
 hashes as text, so a run made with it has its own `config_hash` and the same numbers; the commands file says so.
 Identical numbers are claimed within one environment and one device; the run log says which ran.
+
+A project follows the same rule. Run all through the subprocess runner is `<python> -m germquant project run DIR
+--device D --run-id ID --via gui-subprocess` (with `--images ID ...` for a selection and `--no-resume` for a
+rerun), and through the in-process runner `germquant.api.run_project(project, ..., via="gui-inprocess",
+run_id=ID)`. The engine writes the run's log itself (`<project>/runs/<run_id>.jsonl`, whose `run_start` names the
+via and the run id), and the plugin writes no log of its own for a project run. Every change the docks make to a
+project is an engine command a terminal can repeat (`germquant project edit`, `use-model`, `tune-spots --apply`,
+`python -m germquant.post_stages write`), and Export commands writes the commands that run the project headless.
 
 ## Tests
 
@@ -501,6 +719,30 @@ menu route, which hands it a proxy of the viewer. Two more tests are data depend
 header of a local `.nd2` copy and skips when it is absent; `nas` reads the header of the live GFP::SYP-2
 series on the lab NAS (56 GB, header only, T=25 refused) and runs only with `NAPARI_GERMQUANT_NAS_TEST=1`.
 
+The tranche 5 Train B tests (346 tests in all at 0.2.0.dev1, with the ones above): the runners' new commands
+(`tests/test_runner_commands.py`: the command line of every engine command, the plugin version on every project
+write, refusals and failures as each command answers them, both runners writing the same project files and
+listing and writing post-stages alike) and the engine session the project docks share
+(`tests/test_engine_session.py`); the Project dock (`tests/test_project.py`, `tests/test_project_dock.py`: New,
+Save and Open keeping the manifest, the board equal to `germquant project status`, Run all through both runners
+writing what `germquant project run` writes, the codeless round from the test pack, the board following a run's
+log, Cancel, the lock, the sample sheet); the Recipe tab (`tests/test_role_editor.py`, `tests/test_params.py`,
+`tests/test_recipe_tab.py`: the role preview from the engine's dry run, ASCII maps, a channel name outside ASCII
+that round-trips, collisions and unbound roles keeping Apply off, only declared tunables, an undeclared key
+refused, Reset back to the pack's hash, a post-stage switched on keeping config_hash and matching a headless
+run); the Training dock's project mode (`tests/test_training.py`, `tests/test_training_project.py`: Cell-ACDC and
+Cellpose imports, proj pairs of a projected run, training through the engine with its seams replaced, Use in
+project, Derive pack); the Spot tuning dock (`tests/test_tuning.py`, `tests/test_tuning_dock.py`: truth points
+saved on the run's grid, a real LoG tune of the test pack's example, the top five, Apply); the 2D display
+(`tests/test_display_2d.py`: a single-plane run's layers at (1.0, dy, dx), its spots image's z axis, the Points
+size from the run, the reader's single plane, the header line, a z-range run's source on the run's planes); and
+the Time-lapse dock's laptrack_flow row (`tests/test_timelapse_backend_rows.py`). A test that needs an engine
+feature skips and names it when the engine lacks it (`need_features` in `tests/conftest.py`), and fails instead
+when `NAPARI_GERMQUANT_REQUIRE_FEATURES` lists the feature (the CI lists all ten). Engine commands that train run
+in a child process whose engine seams a wrapper interpreter replaces (`NAPARI_GERMQUANT_SEAMS`,
+`tests/_p6_runner.py`), so no real Cellpose training runs; spot tuning runs for real with the LoG backend, so no
+SpotMAX is needed.
+
 Every test has its own settings file (`NAPARI_GERMQUANT_SETTINGS`), so no test reads or changes the engine
 stored on this computer, and the pack tests keep every pack folder and store private (`$GERMQUANT_PACKS` set to
 `tests/fixtures/packs`, an empty `$GERMQUANT_MODELS` in a short folder of the system temporary folder, so a
@@ -520,16 +762,34 @@ The subprocess runner tests use this Python as the engine interpreter and pass t
 
 ### Continuous integration
 
-`.github/workflows/ci.yml` runs ruff and the whole suite on ubuntu-latest, windows-latest and macos-14 (Apple
+`.github/workflows/ci.yml` runs ruff and the whole suite on ubuntu-24.04, windows-latest and macos-15 (Apple
 Silicon) with Python 3.11, with `QT_QPA_PLATFORM=offscreen` on Linux and Windows and Qt's native `cocoa` platform
-on macOS. It checks the engine out from its public repository
-at a pinned commit (the head of the engine's integration branch while a train is open, then the engine's main
-commit once the engine pull request has merged, and only then does the plugin pull request merge), installs it
-editable with the readers extra, compares the test pack copy's SHA256SUMS with the engine checkout's and
-verifies every file of the copy against it. Pins: the engine checkout's constraints files plus
-`constraints/ci-plugin-2026-10.txt` (napari, PyQt6, pytest-qt at the workstation's versions, and the bioio
-plugins of the readers extra; their native libraries are left to the resolver, and each job prints what it
-installed).
+on macOS. It checks the engine out from its public repository at a pinned commit (the head of the engine's
+integration branch while a train is open, then the engine's main commit once the engine pull request has merged,
+and only then does the plugin pull request merge; now engine main 3aa5244, the merge commit of the tranche 5
+Train B engine pull request), installs it editable with the readers extra, compares the test pack copy's
+SHA256SUMS with the engine checkout's and verifies every file of the copy against it.
+`NAPARI_GERMQUANT_REQUIRE_FEATURES` names the ten features of that engine (packs, planar, labels_from, projects,
+sample_sheet, import_labels, train_curve, pack_derive, tune_spots, post_stages), so a test that needs one of them
+fails instead of skipping. Pins: the engine checkout's constraints files plus `constraints/ci-plugin-2026-10.txt`
+(napari, PyQt6, pytest-qt at the workstation's versions, and the bioio plugins of the readers extra; their native
+libraries are left to the resolver, and each job prints what it installed).
+
+The macOS runner. The macOS job ran on macos-14 until 2026-10-30. GitHub retires the macOS 14 images on
+2026-11-02 (actions/runner-images issue 13518), and that image's scheduled brownouts cancelled the job before it
+started (run 41101457726, all three attempts), so the job moved to macos-15: the same Apple Silicon (arm64)
+runner one macOS release newer, with the same engine constraints file (`ci-mac-arm64-2026-10.txt`), the same
+`cocoa` platform and the same 15-minute budget. The workflow names macos-15 rather than macos-latest, which GitHub
+moves to each new macOS release (it is macOS 26 now).
+
+The Linux runner. The Linux job ran on ubuntu-latest until 2026-11-07. GitHub is moving that label to Ubuntu
+26.04 (from 2026-10-19 to 2026-11-19, actions/runner-images issue 14748), and on the new image (ubuntu-26.04
+20261101.186.1, run 42387359684) 16 tests that run the engine, 7 of them main's own, failed in matplotlib
+("FT_Render_Glyph ... failed with error 0x62: raster overflow") while the engine drew the text of its montage;
+the same tests passed on windows-latest and macos-15 in that run, and they pass on ubuntu-24.04 with the same
+matplotlib (run 42393186029). So the job runs on ubuntu-24.04, a label that names its version as macos-15 does,
+until the engine's montage text works on the new image; then it goes back to ubuntu-latest (follow-up FU22 of the
+engine's Train B plan).
 
 Time. Gate G1 gives a job 15 minutes, and each change records what it adds; `timeout-minutes` is 20, so a job
 over budget fails instead of running on. A Linux replica of the ubuntu job (WSL Ubuntu 24.04, plugin bfab387,
@@ -543,6 +803,12 @@ platform instead of offscreen (offscreen has no OpenGL context on macOS, and nap
 OpenGL call), and torch there offers the Apple GPU, so the tests expect the device the engine picks (mps on that
 runner, cpu on the others).
 
+With the tranche 5 Train B docks the suite has 346 tests. Run 42393186029 (2026-11-07, plugin f6ae908, engine
+main 3aa5244 with the ten features required) took 7.5 min on ubuntu-24.04, 9.7 min on windows-latest and 11.0 min
+on macos-15, of which the Test step took 6.9, 8.1 and 10.3 min (pytest 404, 469 and 602 s): every job is inside
+G1's 15 minutes. On the Windows workstation the whole suite takes about 7 minutes (420 s at f6ae908, with the
+same engine and the ten features required).
+
 On 2026-10-10 both new docks were also driven headless on a scratch copy of the first four timepoints of the
 live GFP::SYP-2 series (xy stride 2, 76 x 1360 x 1360 labels per timepoint; two runs): opening took 1.5 to
 1.9 s and a label plane 0.02 s, Register reproduced the series' own `register_shifts` numbers, Link with
@@ -555,30 +821,47 @@ touched. With `QT_QPA_PLATFORM` unset on a desktop session, napari queries the r
 
 ## Layout
 
-- `src/napari_germquant/napari.yaml`: the npe2 manifest (reader, four widgets).
+- `src/napari_germquant/napari.yaml`: the npe2 manifest (reader, six widgets).
 - `_engine.py`: the glue to `germquant.api`, no Qt: profiles, recipes (a profile, a config file or a pack
   recipe), role rows, stage rows, `RunPlan` (the one description a run has, executed by an engine runner and
-  spelled out as commands for the terminal), the system-pack feature gate.
+  spelled out as commands for the terminal), the system-pack feature gate and the one message for a missing
+  Train B feature.
 - `_runner.py`: where germquant runs, no Qt: `SubprocessRunner` (the engine interpreter, the torch-free
-  `python -m germquant.packs` entry for listing, checks and fetching, `python -m germquant run` for runs, each
-  engine process ended with everything it started on Cancel or when napari closes) and `InProcessRunner`, the
-  version check, interpreter suggestions, and the run logs.
+  `python -m germquant.packs`, `germquant.project` and `germquant.post_stages` entries, `python -m germquant ...`
+  for runs and the other commands, each engine process ended with everything it started on Cancel or when napari
+  closes) and `InProcessRunner`, with one method per engine command (projects, training, tuning, post-stages),
+  the run-log tail of `project run`, the exit codes and the features gate; the version check, interpreter
+  suggestions, and the run logs.
+- `_engine_session.py`: the one engine session per viewer that the Project dock, the Recipe tab, the Training
+  dock and the Spot tuning dock share (which engine, checked once; the recipe's own interpreter; the device; the
+  one message for a missing feature), no Qt.
 - `_packs.py`: an engine's pack listing and the pack card, no Qt.
-- `_settings.py`: the settings (QSettings): the engine interpreter and recipe interpreters (per computer), the
-  device and the last pack (per user).
+- `_settings.py`: the settings (QSettings): the engine interpreter, recipe interpreters and recent projects (per
+  computer), the device, the last pack and the spot-tuning annotator (per user).
 - `_engine_widgets.py`: the Engine box, the interpreter dialog and the System pack picker.
-- `_reader.py`: the reader and the single-time-point check.
-- `_results.py`: a results folder as layer tuples, no Qt.
-- `_training.py`: the training round without Qt (export, the pair list, the atomic save and
-  `corrections.json`, train with the device choice, register, the command lines).
+- `_reader.py`: the reader, the single-time-point check and the scale of a single plane.
+- `_results.py`: a results folder as layer tuples, no Qt (the run's own grid, single-plane results, the Points
+  size from the run).
+- `_project.py`: the Project dock's model, no Qt: the status board from the engine's status record and the run's
+  log, the header's words, what Save writes, the sample table.
+- `_recipe_widget.py`: the Project dock's Recipe tab (the role editor, the parameter form, the post-stages);
+  `_params.py`: what it shows and sends, no Qt.
+- `_tuning.py`: the Spot tuning dock's model, no Qt: the project's images with their runs and truth points, an
+  image opened on its run's grid, the truth-point files, the tuning runs.
+- `_training.py`: the training round without Qt (export, the pair list, the atomic save and `corrections.json`,
+  train with the device choice, register, the command lines; in a project, each run's geometry, the rounds, the
+  imports and the starting weights).
 - `_timelapse.py`: a series folder without Qt (the lazy label and reference stacks, raw or registered, the
   Tracks and Points data, the register_shifts summary, Register and Link with the commands' arguments).
-- `_run_widget.py`, `_results_widget.py`, `_training_widget.py`, `_timelapse_widget.py`: the four docks.
+- `_run_widget.py`, `_results_widget.py`, `_training_widget.py`, `_timelapse_widget.py`, `_project_widget.py`,
+  `_tuning_widget.py`: the six docks.
 - `_qt_common.py`: adding layer tuples, the log-to-status-bar bridge, and the worker runner the Training and
   Time-lapse docks use (one engine call at a time in a napari thread worker, elapsed time and log lines in the
   status bar).
 - `constraints/`: the CPU-filtered constraints copy, the record of the workstation install and the CI pins.
 - `tests/fixtures/packs/test_pack`: the engine's test pack, copied (CI checks the copy).
+- `tests/_p6_*.py`: the helpers of the tranche 5 Train B tests (stand-in and fake engines, project and results
+  folders written as the engine writes them, the seams wrapper).
 - `.github/workflows/ci.yml`: the CI workflow. `docs/screenshots/`: the pictures in this README.
 
 ## License

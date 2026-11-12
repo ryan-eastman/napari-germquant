@@ -1,5 +1,5 @@
 # GUI and test pins for the plugin's continuous integration (.github/workflows/ci.yml; ubuntu-latest,
-# windows-latest and macos-14, Python 3.11). The versions the lab workstation's plugin environment resolved to on
+# windows-latest and macos-15, Python 3.11). The versions the lab workstation's plugin environment resolved to on
 # 2026-10-09 (constraints/plugin-venv-2026-10-09.txt), for the packages the engine's own constraints files do not
 # pin. The workflow combines this file with the engine checkout's constraints/ci-cpu-2026-10.txt (macOS:
 # ci-mac-arm64-2026-10.txt) and constraints/readers-2026-10.txt, which pin numpy, pandas, torch, cellpose, pytest,
@@ -22,7 +22,7 @@ pytest-qt==4.5.0
 # The rest of the engine's readers extra, which the engine's readers-2026-10.txt leaves open (it pins the TIFF
 # readers only): the versions the Linux replica of this workflow resolved to on 2026-10-11 (plugin 79cf3d7,
 # engine 0521abf). These three bioio plugins are pure Python and decide how a .czi, .lif or .zarr is read. The
-# native libraries under them (pylibczirw, readlif, zarr, numcodecs) stay open on purpose, so macos-14 can take
+# native libraries under them (pylibczirw, readlif, zarr, numcodecs) stay open on purpose, so macos-15 can take
 # whichever build has an arm64 wheel; the workflow's "Record the resolved environment" step prints what each job
 # installed.
 bioio-czi==3.0.1

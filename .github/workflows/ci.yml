@@ -4,9 +4,9 @@
 #
 # The engine: checked out from its public repository at ENGINE_COMMIT and installed editable with the readers
 # extra, so the built-in packs are found in that checkout. While a tranche's train is open the pin is the head
-# of the engine's integration branch (feat/tranche5, 0521abf for train A); it moves to the engine's main commit
-# after the engine pull request merges, and only then does the plugin pull request merge. If the engine
-# repository ever becomes private, the engine checkout needs a read token (open question O22).
+# of the engine's integration branch (feat/tranche5, 0521abf for train A; feat/t5-train-b for train B); it moves
+# to the engine's main commit after the engine pull request merges, and only then does the plugin pull request
+# merge. If the engine repository ever becomes private, the engine checkout needs a read token (open question O22).
 #
 # The test pack: tests/fixtures/packs/test_pack is a copy of the engine's tests/fixtures/packs/test_pack, so the
 # tests need no sibling checkout. A step compares the copy's SHA256SUMS with the engine checkout's and verifies
@@ -25,6 +25,22 @@
 # Time: gate G1 gives a job 15 minutes. The Linux replica of this job (WSL, a fresh environment with uv's cache
 # warm) took the time the README's Continuous integration section records; timeout-minutes sits a little above
 # the budget, so a job that blows it shows as failed instead of running on.
+#
+# The macOS runner: macos-15, GitHub's Apple Silicon (arm64) image of macOS 15. The job ran on macos-14 until
+# 2026-10-30: GitHub retires the macOS 14 images on 2026-11-02 (actions/runner-images issue 13518), and that
+# image's scheduled brownouts cancelled the job before it started (run 41101457726, all three attempts). macos-15
+# is the same arm64 runner class one macOS release newer, so the job keeps the engine's ci-mac-arm64-2026-10.txt,
+# PyPI's arm64 torch, Qt's cocoa platform and the 15-minute budget. Not macos-latest: GitHub moves that label to
+# each new macOS release (it is macOS 26 now), while a pinned label changes only by a commit like this one.
+#
+# The Linux runner: ubuntu-24.04, GitHub's image of Ubuntu 24.04. The job ran on ubuntu-latest until 2026-11-07:
+# GitHub is moving that label to Ubuntu 26.04 (from 2026-10-19 to 2026-11-19, actions/runner-images issue 14748).
+# Run 42387359684 got the new image (ubuntu-26.04 20261101.186.1), and there 16 tests that run the engine, 7 of
+# them main's own, failed in matplotlib ("FT_Render_Glyph ... failed with error 0x62: raster overflow") while the
+# engine drew the text of its montage. The same run's windows-latest and macos-15 jobs passed all 16, and the 15
+# of them that ran before passed on ubuntu-24.04 with the same matplotlib (run 41176750051). As macos-15 does, the
+# label names its version, so the image changes only by a commit like this one. The job goes back to ubuntu-latest
+# once the engine's montage text is fixed on the new image (follow-up FU22 of the Train B plan).
 #
 # Qt: QT_QPA_PLATFORM=offscreen on Linux and Windows. tests/conftest.py answers napari's two OpenGL queries with
 # constants under offscreen, so nothing is rendered and no GPU is touched (none of these runners has one).
@@ -50,8 +66,20 @@ env:
   # -1, not an empty string (Windows drops empty variables): torch sees no CUDA device
   CUDA_VISIBLE_DEVICES: "-1"
   ENGINE_REPOSITORY: ryan-eastman/C_elegans_germline_masking_and_spot_counting
-  # train A of tranche 5, merged: the engine's main at b90ebdf ("Merge pull request #12", tranche-5 train A)
-  ENGINE_COMMIT: b90ebdf6859f6b0e3211a3c2970854adfdca41b8
+  # train B of tranche 5, merged: engine main's merge commit of pull request 20, as a full sha (Train B plan,
+  # section 5.4, item 3). Now 3aa5244: "Merge pull request #20" of feat/t5-train-b 59669ca (the G4 head 3770fb2
+  # and a docs commit) into main f00cb36; its tree is 59669ca's, and its version document lists all ten features.
+  # Before it, the pushed heads of the integration branch feat/t5-train-b, moved after every engine merge: 3770fb2
+  # (the head G4 ran on: merge #4, P5b, the post-stage contract, the merge of engine main f00cb36 and the docs and
+  # D55 commits), 78af711 (merge #3, P5: projects, batch formats, the sample sheet, the training and tuning
+  # engine), 82099b8 (merge #2 and the engine CI's move of its macOS job to macos-15, decision D54), fb6cf1a
+  # (merge #2, P2c, labels from files), 361b082 (merge #1, P2b, single-plane images) and main's pin b90ebdf
+  # ("Merge pull request #12", tranche-5 train A, merged).
+  ENGINE_COMMIT: 3aa5244a9de1611bc7461bd2da2cf9f0d81a4037
+  # the ten engine features of the Train B plan (section 9.3), required from the final engine head on and after the
+  # engine pull request merges (section 5.4, items 2 and 3): a test gated on one of them fails instead of skipping
+  # when the engine lacks it (tests/conftest.py, need_features); with all ten present it changes nothing
+  NAPARI_GERMQUANT_REQUIRE_FEATURES: "packs,planar,labels_from,projects,sample_sheet,import_labels,train_curve,pack_derive,tune_spots,post_stages"
 
 jobs:
   test:
@@ -63,13 +91,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             engine_constraints: constraints/ci-cpu-2026-10.txt
             qt_platform: offscreen
           - os: windows-latest
             engine_constraints: constraints/ci-cpu-2026-10.txt
             qt_platform: offscreen
-          - os: macos-14
+          # Apple Silicon; macos-14 until 2026-10-30 (GitHub retires it on 2026-11-02; see the header)
+          - os: macos-15
             engine_constraints: constraints/ci-mac-arm64-2026-10.txt
             qt_platform: cocoa
     env:

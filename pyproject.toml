@@ -6,8 +6,8 @@ build-backend = "setuptools.build_meta"
 # THE PLUGIN NAME. It appears here, as the entry-point key below, and as `name:` (plus the command id
 # prefixes) in src/napari_germquant/napari.yaml. NAMING.md lists every place to touch when renaming.
 name = "napari-germquant"
-version = "0.2.0.dev0"
-description = "napari plugin that drives the germquant engine: pick a system pack or a profile, map channel roles, choose stages, run in the engine's own environment, review nuclei or cells and spots, correct labels and train a nucleus model, review a time-lapse series"
+version = "0.2.0.dev1"
+description = "napari plugin that drives the germquant engine: pick a system pack or a profile, run a study as a project (images, sample sheet, channel roles, recipe parameters, post-stages), choose stages, run in the engine's own environment, review nuclei or cells and spots, tune spot detection on truth points, correct labels and train a nucleus model, review a time-lapse series"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
